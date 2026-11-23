@@ -37,17 +37,15 @@ _RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
                "cpu/ram tinggi")),
     ("uneasy", ("are you sure", "cats can't", "tidak ditemukan", "belum terpasang",
                 "gagal", "galat", "error")),
-    ("smug", ("looking cool", "phantom thief", "sojiro would be proud", "infiltration",
-              "ngoding", "fokus")),
-    ("excited", ("ooh", "whoa", "button mash", "paying off", "kerja bagus", "ayo mulai")),
-    ("wink", ("good morning", "movie", "big bang burger", "stroll", "swing by", "leblanc",
-              "dibuka.", "dimatikan", "dihentikan", "weather", "plenty of time",
-              "schedule ahead")),
+    ("smug", ("ngoding", "fokus")),
+    ("excited", ("ooh", "whoa", "paying off", "kerja bagus", "ayo mulai")),
+    ("wink", ("good morning", "movie", "dibuka.", "dimatikan", "dihentikan", "weather",
+              "plenty of time", "schedule ahead")),
     ("worried", ("test tomorrow", "don't forget", "deadline", "part-time", "raining",
                  "time flies", "acara berikutnya", "acara mendekat")),
     ("sad", ("tired", "worn out", "sleep", "rest up", "well-rested", "bath", "mode tidur")),
-    ("serious", ("shouldn't you", "study", "read a book", "time wisely", "gear",
-                 "guard down", "stock up", "money", "gym", "water your plant", "tugas")),
+    ("serious", ("shouldn't you", "study", "read a book", "guard down",
+                 "money", "gym", "water your plant", "tugas")),
 )
 
 
