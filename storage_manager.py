@@ -156,9 +156,11 @@ class NoteStore(JsonListStore):
     diingatkan). `notified` menandai pengingat "deadline sudah tiba" sudah dibunyikan.
     """
 
-    def add(self, title: str, content: str, deadline: datetime | None) -> dict:
+    def add(self, title: str, content: str, deadline: datetime | None,
+            category: str = "Personal") -> dict:
         stamp = now_iso()
         note = {"id": uuid.uuid4().hex[:12], "title": title.strip(), "content": content.strip(),
+                "category": (category or "Personal").strip() or "Personal",
                 "deadline": deadline.isoformat(timespec="minutes") if deadline else None,
                 "done": False, "notified": False, "created": stamp, "updated": stamp}
         self._items.append(note)
@@ -166,15 +168,18 @@ class NoteStore(JsonListStore):
         return note
 
     def update(self, note_id: str, title: str, content: str,
-               deadline: datetime | None) -> dict | None:
+               deadline: datetime | None, category: str | None = None) -> dict | None:
         note = self.get(note_id)
         if note is None:
             return None
         new_deadline = deadline.isoformat(timespec="minutes") if deadline else None
         if new_deadline != note.get("deadline"):
             note["notified"] = False          # deadline baru -> boleh diingatkan lagi
-        note.update(title=title.strip(), content=content.strip(),
-                    deadline=new_deadline, updated=now_iso())
+        patch = dict(title=title.strip(), content=content.strip(),
+                     deadline=new_deadline, updated=now_iso())
+        if category is not None:
+            patch["category"] = category.strip() or "Personal"
+        note.update(patch)
         self.save()
         return note
 
