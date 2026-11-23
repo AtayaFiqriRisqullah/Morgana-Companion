@@ -1,0 +1,1786 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Desktop Coding Pet - gaya Persona 5 (Tahap 3: UI cair berbasis pegas)
+====================================================================
+
+Instalasi : pip install PyQt6 psutil google-api-python-client google-auth-httplib2 google-auth-oauthlib
+            (paket Google hanya diperlukan untuk AGENDA; tanpa itu dipakai jadwal contoh)
+Jalankan  : python main.py            (opsi lain: python main.py --help)
+
+Berkas proyek (taruh dalam satu folder):
+  main.py              karakter, balon dialog, menu radial, controller
+  theme.py             palet, font, bentuk (bintang), stylesheet Persona 5 (khusus UI)
+  motion.py            mesin animasi pegas (Spring) + FrameTicker 60 FPS adaptif
+  ui_dialogs.py        jendela popup TASKS dan NOTES
+  storage_manager.py   tasks.json dan notes.json
+  calendar_service.py  Google Calendar read-only + jadwal dummy (panduan credentials.json ada di sini)
+  autostart.py         auto-start saat boot (Windows Registry / Linux XDG)
+  lines.py             pembaca kalimat Morgana; isinya dari morgana_list.md (edit file itu, bukan kode)
+
+Berkas yang dibuat otomatis: tasks.json, notes.json, settings.json, token.json (login Google), pet.log (galat).
+Aset opsional: assets/idle.png, talking.png, sleepy.png, action.png (PNG transparan).
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+import math
+import os
+import random
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from datetime import time as dtime
+from pathlib import Path
+
+from PyQt6.QtCore import (QDir, QLockFile, QObject, QPoint, QPointF, QRect, QRectF, Qt,
+                          QTimer, pyqtSignal)
+from PyQt6.QtGui import (QAction, QActionGroup, QColor, QFontMetrics, QGuiApplication, QIcon,
+                         QPainter, QPainterPath, QPen, QPixmap, QPolygonF, QRegion, QTransform)
+from PyQt6.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QWidget
+
+import autostart
+from calendar_service import CalendarEvent, CalendarResult, CalendarService, format_agenda, human_delta
+from motion import FrameTicker, Spring, clamp
+from lines import LineBag, greeting_pool, load_lines
+from storage_manager import NoteStore, SettingsStore, TaskStore, parse_dt
+from theme import (BLACK, BLUE, LIGHT_RED, MENU_QSS, RED, WHITE, lerp_color, p5_font, pen,
+                   star_polygon)
+from ui_dialogs import NotesDialog, SettingsDialog, TasksDialog
+
+try:
+    import psutil
+except ImportError:  # program tetap jalan; menu SYSTEM akan memberi tahu
+    psutil = None
+
+# ---------------------------------------------------------------------------
+# 1. KONFIGURASI & HELPER
+# ---------------------------------------------------------------------------
+IS_WINDOWS = sys.platform.startswith("win")
+IS_LINUX = sys.platform.startswith("linux")
+
+SCRIPT_PATH = Path(__file__).resolve()
+APP_DIR = SCRIPT_PATH.parent
+ASSETS_DIR = APP_DIR / "assets"
+LOG_FILE = APP_DIR / "pet.log"
+
+PET_NAME = "MORGANA"
+STATES = ("idle", "talking", "sleepy", "action")
+DEFAULT_SPRITE = 180          # px
+SPRITE_SIZES = (120, 150, 180, 240)
+PAD = 22                      # ruang di sekeliling sprite (untuk melayang, miring, squash & stretch)
+
+LINES_FILE = APP_DIR / "morgana_list.md"   # kalimat Morgana; edit file ini untuk mengganti percakapan
+NOTE_COUNTDOWN_REMINDERS = True           # catatan ber-deadline ikut diingatkan H-2 jam seperti acara kalender
+EVENT_STARTED_GRACE_S = 90                # pesan "acara dimulai sekarang" dalam N detik setelah mulai
+REMINDER_CHECK_MS = 30_000    # cek deadline catatan & acara tiap 30 detik
+CALENDAR_REFRESH_MS = 10 * 60_000
+STARTUP_TASK_LIMIT = 4        # maksimal tugas yang disebut di ringkasan startup
+
+def clip(text: str, limit: int) -> str:
+    text = " ".join((text or "").split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def install_crash_logger() -> None:
+    """Catat galat ke pet.log. Penting saat auto-start (tanpa console), dan mencegah PyQt6
+    mematikan aplikasi bila ada exception tak tertangani di dalam slot."""
+    try:
+        logging.basicConfig(filename=str(LOG_FILE), level=logging.INFO, encoding="utf-8",
+                            format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    except OSError:
+        logging.basicConfig(level=logging.WARNING)
+
+    last = {"key": None, "t": 0.0}
+
+    def hook(exc_type, exc, tb) -> None:
+        key = (exc_type, str(exc), tb.tb_lineno if tb else 0)
+        now = time.monotonic()
+        if key == last["key"] and now - last["t"] < 5.0:      # galat sama berulang (mis. di paintEvent)
+            return
+        last["key"], last["t"] = key, now
+        logging.getLogger("pet").error("Exception tak tertangani", exc_info=(exc_type, exc, tb))
+        if sys.stderr:
+            sys.__excepthook__(exc_type, exc, tb)
+
+    sys.excepthook = hook
+
+
+def play_beep() -> None:
+    """Bunyi notifikasi sistem. Urutan: API OS -> suara tema freedesktop -> QApplication.beep()."""
+    try:
+        if IS_WINDOWS:
+            import winsound
+            winsound.MessageBeep(winsound.MB_ICONASTERISK)
+            return
+        if IS_LINUX:
+            paplay = shutil.which("paplay")
+            for name in ("message.oga", "bell.oga", "complete.oga"):
+                sound = Path("/usr/share/sounds/freedesktop/stereo") / name
+                if paplay and sound.is_file():
+                    launch_detached([paplay, str(sound)])
+                    return
+            canberra = shutil.which("canberra-gtk-play")
+            if canberra:
+                launch_detached([canberra, "-i", "message"])
+                return
+    except Exception:
+        pass
+    QApplication.beep()
+
+
+def setup_overlay(w: QWidget, on_top: bool = True) -> None:
+    """Jendela frameless + transparan + tidak mencuri fokus dari editor."""
+    flags = (Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
+             | Qt.WindowType.WindowDoesNotAcceptFocus)
+    if on_top:
+        flags |= Qt.WindowType.WindowStaysOnTopHint
+    w.setWindowFlags(flags)
+    w.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+    w.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+
+
+def in_window(now: dtime, start: dtime, end: dtime) -> bool:
+    """True jika `now` ada di rentang [start, end), termasuk yang melewati tengah malam."""
+    if start <= end:
+        return start <= now < end
+    return now >= start or now < end
+
+
+def fmt_mmss(seconds: int) -> str:
+    return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+
+def launch_detached(cmd: list[str]) -> bool:
+    """Jalankan program terpisah dari proses pet (lintas platform)."""
+    kwargs: dict = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL)
+    if IS_WINDOWS:
+        kwargs["creationflags"] = (subprocess.DETACHED_PROCESS
+                                   | subprocess.CREATE_NEW_PROCESS_GROUP)
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        subprocess.Popen(cmd, **kwargs)
+        return True
+    except OSError:
+        return False
+
+
+def find_vscode() -> list[str] | None:
+    for name in ("code", "code-insiders", "codium", "vscodium"):
+        path = shutil.which(name)
+        if path:
+            return [path]
+    if IS_WINDOWS:
+        local = os.environ.get("LOCALAPPDATA")
+        if local:
+            exe = Path(local) / "Programs" / "Microsoft VS Code" / "Code.exe"
+            if exe.is_file():
+                return [str(exe)]
+    return None
+
+
+def find_terminal() -> list[str] | None:
+    if IS_WINDOWS:
+        wt = shutil.which("wt")
+        return [wt] if wt else ["cmd.exe", "/c", "start", "", "cmd.exe"]
+    candidates = [os.environ.get("TERMINAL", ""), "konsole", "gnome-terminal",
+                  "xfce4-terminal", "alacritty", "kitty", "xterm", "x-terminal-emulator"]
+    for name in candidates:
+        path = shutil.which(name) if name else None
+        if path:
+            return [path]
+    return None
+
+
+# ---------------------------------------------------------------------------
+# 2. SPRITE: LOADER + PLACEHOLDER (QPainter)
+# ---------------------------------------------------------------------------
+def _star(cx: float, cy: float, r_out: float, r_in: float, points: int = 8) -> QPolygonF:
+    pts = []
+    for i in range(points * 2):
+        r = r_out if i % 2 == 0 else r_in
+        a = math.pi * i / points - math.pi / 2
+        pts.append(QPointF(cx + r * math.cos(a), cy + r * math.sin(a)))
+    return QPolygonF(pts)
+
+
+def make_placeholder(state: str, size: int, dpr: float = 1.0) -> QPixmap:
+    """Kepala kucing hitam ala Morgana, digambar programatik (kanvas 100x100)."""
+    pm = QPixmap(int(size * dpr), int(size * dpr))
+    pm.setDevicePixelRatio(dpr)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+    p.scale(size / 100.0, size / 100.0)
+
+    def poly(points):
+        return QPolygonF([QPointF(x, y) for x, y in points])
+
+    outline = QPen(WHITE, 2.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
+                   Qt.PenJoinStyle.RoundJoin)
+    no_pen = Qt.PenStyle.NoPen
+
+    # syal merah
+    p.setPen(outline)
+    p.setBrush(RED)
+    p.drawPolygon(poly([(26, 72), (74, 72), (84, 92), (64, 87), (50, 97), (36, 87), (16, 92)]))
+    # telinga
+    p.setBrush(BLACK)
+    p.drawPolygon(poly([(18, 42), (24, 6), (50, 26)]))
+    p.drawPolygon(poly([(82, 42), (76, 6), (50, 26)]))
+    p.setPen(no_pen)
+    p.setBrush(RED)
+    p.drawPolygon(poly([(25, 34), (27, 16), (40, 26)]))
+    p.drawPolygon(poly([(75, 34), (73, 16), (60, 26)]))
+    # kepala
+    p.setPen(outline)
+    p.setBrush(BLACK)
+    p.drawEllipse(QRectF(15, 24, 70, 56))
+    # moncong + hidung
+    p.setPen(no_pen)
+    p.setBrush(WHITE)
+    p.drawEllipse(QRectF(34, 55, 32, 21))
+    p.setBrush(RED)
+    p.drawPolygon(poly([(46, 58), (54, 58), (50, 63)]))
+
+    # mulut
+    if state == "talking":
+        p.setBrush(QColor("#3A0008"))
+        p.drawEllipse(QRectF(44, 64, 12, 9))
+        p.setBrush(RED)
+        p.drawEllipse(QRectF(46, 69, 8, 4))
+    else:
+        p.setPen(QPen(BLACK, 1.7, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        path = QPainterPath()
+        if state == "action":     # nyengir
+            path.moveTo(42, 65)
+            path.quadTo(50, 76, 58, 65)
+        else:
+            path.moveTo(50, 63)
+            path.lineTo(50, 66)
+            path.moveTo(43, 66)
+            path.quadTo(46.5, 70, 50, 66)
+            path.quadTo(53.5, 70, 57, 66)
+        p.drawPath(path)
+
+    # mata
+    eye_y = 45
+    if state == "sleepy":
+        p.setPen(QPen(BLUE, 2.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        for cx in (36, 64):
+            path = QPainterPath()
+            path.moveTo(cx - 8, eye_y)
+            path.quadTo(cx, eye_y + 8, cx + 8, eye_y)
+            p.drawPath(path)
+    else:
+        ry = 6.5 if state == "action" else 10
+        for cx in (36, 64):
+            p.setPen(QPen(WHITE, 1.4))
+            p.setBrush(BLUE)
+            p.drawEllipse(QRectF(cx - 8, eye_y - ry, 16, 2 * ry))
+            p.setPen(no_pen)
+            p.setBrush(BLACK)
+            p.drawEllipse(QRectF(cx - 2.5, eye_y - ry * 0.6, 5, ry * 1.2))
+            p.setBrush(WHITE)
+            p.drawEllipse(QRectF(cx - 4.5, eye_y - ry * 0.7, 3.2, 3.2))
+
+    # kumis
+    p.setPen(QPen(QColor(255, 255, 255, 200), 1.0))
+    for sx in (-1, 1):
+        x0 = 50 + sx * 15
+        x1 = 50 + sx * 42
+        p.drawLine(QPointF(x0, 62), QPointF(x1, 57))
+        p.drawLine(QPointF(x0, 66), QPointF(x1, 68))
+
+    # dekorasi per state
+    if state == "sleepy":
+        p.setPen(WHITE)
+        p.setFont(p5_font(14, italic=False))
+        p.drawText(QPointF(84, 32), "Z")
+        p.setFont(p5_font(10, italic=False))
+        p.drawText(QPointF(91, 19), "z")
+    elif state == "action":
+        p.setPen(QPen(RED, 3.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        p.drawLine(QPointF(26, 33), QPointF(44, 38))
+        p.drawLine(QPointF(74, 33), QPointF(56, 38))
+        p.setPen(pen(WHITE, 1.6))
+        p.setBrush(RED)
+        p.drawPolygon(_star(85, 20, 12, 6))
+        p.setPen(WHITE)
+        p.setFont(p5_font(13, italic=False))
+        p.drawText(QRectF(73, 8, 24, 24), Qt.AlignmentFlag.AlignCenter.value, "!")
+
+    p.end()
+    return pm
+
+
+class SpriteBank:
+    """Memuat assets/<state>.png; jika tidak ada/korup -> placeholder. Di-cache per ukuran."""
+
+    def __init__(self) -> None:
+        self._cache: dict[tuple, QPixmap] = {}
+
+    def get(self, state: str, size: int, dpr: float = 1.0) -> QPixmap:
+        key = (state, size, round(dpr, 2))
+        if key not in self._cache:
+            self._cache[key] = self._load(state, size, dpr)
+        return self._cache[key]
+
+    @staticmethod
+    def _load(state: str, size: int, dpr: float) -> QPixmap:
+        path = ASSETS_DIR / f"{state}.png"
+        if path.is_file():
+            pm = QPixmap(str(path))
+            if not pm.isNull():
+                px = int(size * dpr)
+                pm = pm.scaled(px, px, Qt.AspectRatioMode.KeepAspectRatio,
+                               Qt.TransformationMode.SmoothTransformation)
+                pm.setDevicePixelRatio(dpr)
+                return pm
+        return make_placeholder(state, size, dpr)
+
+
+# ---------------------------------------------------------------------------
+# 3. PET WINDOW (karakter)
+# ---------------------------------------------------------------------------
+class PetWindow(QWidget):
+    """Karakter. Semua gerak (melayang, bernapas, miring saat di-drag, pantulan saat klik,
+    meluncur setelah dilempar) memakai pegas supaya terasa cair."""
+
+    clicked = pyqtSignal()                 # klik kiri tanpa drag
+    moved = pyqtSignal()                   # posisi berubah (bubble & menu mengikuti)
+    context_requested = pyqtSignal(QPoint)  # klik kanan
+
+    DRAG_THRESHOLD = 5          # px; di bawah ini dianggap klik, bukan drag
+    GLIDE_MIN_SPEED = 380.0     # px/detik; lebih lambat dari ini = tidak meluncur
+    GLIDE_MAX_SPEED = 2600.0
+    GLIDE_FRICTION = 5.0
+    # amp: tinggi melayang (px) | speed: rad/detik | breathe: kembang-kempis | droop: turun (px)
+    STYLE = {
+        "idle":    dict(amp=3.0, speed=1.9, breathe=0.018, droop=0.0),
+        "talking": dict(amp=2.0, speed=2.4, breathe=0.022, droop=0.0),
+        "sleepy":  dict(amp=1.6, speed=0.9, breathe=0.032, droop=5.0),
+        "action":  dict(amp=4.5, speed=3.4, breathe=0.025, droop=-2.0),
+    }
+
+    def __init__(self, sprites: SpriteBank, size: int) -> None:
+        super().__init__()
+        setup_overlay(self)
+        self._sprites = sprites
+        self._sprite_size = size
+        self._state = "idle"
+        self._prev_state = "idle"
+        self._badge = ""
+        self._phase = 0.0
+
+        self._tilt = Spring(0.0, 170.0, 11.0)      # derajat; memantul saat dilepas
+        self._pop = Spring(0.0, 420.0, 15.0)       # squash & stretch
+        self._hold = Spring(0.0, 300.0, 24.0)      # "diangkat" saat di-drag
+        self._fade = Spring(1.0)                   # cross-fade antar state
+        self._talk = Spring(0.0, 120.0, 22.0)      # energi saat bicara
+
+        self._press_global: QPoint | None = None
+        self._press_origin = QPoint()
+        self._dragging = False
+        self._last_gx = self._last_gy = 0.0
+        self._last_t = 0.0
+        self._vx = self._vy = 0.0                  # kecepatan kursor saat drag (px/detik)
+        self._glide_active = False
+        self._gx = self._gy = 0.0
+        self._fpos = QPointF()
+
+        side = size + 2 * PAD
+        self.setFixedSize(side, side)
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self._ticker = FrameTicker(self._frame, self)
+
+    # -- properti & setter ---------------------------------------------------
+    @property
+    def sprite_size(self) -> int:
+        return self._sprite_size
+
+    def set_state(self, state: str) -> None:
+        if state in STATES and state != self._state:
+            self._prev_state = self._state
+            self._state = state
+            self._fade.snap(0.0)
+            self._fade.target = 1.0
+            self._fade.configure(150.0)
+            self.bump(0.7)
+
+    def set_talking(self, on: bool) -> None:
+        self._talk.target = 1.0 if on else 0.0
+        self._ticker.start()
+
+    def bump(self, strength: float = 1.0) -> None:
+        """Squash lalu memantul balik (dipakai saat klik, ganti state, pengingat)."""
+        self._pop.value = -0.12 * strength
+        self._pop.velocity = 0.0
+        self._ticker.start()
+
+    def set_badge(self, text: str) -> None:
+        if text != self._badge:
+            self._badge = text
+            self.update()
+
+    def set_sprite_size(self, size: int) -> None:
+        center = self.geometry().center()
+        self._sprite_size = size
+        side = size + 2 * PAD
+        self.setFixedSize(side, side)
+        self.move(center.x() - side // 2, center.y() - side // 2)
+        self.update()
+
+    # -- loop animasi -----------------------------------------------------------
+    def showEvent(self, e) -> None:
+        super().showEvent(e)
+        self._ticker.start()
+
+    def hideEvent(self, e) -> None:
+        super().hideEvent(e)
+        self._ticker.stop()
+
+    def _screen_area(self) -> QRect:
+        screen = QGuiApplication.screenAt(self.geometry().center()) or QGuiApplication.primaryScreen()
+        return screen.availableGeometry()
+
+    def _frame(self, dt: float) -> bool:
+        self._phase += dt
+        moving = False
+        if self._dragging:
+            decay = math.exp(-dt * 7.0)            # kecepatan "basi" meluruh kalau kursor diam
+            self._vx *= decay
+            self._vy *= decay
+            self._tilt.target = clamp(self._vx * 0.012, -11.0, 11.0)
+            moving = True
+        for spring in (self._tilt, self._pop, self._hold, self._fade, self._talk):
+            moving |= spring.step(dt)
+        if self._glide_active:
+            moving |= self._glide_step(dt)
+        # 60 FPS saat ada interaksi, 30 FPS saat sekadar melayang (hemat CPU)
+        self._ticker.set_interval(16 if (moving or self._talk.value > 0.01) else 33)
+        self.update()
+        return self.isVisible()
+
+    def _glide_step(self, dt: float) -> bool:
+        """Meluncur setelah dilempar: gesekan eksponensial + memantul lembut di tepi layar."""
+        speed = math.hypot(self._gx, self._gy)
+        if speed < 25.0:
+            self._glide_active = False
+            return False
+        k = math.exp(-dt * self.GLIDE_FRICTION)
+        self._gx *= k
+        self._gy *= k
+        nx = self._fpos.x() + self._gx * dt
+        ny = self._fpos.y() + self._gy * dt
+        area = self._screen_area()
+        x_min, x_max = area.left(), area.right() - self.width() + 1
+        y_min, y_max = area.top(), area.bottom() - self.height() + 1
+        hit = False
+        if nx < x_min:
+            nx, self._gx, hit = x_min, abs(self._gx) * 0.45, True
+        elif nx > x_max:
+            nx, self._gx, hit = x_max, -abs(self._gx) * 0.45, True
+        if ny < y_min:
+            ny, self._gy, hit = y_min, abs(self._gy) * 0.45, True
+        elif ny > y_max:
+            ny, self._gy, hit = y_max, -abs(self._gy) * 0.45, True
+        self._fpos = QPointF(nx, ny)
+        self.move(int(round(nx)), int(round(ny)))
+        if hit and speed > 140.0:
+            self.bump(min(1.0, speed / 900.0))
+        return True
+
+    # -- menggambar ----------------------------------------------------------
+    def _draw_sprite(self, p: QPainter, state: str) -> None:
+        pm = self._sprites.get(state, self._sprite_size, self.devicePixelRatioF())
+        dpr = pm.devicePixelRatio()
+        w, h = pm.width() / dpr, pm.height() / dpr
+        x = PAD + (self._sprite_size - w) / 2
+        y = PAD + (self._sprite_size - h) / 2
+        p.drawPixmap(QPointF(x, y), pm)
+
+    def paintEvent(self, _event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        st = self.STYLE.get(self._state, self.STYLE["idle"])
+        ph = self._phase
+        hold = clamp(self._hold.value, 0.0, 1.3)
+        pop = self._pop.value
+
+        bob = math.sin(ph * st["speed"]) * st["amp"] + st["droop"]
+        bob += math.sin(ph * 10.0) * 1.5 * clamp(self._talk.value)       # pantulan kecil saat bicara
+        breathe = math.sin(ph * st["speed"] * 0.85 + 1.2) * st["breathe"]
+        sy = 1.0 + breathe + pop + 0.05 * hold
+        sx = 1.0 - breathe * 0.6 - pop * 0.55 + 0.05 * hold
+        tilt = self._tilt.value + math.sin(ph * 0.8) * 0.9 * (1.0 - clamp(hold))
+
+        px = self.width() / 2.0
+        py = PAD + self._sprite_size * 0.94                               # pivot di "kaki"
+        p.save()
+        p.translate(px, py + bob - 7.0 * hold)
+        p.rotate(tilt)
+        p.scale(max(sx, 0.2), max(sy, 0.2))
+        p.translate(-px, -py)
+        f = clamp(self._fade.value)
+        if f < 0.995 and self._prev_state != self._state:
+            p.setOpacity(1.0 - f)
+            self._draw_sprite(p, self._prev_state)
+            p.setOpacity(f)
+        self._draw_sprite(p, self._state)
+        p.restore()
+        p.setOpacity(1.0)
+        if self._badge:
+            self._paint_badge(p)
+
+    def _paint_badge(self, p: QPainter) -> None:
+        font = p5_font(12)
+        p.setFont(font)
+        tw = QFontMetrics(font).horizontalAdvance(self._badge)
+        w, h = tw + 22, 22
+        x = (self.width() - w) / 2
+        y = self.height() - PAD - h + 2
+        poly = QPolygonF([QPointF(x + 7, y), QPointF(x + w, y),
+                          QPointF(x + w - 7, y + h), QPointF(x, y + h)])
+        p.setPen(pen(WHITE, 2))
+        p.setBrush(RED)
+        p.drawPolygon(poly)
+        p.setPen(WHITE)
+        p.drawText(QRectF(x, y, w, h), Qt.AlignmentFlag.AlignCenter.value, self._badge)
+
+    # -- mouse: bedakan klik vs drag; drag memiringkan, lempar meluncur ---------------
+    def mousePressEvent(self, e) -> None:
+        if e.button() == Qt.MouseButton.LeftButton:
+            gp = e.globalPosition()
+            self._press_global = gp.toPoint()
+            self._press_origin = self.pos()
+            self._dragging = False
+            self._glide_active = False
+            self._last_gx, self._last_gy = gp.x(), gp.y()
+            self._last_t = time.perf_counter()
+            self._vx = self._vy = 0.0
+            e.accept()
+        else:
+            e.ignore()
+
+    def mouseMoveEvent(self, e) -> None:
+        if self._press_global is None or not (e.buttons() & Qt.MouseButton.LeftButton):
+            return
+        gp = e.globalPosition()
+        now = time.perf_counter()
+        dt = now - self._last_t
+        if dt > 0.001:                              # EMA kecepatan kursor
+            self._vx = self._vx * 0.45 + ((gp.x() - self._last_gx) / dt) * 0.55
+            self._vy = self._vy * 0.45 + ((gp.y() - self._last_gy) / dt) * 0.55
+            self._last_gx, self._last_gy, self._last_t = gp.x(), gp.y(), now
+        delta = gp.toPoint() - self._press_global
+        if not self._dragging and delta.manhattanLength() >= self.DRAG_THRESHOLD:
+            self._dragging = True
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            self._hold.target = 1.0
+            self._ticker.start()
+        if self._dragging:
+            self.move(self._press_origin + delta)
+
+    def mouseReleaseEvent(self, e) -> None:
+        if e.button() == Qt.MouseButton.LeftButton and self._press_global is not None:
+            was_drag = self._dragging
+            self._press_global = None
+            self._dragging = False
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            self._hold.target = 0.0
+            self._tilt.target = 0.0                 # miring kembali tegak sambil memantul
+            if was_drag:
+                speed = math.hypot(self._vx, self._vy)
+                if speed >= self.GLIDE_MIN_SPEED:   # dilempar -> meluncur
+                    k = min(1.0, self.GLIDE_MAX_SPEED / speed)
+                    self._gx, self._gy = self._vx * k, self._vy * k
+                    self._fpos = QPointF(self.pos())
+                    self._glide_active = True
+            else:
+                self.bump(1.0)
+                self.clicked.emit()
+            self._ticker.start()
+
+    def contextMenuEvent(self, e) -> None:
+        self.context_requested.emit(e.globalPos())
+
+    def moveEvent(self, e) -> None:
+        super().moveEvent(e)
+        self.moved.emit()
+
+
+# ---------------------------------------------------------------------------
+# 4. BALON DIALOG
+# ---------------------------------------------------------------------------
+def wrap_text(text: str, measure, max_w: int) -> list[str]:
+    """Bungkus teks per baris. `measure(str) -> lebar piksel`. Kata terlalu panjang dipecah."""
+    lines: list[str] = []
+    for para in text.split("\n"):
+        cur = ""
+        for word in para.split(" "):
+            while len(word) > 1 and measure(word) > max_w:
+                cut = len(word) - 1
+                while cut > 1 and measure(word[:cut]) > max_w:
+                    cut -= 1
+                if cur:
+                    lines.append(cur)
+                    cur = ""
+                lines.append(word[:cut])
+                word = word[cut:]
+            trial = f"{cur} {word}" if cur else word
+            if cur and measure(trial) > max_w:
+                lines.append(cur)
+                cur = word
+            else:
+                cur = trial
+        lines.append(cur)
+    return lines
+
+
+class BubbleWindow(QWidget):
+    """Balon dialog: muncul membesar dari kepala karakter (pegas + sedikit putar), teks
+    mengetik per huruf, tutup dengan menyusut. Bentuk: kotak miring hitam, garis putih,
+    bayangan merah, ekor runcing, name tag merah, dan bintang bergerigi."""
+
+    dismissed = pyqtSignal()
+
+    MAX_TEXT_W = 240
+    M, PADX, PADY = 22, 18, 12
+    TAIL_H, TAG_OVER, SHADOW, SLANT = 16, 12, 7, 10
+
+    def __init__(self, pet: PetWindow) -> None:
+        super().__init__()
+        setup_overlay(self)
+        self._pet = pet
+        self._lines: list[str] = []
+        self._total = 0
+        self._reveal = 0.0
+        self._speed = 60.0
+        self._bw = self._bh = 0
+        self._line_h = 18
+        self._ascent = 12
+        self._below = False
+        self._tail_x = 0
+        self._closing = False
+        self._font = p5_font(14)
+        self._tag_font = p5_font(10)
+        self._show = Spring(0.0, 300.0, 19.0)      # 0 = hilang, 1 = tampil (overshoot sedikit)
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.timeout.connect(self.dismiss)
+        self._ticker = FrameTicker(self._frame, self)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def show_message(self, text: str, ms: int) -> None:
+        fm = QFontMetrics(self._font)
+        self._lines = wrap_text(text, fm.horizontalAdvance, self.MAX_TEXT_W)
+        self._line_h = fm.height() + 3
+        self._ascent = fm.ascent()
+        tw = max((fm.horizontalAdvance(ln) for ln in self._lines), default=0) + 4
+        self._bw = max(tw, 60) + 2 * self.PADX
+        self._bh = len(self._lines) * self._line_h + 2 * self.PADY - 2
+        self._total = sum(len(ln) for ln in self._lines)
+        self._reveal = 0.0
+        self._speed = max(55.0, self._total / 1.15)            # teks panjang tetap selesai ~1 detik
+        self.setFixedSize(self._bw + 2 * self.M + self.SHADOW,
+                          self._bh + self.TAG_OVER + self.TAIL_H + 2 * self.M + self.SHADOW)
+
+        self._closing = False
+        self._show.configure(300.0, 19.0)
+        if self.isVisible():                                    # pesan baru: pantul ulang
+            self._show.value = min(self._show.value, 0.8)
+            self._show.velocity = 0.0
+        else:
+            self._show.snap(0.0)
+        self._show.target = 1.0
+        self._place()
+        self.show()
+        self.raise_()
+        self._ticker.start()
+        self._hide_timer.start(ms + int(1000 * self._total / self._speed))
+
+    def dismiss(self) -> None:
+        self._hide_timer.stop()
+        if self.isVisible() and not self._closing:
+            self._closing = True
+            self._show.configure(360.0)                         # redaman kritis: menyusut mulus
+            self._show.target = 0.0
+            self._ticker.start()
+            self.dismissed.emit()                               # karakter langsung kembali ke state dasar
+
+    def follow(self) -> None:
+        if self.isVisible():
+            self._place()
+
+    def _frame(self, dt: float) -> bool:
+        moving = self._show.step(dt)
+        if self._reveal < self._total:
+            self._reveal = min(float(self._total), self._reveal + self._speed * dt)
+            moving = True
+        self.update()
+        if self._closing and self._show.value < 0.04:
+            self._closing = False
+            self._show.snap(0.0)
+            self.hide()
+            return False
+        return moving or self._closing
+
+    def _place(self) -> None:
+        pet = self._pet.geometry()
+        screen = QGuiApplication.screenAt(pet.center()) or QGuiApplication.primaryScreen()
+        area = screen.availableGeometry()
+        w = self.width()
+        size = self._pet.sprite_size
+
+        head_y = pet.top() + PAD + int(size * 0.10)          # ujung ekor menunjuk kepala
+        tip_local = self.M + self.TAG_OVER + self._bh + self.TAIL_H
+        y = head_y - tip_local
+        self._below = y < area.top()
+        if self._below:                                      # tidak muat di atas -> taruh di bawah
+            foot_y = pet.bottom() - PAD - int(size * 0.04)
+            y = foot_y - (self.M + self.TAG_OVER)
+        x = pet.center().x() - w // 2
+        x = max(area.left(), min(x, area.right() - w))
+        self._tail_x = max(self.M + 24, min(pet.center().x() - x, w - self.M - self.SHADOW - 34))
+        self.move(x, y)
+
+    def paintEvent(self, _event) -> None:
+        sv = self._show.value
+        if clamp(sv * 1.8) <= 0.01 or not self._lines:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        p.setOpacity(clamp(sv * 1.8))
+        M, s = self.M, self.SLANT
+        top = M + self.TAG_OVER + (self.TAIL_H if self._below else 0)
+        x0, x1, y0, y1 = M, M + self._bw, top, top + self._bh
+        tx = self._tail_x
+        tip_y = (y0 - self.TAIL_H) if self._below else (y1 + self.TAIL_H)
+
+        # pop: membesar dari ujung ekor (kepala karakter), sedikit berputar lalu tegak
+        scale = 0.55 + 0.45 * max(sv, 0.0)
+        p.translate(tx, tip_y)
+        p.rotate((1.0 - clamp(sv, 0.0, 1.5)) * -7.0)
+        p.scale(scale, scale)
+        p.translate(-tx, -tip_y)
+
+        body = QPolygonF([QPointF(x0 + s, y0), QPointF(x1, y0), QPointF(x1 - s, y1), QPointF(x0, y1)])
+        if self._below:
+            tail = QPolygonF([QPointF(tx - 16, y0 + 1), QPointF(tx, y0 - self.TAIL_H), QPointF(tx + 5, y0 + 1)])
+        else:
+            tail = QPolygonF([QPointF(tx - 16, y1 - 1), QPointF(tx, y1 + self.TAIL_H), QPointF(tx + 5, y1 - 1)])
+        path = QPainterPath()
+        path.addPolygon(body)
+        path.closeSubpath()
+        tail_path = QPainterPath()
+        tail_path.addPolygon(tail)
+        tail_path.closeSubpath()
+        path = path.united(tail_path)
+
+        p.save()                                  # bayangan merah miring
+        p.translate(self.SHADOW, self.SHADOW)
+        p.fillPath(path, RED)
+        p.restore()
+        p.setPen(pen(WHITE, 3))
+        p.setBrush(BLACK)
+        p.drawPath(path)
+
+        p.save()                                  # bintang bergerigi di sudut kanan atas
+        p.translate(x1 + 1, y0 - 1)
+        p.rotate((1.0 - clamp(sv)) * 90.0 + 12.0)
+        p.setPen(pen(WHITE, 2))
+        p.setBrush(RED)
+        p.drawPolygon(star_polygon(0, 0, 11, 5, 5))
+        p.restore()
+
+        p.setFont(self._font)                     # teks, muncul per huruf
+        p.setPen(WHITE)
+        remaining = int(self._reveal)
+        ty = y0 + self.PADY + self._ascent
+        for line in self._lines:
+            if remaining <= 0:
+                break
+            p.drawText(QPointF(x0 + self.PADX, ty), line[:remaining])
+            remaining -= len(line)
+            ty += self._line_h
+
+        p.setFont(self._tag_font)                 # name tag merah ala dialog Persona
+        tag_w = QFontMetrics(self._tag_font).horizontalAdvance(PET_NAME) + 20
+        tx0, ty0, th = x0 + 4, y0 - self.TAG_OVER, 20
+        tag = QPolygonF([QPointF(tx0 + 7, ty0), QPointF(tx0 + tag_w, ty0),
+                         QPointF(tx0 + tag_w - 7, ty0 + th), QPointF(tx0, ty0 + th)])
+        p.setPen(pen(WHITE, 2))
+        p.setBrush(RED)
+        p.drawPolygon(tag)
+        p.setPen(WHITE)
+        p.drawText(QRectF(tx0, ty0, tag_w, th), Qt.AlignmentFlag.AlignCenter.value, PET_NAME)
+
+    def mousePressEvent(self, e) -> None:
+        self.dismiss()
+
+
+# ---------------------------------------------------------------------------
+# 5. MENU RADIAL
+# ---------------------------------------------------------------------------
+@dataclass
+class MenuButton:
+    key: str
+    label: str
+    sub: str
+    sx: int            # arah kuadran: -1 kiri / +1 kanan
+    sy: int            # -1 atas / +1 bawah
+    rot: float         # kemiringan dasar (derajat)
+    phase: float       # fase gerak melayang
+    pop: Spring = field(default_factory=lambda: Spring(0.0, 230.0, 15.0))     # muncul (memantul)
+    hover: Spring = field(default_factory=lambda: Spring(0.0, 380.0, 26.0))   # sapuan merah
+    press: Spring = field(default_factory=lambda: Spring(0.0, 700.0, 36.0))   # mengempis saat ditekan
+
+
+class RadialMenu(QWidget):
+    """Menu radial: tombol muncul bergantian dari karakter (pegas, berputar sambil
+    mengembang), melayang pelan, hover = sapuan merah diagonal + bintang berputar,
+    klik = mengempis. Menutup dengan redaman kritis (tanpa pantulan)."""
+
+    triggered = pyqtSignal(str, QPoint)   # key tombol, titik global di dekat tombol
+    closed = pyqtSignal()
+
+    BTN_W, BTN_H = 140, 52
+    SHEAR = -0.28
+    STAGGER = 0.05                        # jeda antar tombol saat membuka (detik)
+    OPEN_STIFFNESS, OPEN_DAMPING = 230.0, 15.0
+    CLOSE_STIFFNESS = 340.0
+
+    def __init__(self, pet: PetWindow) -> None:
+        super().__init__()
+        setup_overlay(self)
+        self.setMouseTracking(True)
+        self._pet = pet
+        self._buttons = [
+            MenuButton("agenda", "AGENDA", "NEXT EVENT", -1, -1, -4, 0.0),
+            MenuButton("tasks", "TASKS", "TO-DO LIST", +1, -1, 3, 1.7),
+            MenuButton("notes", "NOTES", "QUICK NOTES", +1, +1, -3, 3.4),
+            MenuButton("system", "SYSTEM", "OPTIONS / SLEEP", -1, +1, 4, 5.1),
+        ]
+        self._base = QPolygonF(QRectF(-self.BTN_W / 2, -self.BTN_H / 2, self.BTN_W, self.BTN_H))
+        self._label_font = p5_font(22)
+        self._sub_font = p5_font(9)
+        self._rx = self._ry = 0.0
+        self._t = 0.0
+        self._open = False
+        self._mask_on = False
+        self._pressed = -1
+
+        self._ticker = FrameTicker(self._frame, self)
+        self._auto_close = QTimer(self)       # menutup sendiri kalau dibiarkan
+        self._auto_close.setSingleShot(True)
+        self._auto_close.setInterval(15000)
+        self._auto_close.timeout.connect(self.close_menu)
+
+    # -- buka / tutup --------------------------------------------------------
+    @property
+    def is_open(self) -> bool:
+        return self._open and self.isVisible()
+
+    def _layout(self) -> None:
+        size = self._pet.sprite_size
+        self._rx = size / 2 + 82
+        self._ry = max(30.0, 0.4 * size - 21)
+        self.setFixedSize(int(2 * (self._rx + self.BTN_W / 2 + 46)),
+                          int(2 * (self._ry + self.BTN_H / 2 + 46)))
+
+    def open_menu(self) -> None:
+        self._layout()
+        if self.isVisible():
+            self._t = 10.0                      # sedang menutup lalu dibuka lagi: tanpa jeda stagger
+        else:
+            self._t = 0.0
+            for b in self._buttons:
+                b.pop.snap(0.0)
+                b.hover.snap(0.0)
+                b.press.snap(0.0)
+        self._open = True
+        self._mask_on = False
+        self.clearMask()
+        for b in self._buttons:
+            b.pop.configure(self.OPEN_STIFFNESS, self.OPEN_DAMPING)
+        self.follow(force=True)
+        self.show()
+        self.raise_()
+        self._auto_close.start()
+        self._ticker.start()
+
+    def close_menu(self) -> None:
+        if not self.isVisible() or not self._open:
+            return
+        self._open = False
+        self._mask_on = False
+        self.clearMask()
+        self._auto_close.stop()
+        for b in self._buttons:
+            b.pop.configure(self.CLOSE_STIFFNESS)       # kritis: menutup tanpa memantul
+            b.hover.target = 0.0
+        self._ticker.start()
+
+    def follow(self, force: bool = False) -> None:
+        if self.isVisible() or force:
+            c = self._pet.geometry().center()
+            self.move(c.x() - self.width() // 2, c.y() - self.height() // 2)
+
+    # -- loop animasi ---------------------------------------------------------
+    def _frame(self, dt: float) -> bool:
+        if not self.isVisible():                       # disembunyikan dari luar -> berhenti
+            self._open = False
+            return False
+        self._t += dt
+        for i, b in enumerate(self._buttons):
+            if self._open:
+                b.pop.target = 1.0 if self._t >= i * self.STAGGER else 0.0
+            else:
+                b.pop.target = 0.0
+            b.pop.step(dt)
+            b.hover.step(dt)
+            b.press.step(dt)
+        self.update()
+        if self._open:
+            if not self._mask_on and all(b.pop.at_rest and b.pop.target == 1.0 for b in self._buttons):
+                self.setMask(self._build_mask())       # setelah menetap: hanya tombol yang menangkap klik
+                self._mask_on = True
+            return True                                # gerak melayang berjalan selama menu terbuka
+        if all(b.pop.value < 0.04 for b in self._buttons):
+            for b in self._buttons:
+                b.pop.snap(0.0)
+            self.hide()
+            self.closed.emit()
+            return False
+        return True
+
+    # -- geometri tombol -----------------------------------------------------
+    def _xf(self, b: MenuButton, pop: float | None = None, hover: float | None = None,
+            wobble: bool = True) -> QTransform:
+        pop = b.pop.value if pop is None else pop
+        hov = clamp(b.hover.value, 0.0, 1.3) if hover is None else hover
+        prs = b.press.value
+        live = clamp(pop)
+        fx = math.sin(self._t * 1.6 + b.phase) * 2.2 * live if wobble else 0.0
+        fy = math.cos(self._t * 1.25 + b.phase * 1.3) * 2.6 * live if wobble else 0.0
+        sway = math.sin(self._t * 1.1 + b.phase) * 0.7 * live if wobble else 0.0
+        t = QTransform()
+        t.translate(self.width() / 2.0 + b.sx * self._rx * pop + fx,
+                    self.height() / 2.0 + b.sy * self._ry * pop + fy)
+        t.translate(b.sx * 8.0 * hov, b.sy * 5.0 * hov)            # bergeser ke luar saat hover
+        t.rotate(b.rot + (1.0 - live) * 28.0 * -b.sx + sway)       # berputar masuk saat muncul
+        s = (0.4 + 0.6 * max(pop, 0.0)) * (1.0 + 0.09 * hov) * (1.0 - 0.07 * prs)
+        t.scale(s, s)
+        t.shear(self.SHEAR, 0.0)
+        return t
+
+    def _hit(self, pos: QPointF) -> int:
+        for i in reversed(range(len(self._buttons))):
+            b = self._buttons[i]
+            if b.pop.value < 0.5:
+                continue
+            if self._xf(b).map(self._base).containsPoint(pos, Qt.FillRule.OddEvenFill):
+                return i
+        return -1
+
+    def _build_mask(self) -> QRegion:
+        region = QRegion()
+        W, H = self.BTN_W, self.BTN_H
+        grow = QPolygonF(QRectF(-W / 2 - 30, -H / 2 - 8, W + 56, H + 16))   # ruang bintang + bayangan + melayang
+        for b in self._buttons:
+            poly = self._xf(b, pop=1.0, hover=1.0, wobble=False).map(grow)
+            region = region.united(QRegion(poly.toPolygon()))
+        return region
+
+    # -- event ---------------------------------------------------------------
+    def mouseMoveEvent(self, e) -> None:
+        idx = self._hit(e.position())
+        for i, b in enumerate(self._buttons):
+            b.hover.target = 1.0 if i == idx else 0.0
+        self.setCursor(Qt.CursorShape.PointingHandCursor if idx >= 0 else Qt.CursorShape.ArrowCursor)
+        if self._auto_close.isActive():
+            self._auto_close.start()
+
+    def leaveEvent(self, e) -> None:
+        for b in self._buttons:
+            b.hover.target = 0.0
+
+    def mousePressEvent(self, e) -> None:
+        if e.button() != Qt.MouseButton.LeftButton:
+            return
+        idx = self._hit(e.position())
+        if idx < 0:
+            self.close_menu()      # klik area kosong (jika mask tidak didukung platform)
+            return
+        self._pressed = idx
+        self._buttons[idx].press.target = 1.0
+        self._ticker.start()
+
+    def mouseReleaseEvent(self, e) -> None:
+        if e.button() != Qt.MouseButton.LeftButton or self._pressed < 0:
+            return
+        idx, self._pressed = self._pressed, -1
+        b = self._buttons[idx]
+        b.press.target = 0.0
+        if self._hit(e.position()) == idx:
+            anchor = self._xf(b, pop=1.0, hover=0.0, wobble=False).map(QPointF(-self.BTN_W / 2, self.BTN_H / 2))
+            self.triggered.emit(b.key, self.mapToGlobal(anchor.toPoint()))
+
+    # -- menggambar ------------------------------------------------------------
+    def paintEvent(self, _event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        for b in sorted(self._buttons, key=lambda x: x.hover.value):   # yang di-hover digambar paling atas
+            self._paint_button(p, b)
+
+    def _paint_button(self, p: QPainter, b: MenuButton) -> None:
+        opacity = clamp(b.pop.value * 1.7)
+        if opacity <= 0.01:
+            return
+        W, H = self.BTN_W, self.BTN_H
+        hv = b.hover.value
+        hov = clamp(hv)
+        rect = QRectF(-W / 2, -H / 2, W, H)
+        p.save()
+        p.setOpacity(opacity)
+        p.setTransform(self._xf(b))
+
+        off = 6.0 + 3.0 * hov                                       # bayangan miring (putih saat hover)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(lerp_color(RED, WHITE, hov))
+        p.drawRect(rect.translated(off, off))
+        p.setPen(pen(WHITE, 3))                                      # badan hitam + garis putih
+        p.setBrush(BLACK)
+        p.drawRect(rect)
+
+        if hov > 0.01:
+            p.save()                                                 # sapuan merah diagonal
+            p.setClipRect(rect.adjusted(1.5, 1.5, -1.5, -1.5))
+            edge = rect.left() + hv * (W + 40) - 20
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(RED)
+            p.drawPolygon(QPolygonF([QPointF(rect.left() - 6, rect.top()), QPointF(edge + 16, rect.top()),
+                                     QPointF(edge - 16, rect.bottom()), QPointF(rect.left() - 6, rect.bottom())]))
+            p.setPen(pen(WHITE, 2.5))
+            p.drawLine(QPointF(edge + 16, rect.top()), QPointF(edge - 16, rect.bottom()))
+            p.restore()
+
+            p.save()                                                 # bintang penanda berputar
+            p.translate(rect.left() - 4, 0.0)
+            p.rotate(hov * 160.0)
+            sc = 0.2 + 0.8 * hov
+            p.scale(sc, sc)
+            p.setPen(pen(BLACK, 2))
+            p.setBrush(WHITE)
+            p.drawPolygon(star_polygon(0, 0, 13, 6, 5))
+            p.restore()
+
+        nudge = 5.0 * hov
+        p.setPen(WHITE)
+        p.setFont(self._label_font)
+        p.drawText(QRectF(-W / 2 + nudge, -H / 2 + 3, W, 30), Qt.AlignmentFlag.AlignCenter.value, b.label)
+        p.setPen(lerp_color(LIGHT_RED, WHITE, hov))
+        p.setFont(self._sub_font)
+        p.drawText(QRectF(-W / 2 + nudge, 6, W, 16), Qt.AlignmentFlag.AlignCenter.value, b.sub)
+        p.restore()
+
+
+# ---------------------------------------------------------------------------
+# 6. POMODORO & SYSTEM MONITOR
+# ---------------------------------------------------------------------------
+class PomodoroTimer(QObject):
+    FOCUS, REST = "focus", "rest"
+    tick = pyqtSignal(str, int)         # fase, sisa detik
+    phase_started = pyqtSignal(str)
+    finished = pyqtSignal()             # siklus selesai alami
+    stopped = pyqtSignal()              # dihentikan manual
+
+    def __init__(self, focus_min: float, rest_min: float, parent=None) -> None:
+        super().__init__(parent)
+        self.focus_s = max(1, int(focus_min * 60))
+        self.rest_s = max(1, int(rest_min * 60))
+        self.phase = self.FOCUS
+        self.completed = 0
+        self._deadline = 0.0            # pakai jam monotonic -> tidak melenceng saat laptop sleep
+        self._timer = QTimer(self)
+        self._timer.setInterval(1000)
+        self._timer.timeout.connect(self._on_tick)
+
+    @property
+    def running(self) -> bool:
+        return self._timer.isActive()
+
+    def remaining(self) -> int:
+        return self._left() if self.running else 0
+
+    def _left(self) -> int:
+        return max(0, math.ceil(self._deadline - time.monotonic()))
+
+    def start(self) -> None:
+        self._timer.start()
+        self._begin(self.FOCUS)
+
+    def stop(self) -> None:
+        was_running = self.running
+        self._timer.stop()
+        if was_running:
+            self.stopped.emit()
+
+    def _begin(self, phase: str) -> None:
+        self.phase = phase
+        self._deadline = time.monotonic() + (self.focus_s if phase == self.FOCUS else self.rest_s)
+        self.phase_started.emit(phase)
+        self.tick.emit(phase, self._left())
+
+    def _on_tick(self) -> None:
+        left = self._left()
+        if left > 0:
+            self.tick.emit(self.phase, left)
+        elif self.phase == self.FOCUS:
+            self.completed += 1
+            self._begin(self.REST)
+        else:
+            self._timer.stop()
+            self.finished.emit()
+
+
+@dataclass
+class SysSnapshot:
+    cpu: float
+    ram_percent: float
+    ram_used_gb: float
+    ram_total_gb: float
+
+
+class SystemMonitor(QObject):
+    """Sampel CPU tiap 2 detik di latar (non-blocking); RAM dibaca saat diminta."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._cpu: float | None = None
+        self._timer = QTimer(self)
+        self._timer.setInterval(2000)
+        self._timer.timeout.connect(self._sample)
+        if psutil is not None:
+            psutil.cpu_percent(interval=None)   # prime: panggilan pertama selalu 0.0
+            self._timer.start()
+
+    def _sample(self) -> None:
+        self._cpu = psutil.cpu_percent(interval=None)
+
+    def snapshot(self) -> SysSnapshot | None:
+        if psutil is None:
+            return None
+        if self._cpu is None:                   # diklik sebelum sampel pertama
+            self._cpu = psutil.cpu_percent(interval=0.2)
+        vm = psutil.virtual_memory()
+        return SysSnapshot(self._cpu, vm.percent, vm.used / 2**30, vm.total / 2**30)
+
+
+# ---------------------------------------------------------------------------
+# 7. KALENDER ASINKRON
+# ---------------------------------------------------------------------------
+class CalendarFetcher(QObject):
+    """Menjalankan CalendarService.get_upcoming() di thread latar agar UI tidak membeku
+    (panggilan jaringan dan login browser bisa memakan waktu beberapa detik)."""
+
+    done = pyqtSignal(object)           # CalendarResult
+
+    def __init__(self, service: CalendarService, parent=None) -> None:
+        super().__init__(parent)
+        self._service = service
+        self._busy = False
+
+    @property
+    def busy(self) -> bool:
+        return self._busy
+
+    def fetch(self, interactive: bool = False) -> bool:
+        if self._busy:
+            return False
+        self._busy = True
+        threading.Thread(target=self._run, args=(interactive,), daemon=True,
+                         name="calendar-fetch").start()
+        return True
+
+    def _run(self, interactive: bool) -> None:
+        try:
+            result = self._service.get_upcoming(interactive=interactive)
+        except Exception as exc:        # get_upcoming sudah menangkap semuanya; sekadar jaga-jaga
+            result = CalendarResult([], "error", str(exc))
+        self._busy = False
+        self.done.emit(result)          # diterima di thread UI (queued connection)
+
+
+# ---------------------------------------------------------------------------
+# 8. CONTROLLER
+# ---------------------------------------------------------------------------
+class PetController(QObject):
+    def __init__(self, args: argparse.Namespace) -> None:
+        super().__init__()
+        self.args = args
+        self.sprites = SpriteBank()
+        self.pet = PetWindow(self.sprites, args.size)
+        self.bubble = BubbleWindow(self.pet)
+        self.menu = RadialMenu(self.pet)
+        self.pomodoro = PomodoroTimer(args.focus, args.rest, self)
+        self.monitor = SystemMonitor(self)
+
+        # data & integrasi Tahap 2
+        self.tasks = TaskStore(APP_DIR / "tasks.json")
+        self.notes = NoteStore(APP_DIR / "notes.json")
+        self.settings = SettingsStore(APP_DIR / "settings.json")
+        if args.curfew is not None:               # --curfew/--wake menimpa pengaturan untuk sesi ini saja
+            self.settings.set(save=False, bedtime=args.curfew.strftime("%H:%M"))
+        if args.wake is not None:
+            self.settings.set(save=False, wake=args.wake.strftime("%H:%M"))
+        lines = load_lines(LINES_FILE)            # kalimat Morgana dari morgana_list.md
+        self._greetings = lines["greeting"]
+        self._bag_bedtime = LineBag(lines["bedtime"])
+        self._bag_agenda = LineBag(lines["agenda"])
+        self._bag_general = LineBag(lines["general"])
+        self.calendar = CalendarService(APP_DIR)
+        self.fetcher = CalendarFetcher(self.calendar, self)
+        self.tasks_dialog: TasksDialog | None = None
+        self.notes_dialog: NotesDialog | None = None
+        self.settings_dialog: SettingsDialog | None = None
+        self._cal_events: list[CalendarEvent] = []
+        self._remind_last: dict[str, float] = {}    # kunci acara -> waktu (monotonic) pengingat terakhir
+        self._remind_started: set[str] = set()      # acara yang sudah diberi pesan "dimulai sekarang"
+        self._agenda_wanted = False            # pengguna menunggu hasil AGENDA
+
+        # state karakter
+        self.forced_state: str | None = None   # override manual dari menu klik kanan
+        self.sleep_mode = False
+        self.curfew_enabled = bool(self.settings["curfew_enabled"])
+        self.curfew_active = False
+        self._last_curfew_msg: datetime | None = None
+        self.on_top = True
+
+        self._build_context_menu()
+        self._build_system_menu()
+        self._build_tray()
+
+        self.pet.clicked.connect(self._on_pet_clicked)
+        self.pet.moved.connect(self._on_pet_moved)
+        self.pet.context_requested.connect(self.context_menu.popup)
+        self.bubble.dismissed.connect(self._restore_state)
+        self.menu.triggered.connect(self._on_menu_action)
+        self.pomodoro.tick.connect(self._on_pomo_tick)
+        self.pomodoro.phase_started.connect(self._on_pomo_phase)
+        self.pomodoro.finished.connect(self._on_pomo_finished)
+        self.pomodoro.stopped.connect(lambda: self.pet.set_badge(""))
+        self.fetcher.done.connect(self._on_calendar_result)
+
+        self._curfew_timer = QTimer(self)
+        self._curfew_timer.setInterval(30_000)
+        self._curfew_timer.timeout.connect(self._check_curfew)
+        self._reminder_timer = QTimer(self)        # deadline catatan + acara kalender
+        self._reminder_timer.setInterval(REMINDER_CHECK_MS)
+        self._reminder_timer.timeout.connect(self._check_reminders)
+        self._calendar_timer = QTimer(self)
+        self._calendar_timer.setInterval(CALENDAR_REFRESH_MS)
+        self._calendar_timer.timeout.connect(self._refresh_calendar)
+        self._chatter_timer = QTimer(self)
+        self._chatter_timer.setSingleShot(True)
+        self._chatter_timer.timeout.connect(self._chatter)
+
+    # -- siklus hidup -------------------------------------------------------
+    def start(self) -> None:
+        self._move_to_corner(QGuiApplication.primaryScreen())
+        self.pet.show()
+        self._check_curfew()
+        self._curfew_timer.start()
+        self._reminder_timer.start()
+        self._calendar_timer.start()
+        self._schedule_chatter()
+        QTimer.singleShot(900, self._startup_report)
+        QTimer.singleShot(3000, self._refresh_calendar)
+
+    def quit(self) -> None:
+        if self.tray is not None:
+            self.tray.hide()
+        QApplication.quit()
+
+    # -- state & dialog -------------------------------------------------------
+    def base_state(self) -> str:
+        if self.forced_state:
+            return self.forced_state
+        return "sleepy" if (self.sleep_mode or self.curfew_active) else "idle"
+
+    def _restore_state(self) -> None:
+        self.pet.set_state(self.base_state())
+        self.pet.set_talking(False)
+
+    def say(self, text: str, state: str = "talking", ms: int | None = None) -> None:
+        if not self.forced_state:
+            self.pet.set_state(state)
+        self.pet.set_talking(True)
+        self.bubble.show_message(text, ms or max(4000, 2500 + 55 * len(text)))
+
+    def _schedule_chatter(self) -> None:
+        base_ms = max(0.05, self.args.chatter) * 60_000
+        self._chatter_timer.start(int(base_ms * random.uniform(0.75, 1.5)))
+
+    def _chatter(self) -> None:
+        if not self.sleep_mode and not self.menu.is_open and not self.bubble.isVisible():
+            self.say(self._bag_general.next())
+        self._schedule_chatter()
+
+    # -- startup: ringkasan tugas ---------------------------------------------
+    def _startup_report(self) -> None:
+        if self.curfew_active:                  # pengingat tidur lebih penting
+            return
+        pending = self.tasks.pending()
+        greeting = random.choice(greeting_pool(self._greetings, datetime.now().hour))
+        if not pending:
+            self.say(greeting)
+            return
+        shown = pending[:STARTUP_TASK_LIMIT]
+        lines = [f"{i}. {clip(t['title'], 44)}" for i, t in enumerate(shown, 1)]
+        if len(pending) > len(shown):
+            lines.append(f"...dan {len(pending) - len(shown)} lagi")
+        self.say(f"{greeting}\n\nHari ini ada {len(pending)} tugas belum selesai:\n" + "\n".join(lines),
+                 "talking", ms=13000)
+
+    # -- interaksi pet ---------------------------------------------------------
+    def _on_pet_clicked(self) -> None:
+        if self.menu.is_open:
+            self.menu.close_menu()
+        else:
+            self.menu.open_menu()
+            self.say(self._bag_general.next(), ms=4500)
+
+    def _on_pet_moved(self) -> None:
+        self.bubble.follow()
+        self.menu.follow()
+
+    def _on_menu_action(self, key: str, anchor: QPoint) -> None:
+        self.menu.close_menu()
+        if key == "agenda":
+            self._act_agenda()
+        elif key == "tasks":
+            if self.tasks_dialog is None:
+                self.tasks_dialog = TasksDialog(self.tasks)
+            self.tasks_dialog.show_near(self.pet.geometry())
+        elif key == "notes":
+            if self.notes_dialog is None:
+                self.notes_dialog = NotesDialog(self.notes)
+            self.notes_dialog.show_near(self.pet.geometry())
+        elif key == "system":
+            self.system_menu.popup(anchor)
+
+    # -- AGENDA: Google Calendar ---------------------------------------------------
+    def _act_agenda(self) -> None:
+        if not self.calendar.is_configured():
+            # Tanpa credentials.json: tampilkan panduan + jadwal dummy (instan, tanpa jaringan)
+            result = self.calendar.get_upcoming()
+            self._cal_events = result.events if self.args.demo_reminders else self._cal_events
+            self._show_agenda(result)
+            return
+        self._agenda_wanted = True
+        if self.calendar.has_token():
+            self.say("Mengecek kalender...", ms=5000)
+        else:
+            self.say("Aku buka browser untuk izin Google Calendar (cukup sekali). "
+                     "Selesaikan login di sana ya!", ms=9000)
+        self.fetcher.fetch(interactive=True)   # jika sedang sibuk, hasilnya tetap ditampilkan nanti
+
+    def _show_agenda(self, result: CalendarResult) -> None:
+        text = format_agenda(result)
+        self.say(text, "talking", ms=max(8000, 2500 + 50 * len(text)))
+
+    def _refresh_calendar(self) -> None:
+        """Pembaruan latar (tanpa membuka browser). Dipakai untuk pengingat 15 menit sebelum acara."""
+        if not self.calendar.is_configured():
+            if self.args.demo_reminders:
+                self._cal_events = self.calendar.get_upcoming().events
+            return
+        if self.calendar.has_token():
+            self.fetcher.fetch(interactive=False)
+
+    def _on_calendar_result(self, result: CalendarResult) -> None:
+        if result.status == "ok" or (result.is_dummy and self.args.demo_reminders):
+            self._cal_events = result.events
+        if not self._agenda_wanted:
+            return
+        if result.status == "auth_needed":     # fetch latar gagal login -> ulangi interaktif
+            if self.fetcher.fetch(interactive=True):
+                self.say("Izin Google kedaluwarsa. Aku buka browser untuk login ulang...", ms=9000)
+            return
+        self._agenda_wanted = False
+        self._show_agenda(result)
+
+    # -- pengingat: acara H-2 jam (jeda 10 menit) & deadline catatan -------------------
+    def _check_reminders(self) -> None:
+        messages: list[str] = []
+        now = datetime.now()
+        aware_now = now.astimezone()
+
+        # 1) catatan yang deadline-nya sudah tiba (termasuk yang terlewat saat aplikasi mati)
+        for note in self.notes.due(now):
+            self.notes.mark_notified(note["id"])
+            title = note.get("title") or "Catatan"
+            line = f"DEADLINE SEKARANG: {title}"
+            snippet = clip(note.get("content", ""), 70)
+            if snippet and snippet != title:
+                line += f"\n{snippet}"
+            messages.append(line)
+
+        # 2) hitung mundur: mulai H-<jendela>, ulangi tiap <interval> menit sampai acara dimulai
+        window = timedelta(minutes=self.settings["event_window_min"])
+        interval_s = self.settings["event_interval_min"] * 60 - 15      # toleransi 15 dtk karena timer 30 dtk
+        upcoming: list[tuple[str, str, datetime]] = []                  # (kunci, judul, waktu mulai)
+        for ev in self._cal_events:
+            if not ev.all_day:
+                upcoming.append((f"cal:{ev.id}@{ev.start.isoformat()}", ev.title, ev.start))
+        if NOTE_COUNTDOWN_REMINDERS:
+            for n in self.notes.with_deadline():
+                dl = parse_dt(n.get("deadline"))
+                if dl is not None:
+                    upcoming.append((f"note:{n['id']}@{n['deadline']}", n.get("title") or "Catatan",
+                                     dl.astimezone()))
+        countdown: list[str] = []
+        for key, title, start in upcoming:
+            delta = start - aware_now
+            if timedelta(0) < delta <= window:
+                last = self._remind_last.get(key)
+                if last is None or time.monotonic() - last >= interval_s:
+                    self._remind_last[key] = time.monotonic()
+                    countdown.append(f"{title}\nMulai {start:%H:%M}, {human_delta(delta)} lagi")
+            elif (key.startswith("cal:") and key not in self._remind_started
+                  and -timedelta(seconds=EVENT_STARTED_GRACE_S) < delta <= timedelta(0)):
+                self._remind_started.add(key)
+                messages.append(f"SEKARANG: {title} ({start:%H:%M})")
+        if countdown:
+            head = "Acara berikutnya:" if len(countdown) == 1 else "Acara mendekat:"
+            messages.append(head + "\n" + "\n\n".join(countdown) + "\n\n" + self._bag_agenda.next())
+
+        if messages:
+            self.say("\n\n".join(messages), "talking", ms=12000)   # state talking + balon
+            self.pet.bump(1.3)                                      # melompat menarik perhatian
+            play_beep()
+
+    # -- SYSTEM: opsi cepat & mode tidur ---------------------------------------
+    def _build_system_menu(self) -> None:
+        m = QMenu()
+        m.setStyleSheet(MENU_QSS)
+        self.system_menu = m
+        self.act_sys_status = m.addAction("Status Sistem (CPU / RAM)", self._act_item)
+        self.act_sys_pomo = m.addAction("Pomodoro", self._act_heal)
+        self.act_sys_sleep = m.addAction("Mode Tidur", self._toggle_sleep_mode)
+        self.act_sys_bed = m.addAction("Waktu tidur")
+        self.act_sys_bed.setEnabled(False)                 # hanya info
+        m.addAction("Pengaturan...", self._open_settings)
+        m.addSeparator()
+        m.addAction("Buka VS Code", self._launch_vscode)
+        m.addAction("Buka Terminal", self._launch_terminal)
+        m.aboutToShow.connect(self._refresh_system_menu)
+
+    def _refresh_system_menu(self) -> None:
+        if self.pomodoro.running:
+            self.act_sys_pomo.setText(f"Pomodoro: sisa {fmt_mmss(self.pomodoro.remaining())}")
+        else:
+            self.act_sys_pomo.setText(f"Mulai Pomodoro ({self.args.focus:g} menit)")
+        self.act_sys_sleep.setText("Bangunkan Aku (matikan Mode Tidur)" if self.sleep_mode
+                                   else "Mode Tidur (istirahat)")
+        self.act_sys_bed.setText(self._bedtime_text())
+
+    def _bedtime_text(self) -> str:
+        if not self.curfew_enabled:
+            return "Pengingat tidur: nonaktif"
+        bed = self.settings.bedtime
+        if self.curfew_active:
+            return f"Sudah lewat waktu tidur ({bed:%H:%M})"
+        now = datetime.now()
+        target = datetime.combine(now.date(), bed)
+        if target <= now:
+            target += timedelta(days=1)
+        return f"Waktu tidur {bed:%H:%M} ({human_delta(target - now)} lagi)"
+
+    def _open_settings(self) -> None:
+        if self.settings_dialog is None:
+            self.settings_dialog = SettingsDialog(self.settings)
+            self.settings_dialog.saved.connect(self.apply_settings)
+        self.settings_dialog.show_near(self.pet.geometry())
+
+    def apply_settings(self) -> None:
+        """Dipanggil setelah pengaturan disimpan: langsung berlaku tanpa restart."""
+        self.curfew_enabled = bool(self.settings["curfew_enabled"])
+        self.act_curfew.blockSignals(True)
+        self.act_curfew.setChecked(self.curfew_enabled)
+        self.act_curfew.blockSignals(False)
+        self._last_curfew_msg = None
+        self._check_curfew()
+
+    def _toggle_sleep_mode(self) -> None:
+        self.sleep_mode = not self.sleep_mode
+        if self.sleep_mode:
+            self.say("Mode Tidur aktif. Pengingat tetap berjalan; "
+                     "buka SYSTEM lagi untuk membangunkanku.", "sleepy", 6000)
+        else:
+            self.say("Mode Tidur dimatikan.", "talking", 3000)
+        self._restore_state()
+
+    def _act_item(self) -> None:
+        snap = self.monitor.snapshot()
+        if snap is None:
+            self.say("Modul psutil belum terpasang. Jalankan: pip install psutil")
+            return
+        text = (f"SYSTEM STATUS\nCPU : {snap.cpu:.0f}%\n"
+                f"RAM : {snap.ram_percent:.0f}% ({snap.ram_used_gb:.1f} / {snap.ram_total_gb:.1f} GB)")
+        heavy = snap.cpu >= 85 or snap.ram_percent >= 90
+        if heavy:
+            text += "\nCPU/RAM tinggi. Tutup aplikasi yang tidak perlu."
+        self.say(text, "action" if heavy else "talking", ms=6500)
+
+    # -- Pomodoro ----------------------------------------------------------------
+    def _act_heal(self) -> None:
+        if self.pomodoro.running:
+            label = "fokus" if self.pomodoro.phase == PomodoroTimer.FOCUS else "istirahat"
+            self.say(f"Sisa {fmt_mmss(self.pomodoro.remaining())} untuk sesi {label}.")
+        else:
+            self.pomodoro.start()
+
+    def _on_pomo_tick(self, phase: str, left: int) -> None:
+        name = "FOKUS" if phase == PomodoroTimer.FOCUS else "REST"
+        self.pet.set_badge(f"{name} {fmt_mmss(left)}")
+
+    def _on_pomo_phase(self, phase: str) -> None:
+        if phase == PomodoroTimer.FOCUS:
+            self.say(f"Sesi fokus {fmt_mmss(self.pomodoro.focus_s)} dimulai! Matikan distraksi.", "action")
+        else:
+            self.say(f"Kerja bagus! Istirahat {fmt_mmss(self.pomodoro.rest_s)}. Minum air dan regangkan badan.")
+
+    def _on_pomo_finished(self) -> None:
+        self.pet.set_badge("")
+        self.say(f"Istirahat selesai. Sudah {self.pomodoro.completed} sesi fokus hari ini. "
+                 "Buka SYSTEM untuk lanjut!", "action")
+
+    def _stop_pomodoro(self) -> None:
+        self.pomodoro.stop()
+        self.say("Timer dihentikan. Mulai lagi lewat SYSTEM kapan pun kamu siap.")
+
+    # -- peluncur ----------------------------------------------------------------
+    def _launch_vscode(self) -> None:
+        cmd = find_vscode()
+        if cmd and launch_detached(cmd):
+            self.say("VS Code dibuka. Ayo mulai ngoding!", "action")
+        else:
+            self.say("VS Code tidak ditemukan. Pastikan perintah 'code' ada di PATH.")
+
+    def _launch_terminal(self) -> None:
+        cmd = find_terminal()
+        if cmd and launch_detached(cmd):
+            self.say("Terminal dibuka.", "action")
+        else:
+            self.say("Terminal tidak ditemukan. Atur variabel TERMINAL atau edit find_terminal().")
+
+    # -- curfew ------------------------------------------------------------------
+    def _check_curfew(self) -> None:
+        now = datetime.now()
+        active = self.curfew_enabled and in_window(now.time(), self.settings.bedtime, self.settings.wake)
+        if active:
+            if not self.curfew_active:
+                self.curfew_active = True
+                self._restore_state()
+            interval_s = self.settings["curfew_interval_min"] * 60 - 15    # toleransi timer 30 dtk
+            if (self._last_curfew_msg is None
+                    or (now - self._last_curfew_msg).total_seconds() >= interval_s):
+                self._last_curfew_msg = now
+                self.say(self._bag_bedtime.next(), "sleepy", 12000)
+        elif self.curfew_active:
+            self.curfew_active = False
+            self._last_curfew_msg = None
+            self._restore_state()
+
+    # -- menu klik kanan & tray ------------------------------------------------
+    def _build_context_menu(self) -> None:
+        m = QMenu()
+        m.setStyleSheet(MENU_QSS)
+        self.context_menu = m
+
+        state_menu = m.addMenu("Ganti State")
+        state_group = QActionGroup(m)
+        state_group.setExclusive(True)
+        for label, key in (("Auto", "auto"), ("Idle", "idle"), ("Talking", "talking"),
+                           ("Sleepy", "sleepy"), ("Action", "action")):
+            act = QAction(label, m)
+            act.setCheckable(True)
+            act.setData(key)
+            act.setChecked(key == "auto")
+            state_group.addAction(act)
+            state_menu.addAction(act)
+        state_group.triggered.connect(lambda a: self.set_forced_state(a.data()))
+
+        size_menu = m.addMenu("Ukuran Sprite")
+        size_group = QActionGroup(m)
+        size_group.setExclusive(True)
+        for px in SPRITE_SIZES:
+            act = QAction(f"{px} px", m)
+            act.setCheckable(True)
+            act.setData(px)
+            act.setChecked(px == self.args.size)
+            size_group.addAction(act)
+            size_menu.addAction(act)
+        size_group.triggered.connect(lambda a: self.set_size(int(a.data())))
+
+        m.addSeparator()
+        top = m.addAction("Always on Top")
+        top.setCheckable(True)
+        top.setChecked(True)
+        top.toggled.connect(self.set_always_on_top)
+
+        self.act_curfew = m.addAction("Pengingat Tidur")
+        self.act_curfew.setCheckable(True)
+        self.act_curfew.setChecked(self.curfew_enabled)
+        self.act_curfew.toggled.connect(self.set_curfew_enabled)
+        m.addAction("Pengaturan...", self._open_settings)
+
+        self.act_autostart = m.addAction("Auto-Start saat Boot")
+        self.act_autostart.setCheckable(True)
+        self.act_autostart.setChecked(autostart.is_enabled())
+        self.act_autostart.triggered.connect(self._toggle_autostart)   # hanya aksi pengguna
+
+        self.act_stop_pomo = m.addAction("Hentikan Pomodoro", self._stop_pomodoro)
+        m.addAction("Reset Posisi ke Pojok Layar", self.reset_position)
+        m.addSeparator()
+        m.addAction("Keluar", self.quit)
+        m.aboutToShow.connect(self._refresh_context_menu)
+
+    def _refresh_context_menu(self) -> None:
+        self.act_stop_pomo.setEnabled(self.pomodoro.running)
+        self.act_autostart.setChecked(autostart.is_enabled())    # sinkron bila diubah dari luar
+
+    def _build_tray(self) -> None:
+        self.tray: QSystemTrayIcon | None = None
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        self.tray = QSystemTrayIcon(QIcon(self.sprites.get("idle", 64, 1.0)), self)
+        self.tray.setToolTip(f"{PET_NAME.title()} - Coding Pet")
+        self.tray.setContextMenu(self.context_menu)
+        self.tray.activated.connect(self._on_tray_activated)
+        self.tray.show()
+
+    def _on_tray_activated(self, reason) -> None:
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:   # klik kiri pada ikon tray
+            if self.pet.isVisible():
+                self.menu.hide()
+                self.bubble.dismiss()
+                self.pet.hide()
+            else:
+                self.pet.show()
+
+    # -- aksi menu klik kanan ----------------------------------------------------
+    def _toggle_autostart(self, checked: bool) -> None:
+        ok, info = autostart.set_enabled(checked, SCRIPT_PATH)
+        if ok:
+            self.say("Auto-start aktif. Aku akan muncul otomatis saat komputer menyala!" if checked
+                     else "Auto-start dimatikan.", ms=5000)
+        else:
+            self.act_autostart.setChecked(autostart.is_enabled())
+            self.say(f"Gagal mengatur auto-start: {clip(info, 90)}", ms=8000)
+
+    def set_forced_state(self, key: str) -> None:
+        self.forced_state = None if key == "auto" else key
+        self._restore_state()
+
+    def set_size(self, px: int) -> None:
+        self.menu.hide()
+        self.pet.set_sprite_size(px)
+        self.bubble.follow()
+
+    def set_always_on_top(self, on: bool) -> None:
+        self.on_top = on
+        was_visible = self.pet.isVisible()
+        for w in (self.pet, self.bubble, self.menu):
+            w.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, on)   # ini menyembunyikan window
+        if was_visible:
+            self.pet.show()
+
+    def set_curfew_enabled(self, on: bool) -> None:
+        self.curfew_enabled = on
+        self.settings.set(curfew_enabled=on)
+        self._check_curfew()
+
+    def reset_position(self) -> None:
+        screen = QGuiApplication.screenAt(self.pet.geometry().center()) or QGuiApplication.primaryScreen()
+        self._move_to_corner(screen)
+
+    def _move_to_corner(self, screen) -> None:
+        area = screen.availableGeometry()
+        self.pet.move(area.right() - self.pet.width() - 24, area.bottom() - self.pet.height() - 24)
+
+
+# ---------------------------------------------------------------------------
+# 9. MAIN
+# ---------------------------------------------------------------------------
+def hhmm(value: str) -> dtime:
+    return datetime.strptime(value, "%H:%M").time()
+
+
+def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
+    ap = argparse.ArgumentParser(description="Desktop Coding Pet - gaya Persona 5")
+    ap.add_argument("--size", type=int, default=DEFAULT_SPRITE, help="ukuran sprite dalam px (default 180)")
+    ap.add_argument("--focus", type=float, default=25, help="durasi fokus Pomodoro, menit (default 25)")
+    ap.add_argument("--rest", type=float, default=5, help="durasi istirahat, menit (default 5)")
+    ap.add_argument("--curfew", type=hhmm, default=None, help="jam mulai pengingat tidur HH:MM untuk sesi ini (biasanya diatur lewat menu Pengaturan)")
+    ap.add_argument("--wake", type=hhmm, default=None, help="jam pengingat tidur berhenti HH:MM untuk sesi ini")
+    ap.add_argument("--chatter", type=float, default=4.0, help="rata-rata menit antar komentar acak (default 4)")
+    ap.add_argument("--demo-reminders", action="store_true",
+                    help="uji: jadwal dummy (tanpa credentials.json) ikut memicu pengingat 15 menit sebelum acara")
+    ap.add_argument("--multi", action="store_true", help="izinkan lebih dari satu instance (untuk uji)")
+    args, qt_args = ap.parse_known_args(argv[1:])
+    return args, [argv[0]] + qt_args
+
+
+def main() -> int:
+    install_crash_logger()
+    args, qt_argv = parse_args(sys.argv)
+
+    # Wayland tidak mengizinkan aplikasi menentukan posisi / always-on-top jendelanya sendiri.
+    # Di KDE Plasma (Wayland) kita pakai XWayland (xcb) supaya drag & always-on-top bekerja.
+    # Matikan dengan: PET_NATIVE_WAYLAND=1 python main.py
+    if (IS_LINUX and os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+            and "QT_QPA_PLATFORM" not in os.environ and not os.environ.get("PET_NATIVE_WAYLAND")):
+        os.environ["QT_QPA_PLATFORM"] = "xcb"
+
+    app = QApplication(qt_argv)
+    app.setApplicationName("Desktop Coding Pet")
+    app.setQuitOnLastWindowClosed(False)           # semua jendela bertipe Tool/overlay
+    signal.signal(signal.SIGINT, signal.SIG_DFL)   # Ctrl+C di terminal tetap bisa menutup app
+
+    # Satu instance saja (penting karena ada auto-start + menjalankan manual).
+    lock = QLockFile(os.path.join(QDir.tempPath(), "desktop-coding-pet.lock"))
+    lock.setStaleLockTime(0)                       # 0 = jangan anggap basi hanya karena lama
+    if not args.multi and not lock.tryLock(300):
+        msg = "Desktop Coding Pet sudah berjalan (lock: desktop-coding-pet.lock di folder temp)."
+        logging.getLogger("pet").info(msg)
+        if sys.stderr:
+            print(msg, file=sys.stderr)
+        return 0
+
+    controller = PetController(args)
+    controller.start()
+    code = app.exec()
+    lock.unlock()
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
