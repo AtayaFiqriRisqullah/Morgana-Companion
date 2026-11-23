@@ -15,3 +15,8 @@ notes.json
 *.corrupt-*
 pet.log
 *.lock
+
+# PyInstaller build artifacts
+build/
+dist/
+*.zip
