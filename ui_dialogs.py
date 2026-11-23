@@ -21,18 +21,18 @@ from PyQt6.QtCore import (QDate, QDateTime, QEvent, QPoint, QPointF, QRect, QRec
                           QTime, QTimer, pyqtSignal)
 from PyQt6.QtGui import (QColor, QFontMetrics, QGuiApplication, QKeySequence, QPainter,
                          QPainterPath, QPen, QPixmap, QPolygonF, QShortcut, QTextCursor)
-from PyQt6.QtWidgets import (QAbstractItemView, QCheckBox, QDateTimeEdit, QFrame, QHBoxLayout,
-                             QLabel, QLineEdit, QListWidget, QListWidgetItem, QProgressBar,
-                             QPushButton, QScrollArea, QSpinBox, QStyle, QStyledItemDelegate,
-                             QTextEdit, QTimeEdit, QVBoxLayout, QWidget)
+from PyQt6.QtWidgets import (QAbstractItemView, QCheckBox, QDateTimeEdit, QFrame, QGridLayout,
+                             QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+                             QProgressBar, QPushButton, QScrollArea, QSpinBox, QStyle,
+                             QStyledItemDelegate, QTextEdit, QTimeEdit, QVBoxLayout, QWidget)
 
 import sprites
 from audio_manager import play_ui
 from calendar_service import CalendarResult, events_by_day, human_delta, morgana_briefing
 from motion import FrameTicker, Spring, clamp
 from storage_manager import (DAILY_BLOCK_TARGET, DEFAULT_STAT_POINTS, QUICK_STAT_POINTS,
-                             SETTINGS_DEFAULTS, SOCIAL_STAT_KEYS, SOCIAL_STATS, TIME_BLOCKS,
-                             NoteStore, SettingsStore, SocialStatsStore, TaskStore,
+                             RADIAL_TAB_KEYS, SETTINGS_DEFAULTS, SOCIAL_STAT_KEYS, SOCIAL_STATS,
+                             TIME_BLOCKS, NoteStore, SettingsStore, SocialStatsStore, TaskStore,
                              default_time_block, parse_dt, stat_level, stat_level_progress,
                              stat_rank_title)
 from theme import (BLACK, DEEP_RED, GOLD, LIGHT_RED, P5_BG, P5_BORDER, P5_BORDER_HI,
@@ -199,7 +199,8 @@ class P5FluidButton(QPushButton):
 
     def __init__(self, text: str = "", variant: str = "soft", icon: str = "",
                  display: bool = False, px: int = 12, radius: float = 6.0,
-                 scale: float = 1.0, parent: QWidget | None = None) -> None:
+                 scale: float = 1.0, parent: QWidget | None = None,
+                 sfx_hover: bool = True, sfx_click: str | None = None) -> None:
         super().__init__(text, parent)
         self._variant = variant
         self._base_variant = variant
@@ -207,6 +208,8 @@ class P5FluidButton(QPushButton):
         self._radius = radius
         self._scale = max(0.75, min(1.5, float(scale)))
         self._active = False
+        self._sfx_hover = bool(sfx_hover)
+        self._sfx_click = sfx_click      # None = auto ('cancel' for danger/trash/stop else 'select'); "" = silent
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         fpx = _sc((px + 2) if display else (px + 1), self._scale, 9)
@@ -235,6 +238,8 @@ class P5FluidButton(QPushButton):
         return QSize(max(h, tw + iw + gap + pad), h)
 
     def enterEvent(self, e) -> None:
+        if self.isEnabled() and self._sfx_hover:
+            play_ui("ui_hover")
         self._hover.target = 1.0
         self._ticker.start()
         super().enterEvent(e)
@@ -245,7 +250,12 @@ class P5FluidButton(QPushButton):
         super().leaveEvent(e)
 
     def mousePressEvent(self, e) -> None:
-        if e.button() == Qt.MouseButton.LeftButton:
+        if e.button() == Qt.MouseButton.LeftButton and self.isEnabled():
+            if self._sfx_click is None:
+                cue = "cancel" if (self._variant == "danger" or self._icon in ("trash", "stop")) else "select"
+                play_ui(cue)
+            elif self._sfx_click:
+                play_ui(self._sfx_click)
             self._press.target = 1.0
             self._ticker.start()
         super().mousePressEvent(e)
@@ -316,6 +326,12 @@ class P5CheckBox(QCheckBox):
         self._scale = max(0.75, min(1.5, float(scale)))
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFont(ui_font(_sc(14, self._scale, 11), bold=True))
+        self.clicked.connect(lambda checked: play_ui("select" if checked else "cancel"))
+
+    def enterEvent(self, e) -> None:
+        if self.isEnabled():
+            play_ui("ui_hover")
+        super().enterEvent(e)
 
     def sizeHint(self) -> QSize:
         fm = QFontMetrics(self.font())
@@ -409,13 +425,15 @@ class P5FluidPanel(QWidget):
         self.outer.addWidget(content_w, 1)
 
     def _btn(self, text: str = "", variant: str = "soft", icon: str = "",
-             display: bool = False, px: int = 12, radius: float = 6.0) -> P5FluidButton:
+             display: bool = False, px: int = 12, radius: float = 6.0,
+             sfx_hover: bool = True, sfx_click: str | None = None) -> P5FluidButton:
         return P5FluidButton(text, variant=variant, icon=icon, display=display,
-                             px=px, radius=radius, scale=self._ui_scale)
+                             px=px, radius=radius, scale=self._ui_scale,
+                             sfx_hover=sfx_hover, sfx_click=sfx_click)
 
     def _add_close_button(self) -> None:
         sz = _sc(30, self._ui_scale, 24)
-        close_btn = self._btn("", variant="ghost", icon="close", radius=6.0)
+        close_btn = self._btn("", variant="ghost", icon="close", radius=6.0, sfx_click="")
         close_btn.setFixedSize(sz, sz)
         close_btn.setToolTip("Close (Esc)")
         close_btn.clicked.connect(self.close_animated)
@@ -986,6 +1004,7 @@ class TasksDialog(P5FluidPanel):
     open_settings = pyqtSignal()
     open_notes = pyqtSignal()
     tasks_changed = pyqtSignal()
+    task_completed = pyqtSignal(str, int)
 
     def __init__(self, store: TaskStore, on_top: bool = True, ui_scale: float = 1.0) -> None:
         super().__init__("TASKS", QSize(500, 610), on_top=on_top, ui_scale=ui_scale)
@@ -1000,9 +1019,9 @@ class TasksDialog(P5FluidPanel):
         self._count_lbl.setObjectName("subhead")
         self.header_bar.addWidget(self._count_lbl)
 
-        notes_btn = self._btn("NOTES", variant="soft", display=True, px=10)
-        notes_btn.clicked.connect(lambda _c=False: self.open_notes.emit())
-        self.header_bar.addWidget(notes_btn)
+        self._notes_btn = self._btn("NOTES", variant="soft", display=True, px=10)
+        self._notes_btn.clicked.connect(lambda _c=False: self.open_notes.emit())
+        self.header_bar.addWidget(self._notes_btn)
 
         set_btn = self._btn("", variant="soft", icon="gear")
         set_btn.setFixedSize(_sc(30, sc, 24), _sc(30, sc, 24))
@@ -1202,8 +1221,11 @@ class TasksDialog(P5FluidPanel):
         if done != bool(task.get("done")):
             self.store.set_done(task_id, done)
             if done:
+                play_ui("select")
                 self._delegate.start_check_anim(task_id)
+                self.task_completed.emit(task["title"], len(self.store.pending()))
             else:
+                play_ui("cancel")
                 self._delegate.clear_anim(task_id)
             self._resort_timer.start()
         self._update_status()
@@ -1283,9 +1305,9 @@ class NotesDialog(P5FluidPanel):
         self._undo_note: dict | None = None
 
         # Header quick actions (1-click jump to Tasks or Settings)
-        tasks_btn = self._btn("TASKS", variant="soft", display=True, px=10)
-        tasks_btn.clicked.connect(lambda _c=False: self.open_tasks.emit())
-        self.header_bar.addWidget(tasks_btn)
+        self._tasks_btn = self._btn("TASKS", variant="soft", display=True, px=10)
+        self._tasks_btn.clicked.connect(lambda _c=False: self.open_tasks.emit())
+        self.header_bar.addWidget(self._tasks_btn)
 
         set_btn = self._btn("", variant="soft", icon="gear")
         set_btn.setFixedSize(_sc(30, sc, 24), _sc(30, sc, 24))
@@ -1699,6 +1721,7 @@ class NotesDialog(P5FluidPanel):
             self._save(silent=True)
         note = self.store.get(note_id)
         if note is not None:
+            play_ui("select")
             self._load(note)
         QTimer.singleShot(0, self.refresh)
 
@@ -1882,8 +1905,9 @@ class SettingsDialog(P5FluidPanel):
         self.wake_edit.setDisplayFormat("HH:mm")
         self._row(l1, "Reminder stops (wake up)", self.wake_edit)
         self.curfew_interval = QSpinBox()
-        self.curfew_interval.setRange(1, 120)
-        self.curfew_interval.setSuffix(" min")
+        self.curfew_interval.setRange(10, 3600)
+        self.curfew_interval.setSingleStep(10)
+        self.curfew_interval.setSuffix(" sec")
         self._row(l1, "Morgana speaks every", self.curfew_interval)
         cards_lay.addWidget(c1)
 
@@ -1938,6 +1962,42 @@ class SettingsDialog(P5FluidPanel):
         l3.addWidget(self.on_top_check)
         l3.addWidget(self.autostart_check)
         cards_lay.addWidget(c3)
+
+        # Card 4: Radial menu tabs (enable/disable individual tabs)
+        c4 = _make_card()
+        l4 = QVBoxLayout(c4)
+        l4.setContentsMargins(pad_x, pad_y, pad_x, pad_y)
+        l4.setSpacing(row_gap)
+        h4 = QLabel("RADIAL MENU TABS")
+        h4.setObjectName("section")
+        l4.addWidget(h4)
+        tabs_grid = QGridLayout()
+        tabs_grid.setContentsMargins(0, 0, 0, 0)
+        tabs_grid.setHorizontalSpacing(_sc(12, sc, 8))
+        tabs_grid.setVerticalSpacing(_sc(6, sc, 4))
+        self.tab_checks: dict[str, P5CheckBox] = {}
+        tab_short = {
+            "events": "Events (7-Day)",
+            "tasks": "Tasks (To-Do)",
+            "timer": "Timer & Focus",
+            "notes": "Quick Notes",
+            "stats": "Social Stats",
+            "system": "System Menu",
+        }
+        # Mirror radial menu layout: Left column (Events, Timer, System), Right column (Tasks, Notes, Stats)
+        left_keys = ("events", "timer", "system")
+        right_keys = ("tasks", "notes", "stats")
+        for r_idx, (lk, rk) in enumerate(zip(left_keys, right_keys)):
+            for c_idx, key in enumerate((lk, rk)):
+                cb = P5CheckBox(tab_short.get(key, key.title()), scale=sc)
+                self.tab_checks[key] = cb
+                tabs_grid.addWidget(cb, r_idx, c_idx)
+        l4.addLayout(tabs_grid)
+        tab_tip = QLabel("Choose which tabs show in Morgana's radial menu. Right-click Morgana anytime for Settings.")
+        tab_tip.setObjectName("tip")
+        tab_tip.setWordWrap(True)
+        l4.addWidget(tab_tip)
+        cards_lay.addWidget(c4)
         cards_lay.addStretch(1)
 
         scroll.setWidget(scroll_body)
@@ -1978,7 +2038,7 @@ class SettingsDialog(P5FluidPanel):
         self.curfew_check.setChecked(bool(values["curfew_enabled"]))
         self.bed_edit.setTime(QTime.fromString(values["bedtime"], "HH:mm"))
         self.wake_edit.setTime(QTime.fromString(values["wake"], "HH:mm"))
-        self.curfew_interval.setValue(int(values["curfew_interval_min"]))
+        self.curfew_interval.setValue(int(values.get("curfew_interval_sec", SETTINGS_DEFAULTS["curfew_interval_sec"])))
         self.event_window.setValue(int(values["event_window_min"]))
         self.event_interval.setValue(int(values["event_interval_min"]))
         self.focus_spin.setValue(int(values.get("focus_min", SETTINGS_DEFAULTS["focus_min"])))
@@ -1986,6 +2046,9 @@ class SettingsDialog(P5FluidPanel):
         self.ui_scale_spin.setValue(int(values.get("ui_scale", SETTINGS_DEFAULTS["ui_scale"])))
         self.sound_check.setChecked(bool(values.get("sound_enabled", SETTINGS_DEFAULTS["sound_enabled"])))
         self.sound_vol_spin.setValue(int(values.get("sound_volume", SETTINGS_DEFAULTS["sound_volume"])))
+        enabled = set(values.get("enabled_tabs", RADIAL_TAB_KEYS))
+        for key, cb in self.tab_checks.items():
+            cb.setChecked(key in enabled)
         if self._get_on_top is not None:
             self.on_top_check.setChecked(bool(self._get_on_top()))
         if self._get_autostart is not None:
@@ -2008,12 +2071,16 @@ class SettingsDialog(P5FluidPanel):
                       self.event_window, self.event_interval, self.focus_spin,
                       self.rest_spin, self.ui_scale_spin, self.sound_vol_spin):
                 w.interpretText()
+            chosen_tabs = [k for k in RADIAL_TAB_KEYS if self.tab_checks[k].isChecked()]
+            if not chosen_tabs:
+                self.status.setText("Keep at least one radial menu tab enabled.")
+                return
             b, w = self.bed_edit.time(), self.wake_edit.time()
             self.store.set(
                 bedtime=f"{b.hour():02d}:{b.minute():02d}",
                 wake=f"{w.hour():02d}:{w.minute():02d}",
                 curfew_enabled=self.curfew_check.isChecked(),
-                curfew_interval_min=self.curfew_interval.value(),
+                curfew_interval_sec=self.curfew_interval.value(),
                 event_window_min=self.event_window.value(),
                 event_interval_min=self.event_interval.value(),
                 focus_min=self.focus_spin.value(),
@@ -2021,6 +2088,7 @@ class SettingsDialog(P5FluidPanel):
                 ui_scale=self.ui_scale_spin.value(),
                 sound_enabled=self.sound_check.isChecked(),
                 sound_volume=self.sound_vol_spin.value(),
+                enabled_tabs=chosen_tabs,
             )
             self.saved.emit()
             if self._get_on_top is not None and self.on_top_check.isChecked() != bool(self._get_on_top()):
@@ -2115,9 +2183,9 @@ class EventsDialog(P5FluidPanel):
         self._hdr_refresh.clicked.connect(lambda _c=False: self.refresh_requested.emit(True))
         self.header_bar.addWidget(self._hdr_refresh)
 
-        tasks_btn = self._btn("TASKS", variant="soft", display=True, px=10)
-        tasks_btn.clicked.connect(lambda _c=False: self.open_tasks.emit())
-        self.header_bar.addWidget(tasks_btn)
+        self._tasks_btn = self._btn("TASKS", variant="soft", display=True, px=10)
+        self._tasks_btn.clicked.connect(lambda _c=False: self.open_tasks.emit())
+        self.header_bar.addWidget(self._tasks_btn)
 
         set_btn = self._btn("", variant="soft", icon="gear")
         set_btn.setFixedSize(_sc(30, sc, 24), _sc(30, sc, 24))
@@ -2504,6 +2572,7 @@ class SocialPentagonWidget(QWidget):
             if d < best_d:
                 best_k, best_d = k, d
         if best_k and best_d <= 78.0 * self._scale:
+            play_ui("select")
             self.stat_clicked.emit(best_k)
 
     def paintEvent(self, _event) -> None:
@@ -2868,7 +2937,8 @@ class SocialStatsDialog(P5FluidPanel):
         self._act_input.returnPressed.connect(self._log_activity)
         act_row.addWidget(self._act_input, 1)
 
-        self._log_btn = self._btn(f"LOG +{DEFAULT_STAT_POINTS}", variant="primary", icon="plus", display=True, px=10)
+        self._log_btn = self._btn(f"LOG +{DEFAULT_STAT_POINTS}", variant="primary", icon="plus",
+                                  display=True, px=10, sfx_click="")
         self._log_btn.setFixedHeight(_sc(30, sc, 25))
         self._log_btn.clicked.connect(self._log_activity)
         act_row.addWidget(self._log_btn)

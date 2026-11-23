@@ -56,11 +56,11 @@ from audio_manager import init_audio, play_ui
 from calendar_service import CalendarEvent, CalendarResult, CalendarService, format_agenda, human_delta
 from emotions import EXPRESSIONS, STATE_EXPRESSION, emotion_for_text, voice_for_dialogue
 from motion import FrameTicker, Spring, clamp
-from lines import LineBag, greeting_pool, load_lines
+from lines import ContextualDialogue, LineBag, greeting_pool, load_lines
 import sprites
 from sprites import EYE_CLOSED, EYE_HALF, EYE_OPEN, MOUTH_BASE, MorganaSprites
-from storage_manager import (SOCIAL_STATS, NoteStore, SettingsStore, SocialStatsStore,
-                             TaskStore, parse_dt, stat_rank_title)
+from storage_manager import (RADIAL_TAB_KEYS, SOCIAL_STATS, NoteStore, SettingsStore,
+                             SocialStatsStore, TaskStore, parse_dt, stat_rank_title)
 from theme import (BLACK, BLACK_BURST_SHARDS, BLUE, GOLD, LIGHT_RED, MENU_QSS, P5_MINT_FG,
                    P5_SURFACE, RED, RED_BURST_SHARDS, UI_SCALE_PRESETS, WHITE, lerp_color,
                    load_fonts, menu_qss, p5_dialogue_font, p5_font, pen, scale_polygon,
@@ -1337,10 +1337,27 @@ class RadialMenu(QWidget):
 
     triggered = pyqtSignal(str, QPoint)   # key tombol, titik global di dekat tombol
     closed = pyqtSignal()
+    user_closed = pyqtSignal()            # emitted when user dismisses menu without launching a tab
 
     STAGGER = 0.05                        # jeda antar tombol saat membuka (detik)
     OPEN_STIFFNESS, OPEN_DAMPING = 230.0, 15.0
     CLOSE_STIFFNESS = 340.0
+
+    # Master tab definitions: (key, label, subtitle, side, hi_idx)
+    _TAB_DEFS: tuple[tuple[str, str, str, int, int], ...] = (
+        ("events", "EVENTS", "This Week",       -1, 2),
+        ("tasks",  "TASKS",  "To-Do List",      +1, 2),
+        ("timer",  "TIMER",  "Focus & Timers",  -1, 2),
+        ("notes",  "NOTES",  "Quick Notes",     +1, 2),
+        ("system", "SYSTEM", "Options & Sleep", -1, 2),
+        ("stats",  "STATS",  "Social Stats",    +1, 2),
+    )
+    # Non-overlapping fan slots per side count: list of (abs_ox_left, oy, rot_left_deg)
+    _SIDE_SLOTS: dict[int, tuple[tuple[float, float, float], ...]] = {
+        1: ((92.0,  -2.0,  +2.0),),
+        2: ((86.0, -34.0, +12.0), (86.0, +30.0, -10.0)),
+        3: ((80.0, -56.0, +20.0), (94.0,  -4.0,  +2.0), (88.0, +48.0, -11.0)),
+    }
 
     def __init__(self, pet: PetWindow) -> None:
         super().__init__()
@@ -1348,15 +1365,7 @@ class RadialMenu(QWidget):
         self.setMouseTracking(True)
         self._pet = pet
         self._backdrop = MenuBackdrop()
-        # 6-wedge P5 battle fan: 3 left (EVENTS, TIMER, SYSTEM) + 3 right (TASKS, NOTES, STATS)
-        self._buttons = [
-            MenuButton("events", "EVENTS", "This Week",       -1, -80, -56, +20.0, 176, 25, 48, 2, 0.0),
-            MenuButton("tasks",  "TASKS",  "To-Do List",      +1, +78, -56, -20.0, 176, 25, 48, 2, 1.0),
-            MenuButton("timer",  "TIMER",  "Focus & Timers",  -1, -94,  -4,  +2.0, 176, 25, 48, 2, 2.0),
-            MenuButton("notes",  "NOTES",  "Quick Notes",     +1, +92,  -4,  -2.0, 176, 25, 48, 2, 3.0),
-            MenuButton("system", "SYSTEM", "Options & Sleep", -1, -88, +48, -11.0, 176, 25, 48, 2, 4.0),
-            MenuButton("stats",  "STATS",  "Social Stats",    +1, +86, +48, +11.0, 176, 25, 48, 2, 5.0),
-        ]
+        self._buttons: list[MenuButton] = []
         self._u = 1.0                                    # button & font scale
         self._u_pos = 1.0                                # horizontal clearance from Morgana & HUD
         self._u_y = 1.0                                  # vertical separation scale
@@ -1368,12 +1377,48 @@ class RadialMenu(QWidget):
         self._mask_on = False
         self._pressed = -1
         self._hovered_idx = -1
+        self.set_enabled_tabs(list(RADIAL_TAB_KEYS))
 
         self._ticker = FrameTicker(self._frame, self)
         self._auto_close = QTimer(self)                  # menutup sendiri kalau dibiarkan
         self._auto_close.setSingleShot(True)
         self._auto_close.setInterval(15000)
-        self._auto_close.timeout.connect(self.close_menu)
+        self._auto_close.timeout.connect(lambda: self.close_menu(silent=False, emit_user_close=False))
+
+    def set_enabled_tabs(self, enabled_keys: list[str] | tuple[str, ...]) -> None:
+        """Rebuild the radial fan for the active subset of tabs with balanced non-overlapping spacing."""
+        wanted = set(enabled_keys or RADIAL_TAB_KEYS)
+        left_defs = [d for d in self._TAB_DEFS if d[3] < 0 and d[0] in wanted]
+        right_defs = [d for d in self._TAB_DEFS if d[3] > 0 and d[0] in wanted]
+        if not left_defs and not right_defs:
+            left_defs = [d for d in self._TAB_DEFS if d[3] < 0]
+            right_defs = [d for d in self._TAB_DEFS if d[3] > 0]
+
+        built_left: list[MenuButton] = []
+        slots_l = self._SIDE_SLOTS.get(len(left_defs), self._SIDE_SLOTS[3])
+        for (key, label, sub, side, hi), (ax, oy, rot_l) in zip(left_defs, slots_l):
+            built_left.append(MenuButton(key, label, sub, side, -ax, oy, rot_l, 176, 25, 48, hi, 0.0))
+
+        built_right: list[MenuButton] = []
+        slots_r = self._SIDE_SLOTS.get(len(right_defs), self._SIDE_SLOTS[3])
+        for (key, label, sub, side, hi), (ax, oy, rot_l) in zip(right_defs, slots_r):
+            built_right.append(MenuButton(key, label, sub, side, ax - 2.0, oy, -rot_l, 176, 25, 48, hi, 0.0))
+
+        # Interleave left/right so stagger opens symmetrically top-to-bottom
+        ordered: list[MenuButton] = []
+        for idx in range(max(len(built_left), len(built_right))):
+            if idx < len(built_left):
+                ordered.append(built_left[idx])
+            if idx < len(built_right):
+                ordered.append(built_right[idx])
+        for i, b in enumerate(ordered):
+            b.phase = float(i)
+        self._buttons = ordered
+        self._hovered_idx = -1
+        self._pressed = -1
+        if self.isVisible():
+            self.hide()
+            self._open = False
 
     # -- buka / tutup & z-order ----------------------------------------------
     @property
@@ -1474,7 +1519,7 @@ class RadialMenu(QWidget):
         for b in self._buttons:
             b.pop.configure(self.OPEN_STIFFNESS, self.OPEN_DAMPING)
         self.follow(force=True)
-        # Urutan tumpukan: spike belakang -> karakter Morgana -> 6 tombol di depan
+        # Urutan tumpukan: spike belakang -> karakter Morgana -> tombol di depan
         self._backdrop.show()
         self._pet.raise_()
         self.show()
@@ -1482,7 +1527,7 @@ class RadialMenu(QWidget):
         self._auto_close.start()
         self._ticker.start()
 
-    def close_menu(self, silent: bool = False) -> None:
+    def close_menu(self, silent: bool = False, emit_user_close: bool = False) -> None:
         if not self.isVisible() or not self._open:
             return
         self._open = False
@@ -1498,6 +1543,8 @@ class RadialMenu(QWidget):
             b.pop.configure(self.CLOSE_STIFFNESS)       # kritis: menutup tanpa memantul
             b.hover.target = 0.0
         self._ticker.start()
+        if emit_user_close:
+            self.user_closed.emit()
 
     def hideEvent(self, e) -> None:
         super().hideEvent(e)
@@ -1517,6 +1564,8 @@ class RadialMenu(QWidget):
         u = self._u
         max_y = float(self.height() / 2.0)
         for b in self._buttons:
+            if b.key not in self._geom:
+                continue
             poly = self._geom[b.key][3]
             for hv in (0.0, 1.0):
                 br = self._xf(b, pop=1.0, hover=hv, wobble=False).map(poly).boundingRect()
@@ -1530,6 +1579,8 @@ class RadialMenu(QWidget):
         u = self._u
         min_y = float(self.height() / 2.0)
         for b in self._buttons:
+            if b.key not in self._geom:
+                continue
             poly = self._geom[b.key][3]
             for hv in (0.0, 1.0):
                 br = self._xf(b, pop=1.0, hover=hv, wobble=False).map(poly).boundingRect()
@@ -1637,7 +1688,7 @@ class RadialMenu(QWidget):
             return
         idx = self._hit(e.position())
         if idx < 0:
-            self.close_menu()      # klik area kosong (jika mask tidak didukung platform)
+            self.close_menu(silent=False, emit_user_close=True)      # klik area kosong
             return
         self._pressed = idx
         self._buttons[idx].press.target = 1.0
@@ -2014,6 +2065,7 @@ class PetController(QObject):
         self._bag_bedtime = LineBag(lines["bedtime"])
         self._bag_agenda = LineBag(lines["agenda"])
         self._bag_general = LineBag(lines["general"])
+        self.dialogue = ContextualDialogue()
         self.calendar = CalendarService(APP_DIR)
         self.fetcher = CalendarFetcher(self.calendar, self)
         self.tasks_dialog: TasksDialog | None = None
@@ -2027,6 +2079,9 @@ class PetController(QObject):
         self._remind_last: dict[str, float] = {}    # kunci acara -> waktu (monotonic) pengingat terakhir
         self._remind_started: set[str] = set()      # acara yang sudah diberi pesan "dimulai sekarang"
         self._agenda_wanted = False            # pengguna menunggu hasil EVENTS
+        self._rebuilding_ui = False            # suppress open/close chatter during UI scale/tab sync
+        self._last_bump_t = 0.0
+        self._menu_hover_action: dict[int, object] = {}
 
         # state karakter
         self.forced_state: str | None = None   # override manual dari menu klik kanan
@@ -2045,6 +2100,7 @@ class PetController(QObject):
         self.pet.set_ui_scale(self.ui_scale)
         self.bubble.set_ui_scale(self.ui_scale)
         self.menu.set_ui_scale(self.ui_scale)
+        self.menu.set_enabled_tabs(self.settings["enabled_tabs"])
 
         self._build_context_menu()
         self._build_system_menu()
@@ -2053,13 +2109,14 @@ class PetController(QObject):
         self.pet.clicked.connect(self._on_pet_clicked)
         self.pet.moved.connect(self._on_pet_moved)
         self.pet.context_requested.connect(self.context_menu.popup)
-        self.pet.wall_bounced.connect(lambda: self.audio.play_voice("uwooh"))
+        self.pet.wall_bounced.connect(self._on_wall_bounced)
         self.bubble.dismissed.connect(self._restore_state)
         self.bubble.typing_finished.connect(lambda: self.pet.set_speaking(False))
         self.bubble.page_started.connect(lambda: self.pet.set_speaking(True))
         self.bubble.set_menu(self.menu)
         self.bubble.set_avoid_rects(self._visible_dialog_rects)
         self.menu.triggered.connect(self._on_menu_action)
+        self.menu.user_closed.connect(self._on_menu_user_closed)
         self.menu.closed.connect(self.bubble.follow)
         self.pomodoro.tick.connect(self._on_pomo_tick)
         self.pomodoro.phase_started.connect(self._on_pomo_phase)
@@ -2070,7 +2127,7 @@ class PetController(QObject):
         self.fetcher.done.connect(self._on_calendar_result)
 
         self._curfew_timer = QTimer(self)
-        self._curfew_timer.setInterval(30_000)
+        self._curfew_timer.setInterval(5_000)      # 5s precision check for 30s bedtime cadence
         self._curfew_timer.timeout.connect(self._check_curfew)
         self._reminder_timer = QTimer(self)        # deadline catatan + acara kalender
         self._reminder_timer.setInterval(REMINDER_CHECK_MS)
@@ -2129,12 +2186,66 @@ class PetController(QObject):
             self.audio.play_voice(vkey)
         self.bubble.show_message(text, ms or max(4000, 2500 + 55 * len(text)))
 
+    def _say_tuple(self, triple: tuple[str, str, str], state: str = "talking",
+                   ms: int | None = None) -> None:
+        text, emotion, voice = triple
+        self.say(text, state=state, ms=ms, emotion=emotion, voice=voice)
+
+    def _ctx(self) -> dict:
+        """Gather live workspace state for context-aware Morgana dialogue."""
+        now = datetime.now()
+        aware_now = now.astimezone()
+        all_tasks = self.tasks.all()
+        pending = [t for t in all_tasks if not t.get("done")]
+        high_pending = [t for t in pending if t.get("priority") == "high"]
+        top_task = (high_pending[0]["title"] if high_pending else (pending[0]["title"] if pending else ""))
+
+        notes_all = self.notes.all()
+        due_notes = self.notes.with_deadline()
+
+        manual = self.manual_timers.snapshot()
+        nearest = manual[0] if manual else None
+
+        # Calendar snapshot (live events or cached weekly sample)
+        cal_list = self._cal_events or (self._last_cal_result.events if self._last_cal_result else [])
+        timed = sorted((e for e in cal_list if not e.all_day), key=lambda e: e.start)
+        ongoing = next((e for e in timed if e.start <= aware_now and (e.end is None or e.end > aware_now)), None)
+        next_ev = next((e for e in timed if e.start > aware_now), None)
+        next_title, next_delta = "", ""
+        if next_ev is not None and (next_ev.start - aware_now) <= timedelta(hours=8):
+            next_title = next_ev.title
+            next_delta = human_delta(next_ev.start - aware_now)
+
+        return {
+            "curfew_active": self.curfew_active,
+            "sleep_mode": self.sleep_mode,
+            "hour": now.hour,
+            "enabled_tabs": list(self.settings["enabled_tabs"]),
+            "total_tasks": len(all_tasks),
+            "pending_tasks": len(pending),
+            "high_tasks": len(high_pending),
+            "top_task": top_task,
+            "notes_count": len(notes_all),
+            "due_notes": len(due_notes),
+            "today_blocks": len(self.social_stats.today_entries()),
+            "focus_running": self.pomodoro.running,
+            "focus_phase": self.pomodoro.phase,
+            "focus_rem": fmt_mmss(self.pomodoro.remaining()) if self.pomodoro.running else "",
+            "manual_count": len(manual),
+            "manual_nearest_label": nearest["label"] if nearest else "",
+            "manual_nearest_rem": fmt_hms(nearest["remaining_s"]) if nearest else "",
+            "ongoing_event_title": ongoing.title if ongoing else "",
+            "next_event_title": next_title,
+            "next_event_delta": next_delta,
+            "week_events_count": len(cal_list),
+        }
+
     def _schedule_chatter(self) -> None:
         base_ms = max(0.05, self.args.chatter) * 60_000
         self._chatter_timer.start(int(base_ms * random.uniform(0.75, 1.5)))
 
     def _chatter(self) -> None:
-        if not self.sleep_mode and not self.menu.is_open and not self.bubble.isVisible():
+        if not self.sleep_mode and not self.curfew_active and not self.menu.is_open and not self.bubble.isVisible():
             self.say(self._bag_general.next())
         self._schedule_chatter()
 
@@ -2144,7 +2255,7 @@ class PetController(QObject):
             return
         pending = self.tasks.pending()
         greeting = random.choice(greeting_pool(self._greetings, datetime.now().hour))
-        if not pending:
+        if not pending or "tasks" not in self.settings["enabled_tabs"]:
             self.say(greeting, context="startup")
             return
         shown = pending[:STARTUP_TASK_LIMIT]
@@ -2158,48 +2269,99 @@ class PetController(QObject):
     # -- interaksi pet ---------------------------------------------------------
     def _on_pet_clicked(self) -> None:
         if self.menu.is_open:
-            self.menu.close_menu()
+            self.menu.close_menu(silent=False, emit_user_close=True)
         else:
             self.menu.open_menu()
-            self.say(self._bag_general.next(), ms=4500, context="menu_open")
+            self._say_tuple(self.dialogue.radial_open(self._ctx()), ms=5200)
+
+    def _on_menu_user_closed(self) -> None:
+        if not self._rebuilding_ui:
+            self._say_tuple(self.dialogue.radial_close(self._ctx()), ms=3400)
+
+    def _on_wall_bounced(self) -> None:
+        now = time.monotonic()
+        if now - self._last_bump_t >= 2.5:
+            self._last_bump_t = now
+            self._say_tuple(self.dialogue.wall_bump(), state="action", ms=3600)
+        else:
+            self.audio.play_voice("uwooh")
+
+    def _on_task_completed(self, title: str, remaining: int) -> None:
+        self.pet.bump(0.75)
+        self._say_tuple(self.dialogue.task_completed(title, remaining), ms=4200)
+
+    def _on_dialog_closed(self, kind: str) -> None:
+        if self._rebuilding_ui:
+            return
+        self._say_tuple(self.dialogue.window_close(kind, self._ctx()), ms=3600)
 
     def _on_pet_moved(self) -> None:
         self.bubble.follow()
         self.menu.follow()
 
+    def _sync_dialog_links(self) -> None:
+        enabled = set(self.settings["enabled_tabs"])
+        if self.tasks_dialog is not None:
+            self.tasks_dialog._notes_btn.setVisible("notes" in enabled)
+        if self.notes_dialog is not None:
+            self.notes_dialog._tasks_btn.setVisible("tasks" in enabled)
+        if self.events_dialog is not None:
+            self.events_dialog._tasks_btn.setVisible("tasks" in enabled)
+
     def _open_tasks(self) -> None:
+        was_open = self.tasks_dialog is not None and self.tasks_dialog.isVisible()
         if self.tasks_dialog is None:
             self.tasks_dialog = TasksDialog(self.tasks, on_top=self.on_top, ui_scale=self.ui_scale)
             self.tasks_dialog.open_settings.connect(self._open_settings_deferred)
             self.tasks_dialog.open_notes.connect(self._open_notes)
+            self.tasks_dialog.task_completed.connect(self._on_task_completed)
+            self.tasks_dialog.closed.connect(lambda: self._on_dialog_closed("tasks"))
+        self._sync_dialog_links()
         self.tasks_dialog.show_near(self.pet.geometry())
+        if not was_open and not self._rebuilding_ui:
+            self._say_tuple(self.dialogue.window_open("tasks", self._ctx()), ms=4800)
 
     def _open_notes(self) -> None:
+        was_open = self.notes_dialog is not None and self.notes_dialog.isVisible()
         if self.notes_dialog is None:
             self.notes_dialog = NotesDialog(self.notes, self.tasks, on_top=self.on_top, ui_scale=self.ui_scale)
             self.notes_dialog.open_settings.connect(self._open_settings_deferred)
             self.notes_dialog.open_tasks.connect(self._open_tasks)
+            self.notes_dialog.closed.connect(lambda: self._on_dialog_closed("notes"))
+        self._sync_dialog_links()
         self.notes_dialog.show_near(self.pet.geometry())
+        if not was_open and not self._rebuilding_ui:
+            self._say_tuple(self.dialogue.window_open("notes", self._ctx()), ms=4800)
 
     def _open_events(self) -> None:
+        was_open = self.events_dialog is not None and self.events_dialog.isVisible()
         if self.events_dialog is None:
             self.events_dialog = EventsDialog(on_top=self.on_top, ui_scale=self.ui_scale)
             self.events_dialog.refresh_requested.connect(self._refresh_events)
             self.events_dialog.open_tasks.connect(self._open_tasks)
             self.events_dialog.open_settings.connect(self._open_settings_deferred)
+            self.events_dialog.closed.connect(lambda: self._on_dialog_closed("events"))
+        self._sync_dialog_links()
         if self._last_cal_result is not None:
             self.events_dialog.set_result(self._last_cal_result)
         self.events_dialog.show_near(self.pet.geometry())
+        if not was_open and not self._rebuilding_ui:
+            self._say_tuple(self.dialogue.window_open("events", self._ctx()), ms=5000)
         self._refresh_events(interactive=not self.calendar.has_token())
 
     def _open_stats(self) -> None:
+        was_open = self.stats_dialog is not None and self.stats_dialog.isVisible()
         if self.stats_dialog is None:
             self.stats_dialog = SocialStatsDialog(self.social_stats, on_top=self.on_top, ui_scale=self.ui_scale)
             self.stats_dialog.stat_logged.connect(self._on_stat_logged)
             self.stats_dialog.open_settings.connect(self._open_settings_deferred)
+            self.stats_dialog.closed.connect(lambda: self._on_dialog_closed("stats"))
         self.stats_dialog.show_near(self.pet.geometry())
+        if not was_open and not self._rebuilding_ui:
+            self._say_tuple(self.dialogue.window_open("stats", self._ctx()), ms=4800)
 
     def _open_timer(self) -> None:
+        was_open = self.timer_dialog is not None and self.timer_dialog.isVisible()
         if self.timer_dialog is None:
             self.timer_dialog = TimerDialog(self.settings, on_top=self.on_top, ui_scale=self.ui_scale)
             self.timer_dialog.focus_start_requested.connect(self._start_focus_from_dialog)
@@ -2207,8 +2369,11 @@ class PetController(QObject):
             self.timer_dialog.manual_add_requested.connect(self._add_manual_timer)
             self.timer_dialog.manual_cancel_requested.connect(self._cancel_manual_timer)
             self.timer_dialog.open_settings.connect(self._open_settings_deferred)
+            self.timer_dialog.closed.connect(lambda: self._on_dialog_closed("timer"))
         self._sync_timer_ui()
         self.timer_dialog.show_near(self.pet.geometry())
+        if not was_open and not self._rebuilding_ui:
+            self._say_tuple(self.dialogue.window_open("timer", self._ctx()), ms=4800)
 
     def _visible_dialog_rects(self) -> list[QRect]:
         rects: list[QRect] = []
@@ -2223,9 +2388,7 @@ class PetController(QObject):
         QTimer.singleShot(60, self._open_settings)
 
     def _on_menu_action(self, key: str, anchor: QPoint) -> None:
-        self.menu.close_menu(silent=True)
-        if key in ("events", "agenda", "tasks", "notes", "stats", "timer"):
-            self.bubble.dismiss()
+        self.menu.close_menu(silent=True, emit_user_close=False)
         if key in ("events", "agenda"):
             self._open_events()
         elif key == "tasks":
@@ -2238,6 +2401,7 @@ class PetController(QObject):
             self._open_timer()
         elif key == "system":
             play_ui("open_window")
+            self._say_tuple(self.dialogue.window_open("system", self._ctx()), ms=4200)
             self.system_menu.popup(anchor)
 
     # -- EVENTS: 7-day Google Calendar --------------------------------------------
@@ -2367,6 +2531,7 @@ class PetController(QObject):
         m = QMenu()
         m.setStyleSheet(menu_qss(self.ui_scale))
         self.system_menu = m
+        self._attach_menu_sfx(m)
         self.act_sys_status = m.addAction("SYSTEM STATUS (CPU / RAM)", self._act_item)
         self.act_sys_pomo = m.addAction("TIMER & FOCUS...", self._open_timer)
         self.act_sys_sleep = m.addAction("SLEEP MODE", self._toggle_sleep_mode)
@@ -2379,6 +2544,7 @@ class PetController(QObject):
         m.aboutToShow.connect(self._refresh_system_menu)
 
     def _refresh_system_menu(self) -> None:
+        self.act_sys_pomo.setVisible("timer" in self.settings["enabled_tabs"])
         if self.pomodoro.running:
             self.act_sys_pomo.setText(f"TIMER & FOCUS  ({fmt_mmss(self.pomodoro.remaining())} left)")
         elif self.manual_timers.nearest() is not None:
@@ -2407,8 +2573,10 @@ class PetController(QObject):
         if self.settings_dialog is dlg:
             self.settings_dialog = None
         dlg.deleteLater()
+        self._on_dialog_closed("settings")
 
     def _open_settings(self) -> None:
+        was_open = self.settings_dialog is not None and self.settings_dialog.isVisible() and not self.settings_dialog._closing
         if self.settings_dialog is not None and (not self.settings_dialog.isVisible() or self.settings_dialog._closing):
             old = self.settings_dialog
             self.settings_dialog = None
@@ -2428,12 +2596,17 @@ class PetController(QObject):
             dlg.closed.connect(lambda d=dlg: self._on_settings_closed(d))
             self.settings_dialog = dlg
         # If any panel is open, center Settings over it so it's never buried
+        shown = False
         for panel in (self.notes_dialog, self.tasks_dialog, self.events_dialog,
                       self.stats_dialog, self.timer_dialog):
             if panel is not None and panel.isVisible():
                 self.settings_dialog.show_near(panel.geometry(), prefer_center=True)
-                return
-        self.settings_dialog.show_near(self.pet.geometry())
+                shown = True
+                break
+        if not shown:
+            self.settings_dialog.show_near(self.pet.geometry())
+        if not was_open and not self._rebuilding_ui:
+            self._say_tuple(self.dialogue.window_open("settings", self._ctx()), ms=4500)
 
     def apply_settings(self) -> None:
         """Apply saved settings immediately without restarting."""
@@ -2447,6 +2620,22 @@ class PetController(QObject):
         self.act_sound.blockSignals(True)
         self.act_sound.setChecked(sound_on)
         self.act_sound.blockSignals(False)
+        enabled_tabs = list(self.settings["enabled_tabs"])
+        self.menu.set_enabled_tabs(enabled_tabs)
+        self._sync_dialog_links()
+        # Close any currently visible panel whose tab was just disabled
+        enabled_set = set(enabled_tabs)
+        self._rebuilding_ui = True
+        try:
+            for key, attr in (("events", "events_dialog"), ("tasks", "tasks_dialog"),
+                              ("notes", "notes_dialog"), ("stats", "stats_dialog"),
+                              ("timer", "timer_dialog")):
+                dlg = getattr(self, attr)
+                if key not in enabled_set and dlg is not None and dlg.isVisible():
+                    dlg.on_closing()
+                    dlg.hide()
+        finally:
+            self._rebuilding_ui = False
         self.pomodoro.focus_s = max(1, int(self.settings["focus_min"] * 60))
         self.pomodoro.rest_s = max(1, int(self.settings["rest_min"] * 60))
         if self.timer_dialog is not None:
@@ -2593,23 +2782,47 @@ class PetController(QObject):
             if not self.curfew_active:
                 self.curfew_active = True
                 self._restore_state()
-            interval_s = self.settings["curfew_interval_min"] * 60 - 15    # toleransi timer 30 dtk
+            interval_s = max(10, int(self.settings["curfew_interval_sec"]))
             if (self._last_curfew_msg is None
-                    or (now - self._last_curfew_msg).total_seconds() >= interval_s):
+                    or (now - self._last_curfew_msg).total_seconds() >= interval_s - 1.5):
                 self._last_curfew_msg = now
-                self.say(self._bag_bedtime.next(), "sleepy", 12000, context="bedtime")
+                self.say(self._bag_bedtime.next(), "sleepy", 10000, context="bedtime")
         elif self.curfew_active:
             self.curfew_active = False
             self._last_curfew_msg = None
             self._restore_state()
+
+    def _attach_menu_sfx(self, menu: QMenu) -> None:
+        """Play subtle Persona 5 hover & select SFX on QMenu interactions."""
+        key = id(menu)
+        self._menu_hover_action[key] = None
+
+        def _on_hover(act) -> None:
+            if act is not None and act.isEnabled() and not act.isSeparator():
+                if self._menu_hover_action.get(key) is not act:
+                    self._menu_hover_action[key] = act
+                    play_ui("ui_hover")
+
+        def _on_trigger(act) -> None:
+            if act is not None and act.isEnabled():
+                play_ui("select")
+
+        def _on_hide() -> None:
+            self._menu_hover_action[key] = None
+
+        menu.hovered.connect(_on_hover)
+        menu.triggered.connect(_on_trigger)
+        menu.aboutToHide.connect(_on_hide)
 
     # -- menu klik kanan & tray ------------------------------------------------
     def _build_context_menu(self) -> None:
         m = QMenu()
         m.setStyleSheet(menu_qss(self.ui_scale))
         self.context_menu = m
+        self._attach_menu_sfx(m)
 
         state_menu = m.addMenu("STATE")
+        self._attach_menu_sfx(state_menu)
         state_group = QActionGroup(m)
         state_group.setExclusive(True)
         for label, key in (("AUTO", "auto"), ("IDLE", "idle"), ("TALKING", "talking"),
@@ -2623,6 +2836,7 @@ class PetController(QObject):
         state_group.triggered.connect(lambda a: self.set_forced_state(a.data()))
 
         expr_menu = m.addMenu("EXPRESSION")
+        self._attach_menu_sfx(expr_menu)
         expr_group = QActionGroup(m)
         expr_group.setExclusive(True)
         for key in ("auto",) + tuple(EXPRESSIONS):
@@ -2635,6 +2849,7 @@ class PetController(QObject):
         expr_group.triggered.connect(lambda a: self.set_forced_expression(a.data()))
 
         size_menu = m.addMenu("SPRITE SIZE")
+        self._attach_menu_sfx(size_menu)
         size_group = QActionGroup(m)
         size_group.setExclusive(True)
         for px in SPRITE_SIZES:
@@ -2647,6 +2862,7 @@ class PetController(QObject):
         size_group.triggered.connect(lambda a: self.set_size(int(a.data())))
 
         ui_menu = m.addMenu("UI SIZE")
+        self._attach_menu_sfx(ui_menu)
         self._ui_size_group = QActionGroup(m)
         self._ui_size_group.setExclusive(True)
         labels = {85: "85% (COMPACT)", 100: "100% (NORMAL)", 115: "115% (LARGE)", 130: "130% (XLARGE)"}
@@ -2754,30 +2970,42 @@ class PetController(QObject):
         self.system_menu.setStyleSheet(qss)
         self.context_menu.setStyleSheet(qss)
 
-        # Rebuild cached dialogs at the new scale (reopen any that were visible)
-        for attr, opener, closing in (
-            ("tasks_dialog", self._open_tasks, False),
-            ("notes_dialog", self._open_notes, True),
-            ("events_dialog", self._open_events, False),
-            ("stats_dialog", self._open_stats, False),
-            ("timer_dialog", self._open_timer, False),
-        ):
-            dlg = getattr(self, attr)
-            if dlg is not None:
-                was = dlg.isVisible()
-                if closing:
-                    dlg.on_closing()
-                dlg.hide()
-                dlg.deleteLater()
-                setattr(self, attr, None)
-                if was:
-                    opener()
-        if self.settings_dialog is not None:
-            was = self.settings_dialog.isVisible()
-            if reopen_settings or was:
-                old = self.settings_dialog
-                self.settings_dialog = None
-                QTimer.singleShot(0, lambda o=old: (o.hide(), o.deleteLater(), self._open_settings()))
+        # Rebuild cached dialogs at the new scale (suppress open/close chatter during rebuild)
+        self._rebuilding_ui = True
+        try:
+            for attr, opener, closing in (
+                ("tasks_dialog", self._open_tasks, False),
+                ("notes_dialog", self._open_notes, True),
+                ("events_dialog", self._open_events, False),
+                ("stats_dialog", self._open_stats, False),
+                ("timer_dialog", self._open_timer, False),
+            ):
+                dlg = getattr(self, attr)
+                if dlg is not None:
+                    was = dlg.isVisible()
+                    if closing:
+                        dlg.on_closing()
+                    dlg.hide()
+                    dlg.deleteLater()
+                    setattr(self, attr, None)
+                    if was:
+                        opener()
+            if self.settings_dialog is not None:
+                was = self.settings_dialog.isVisible()
+                if reopen_settings or was:
+                    old = self.settings_dialog
+                    self.settings_dialog = None
+                    def _reopen(o=old) -> None:
+                        self._rebuilding_ui = True
+                        try:
+                            o.hide()
+                            o.deleteLater()
+                            self._open_settings()
+                        finally:
+                            self._rebuilding_ui = False
+                    QTimer.singleShot(0, _reopen)
+        finally:
+            self._rebuilding_ui = False
 
     def set_always_on_top(self, on: bool) -> None:
         self.on_top = on

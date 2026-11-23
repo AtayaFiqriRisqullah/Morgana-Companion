@@ -25,9 +25,12 @@ AUDIO_DIR = app_paths.resource_path("assets/audio")
 
 UI_SOUNDS: dict[str, str] = {
     "hover": "ui hover.mp3",
+    "ui_hover": "ui hover.mp3",
     "open_radial": "ui open radial menu.mp3",
     "open_window": "ui open window.mp3",
+    "select": "ui open window.mp3",
     "close": "ui close.mp3",
+    "cancel": "ui close.mp3",
 }
 
 STATS_SOUNDS: dict[str, str] = {
@@ -84,6 +87,22 @@ def resolve_audio(filename: str) -> Path | None:
 class AudioManager(QObject):
     """Manages UI SFX, P5R Social Stats audio sequences, and Morgana's Japanese voicelines."""
 
+    _UI_VOL_MULT: dict[str, float] = {
+        "hover": 0.72,
+        "ui_hover": 0.48,
+        "select": 0.66,
+        "cancel": 0.66,
+        "open_radial": 0.90,
+        "open_window": 0.88,
+        "close": 0.88,
+    }
+    _UI_COOLDOWN: dict[str, float] = {
+        "hover": 0.045,
+        "ui_hover": 0.055,
+        "select": 0.055,
+        "cancel": 0.055,
+    }
+
     def __init__(self, parent=None, enabled: bool = True, volume_pct: int = 80) -> None:
         super().__init__(parent)
         self._enabled = bool(enabled)
@@ -94,7 +113,7 @@ class AudioManager(QObject):
         self._voice_urls: dict[str, QUrl] = {}
         self._voice_player = None
         self._voice_out = None
-        self._last_hover_t = 0.0
+        self._last_ui_t: dict[str, float] = {}
         self._last_voice_t = 0.0
         self._seq_timers: list[QTimer] = []
         self._init_channels()
@@ -145,7 +164,7 @@ class AudioManager(QObject):
             self._ready = False
 
     def _ui_vol(self, key: str) -> float:
-        return self._volume * (0.72 if key == "hover" else 0.90)
+        return self._volume * self._UI_VOL_MULT.get(key, 0.88)
 
     # -- settings -------------------------------------------------------------
     @property
@@ -186,11 +205,12 @@ class AudioManager(QObject):
         slot = self._ui_players.get(key)
         if slot is None:
             return
-        now = time.monotonic()
-        if key == "hover":
-            if now - self._last_hover_t < 0.045:
+        cooldown = self._UI_COOLDOWN.get(key, 0.0)
+        if cooldown > 0.0:
+            now = time.monotonic()
+            if now - self._last_ui_t.get(key, 0.0) < cooldown:
                 return
-            self._last_hover_t = now
+            self._last_ui_t[key] = now
         player, _out = slot
         try:
             player.stop()
