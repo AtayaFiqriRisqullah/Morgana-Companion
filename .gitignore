@@ -12,6 +12,7 @@ token.json
 settings.json
 tasks.json
 notes.json
+social_stats.json
 *.corrupt-*
 pet.log
 *.lock

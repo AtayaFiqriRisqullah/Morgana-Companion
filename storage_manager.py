@@ -252,6 +252,152 @@ class NoteStore(JsonListStore):
 
 
 # ---------------------------------------------------------------------------
+# Social Stats (social_stats.json) — Persona 5 Royal style, 20 pts per level
+# ---------------------------------------------------------------------------
+STAT_POINTS_PER_LEVEL = 20
+DEFAULT_STAT_POINTS = 3
+QUICK_STAT_POINTS = (1, 2, 3, 5)
+DAILY_BLOCK_TARGET = 3
+TIME_BLOCKS = ("Daytime", "After School", "Evening")
+
+# Pentagon order (clockwise starting from top)
+SOCIAL_STAT_KEYS = ("knowledge", "charm", "kindness", "proficiency", "guts")
+
+SOCIAL_STATS: dict[str, dict] = {
+    "knowledge": {
+        "label": "Knowledge",
+        "short": "KNO",
+        "examples": "Study, lectures, coursework",
+        "placeholder": "e.g. Lecture review, 2h study session...",
+        "ranks": ("Oblivious", "Learned", "Scholarly", "Encyclopedic", "Erudite"),
+    },
+    "guts": {
+        "label": "Guts",
+        "short": "GUT",
+        "examples": "Gym, workouts, physical training",
+        "placeholder": "e.g. Gym session, strength workout...",
+        "ranks": ("Milquetoast", "Bold", "Staunch", "Dauntless", "Lionhearted"),
+    },
+    "proficiency": {
+        "label": "Proficiency",
+        "short": "PRO",
+        "examples": "Badminton, volleyball, technique sports",
+        "placeholder": "e.g. Badminton match, volleyball practice...",
+        "ranks": ("Bumbling", "Decent", "Skilled", "Expert", "Transcendent"),
+    },
+    "charm": {
+        "label": "Charm",
+        "short": "CHA",
+        "examples": "Movies, books, drawing, 3D, gamedev",
+        "placeholder": "e.g. Watched a movie, 3D modeling, gamedev...",
+        "ranks": ("Existent", "Head-Turning", "Suave", "Charismatic", "Debonair"),
+    },
+    "kindness": {
+        "label": "Kindness",
+        "short": "KIN",
+        "examples": "Cleaning, laundry, groceries, room chores",
+        "placeholder": "e.g. Room cleaning, laundry, grocery run...",
+        "ranks": ("Inoffensive", "Considerate", "Empathetic", "Selfless", "Angelic"),
+    },
+}
+
+
+def stat_level(points: int) -> int:
+    """0-20 -> Lv 1, 21-40 -> Lv 2, 41-60 -> Lv 3, ... (unlimited)."""
+    pts = max(0, int(points))
+    if pts <= STAT_POINTS_PER_LEVEL:
+        return 1
+    return ((pts - 1) // STAT_POINTS_PER_LEVEL) + 1
+
+
+def stat_level_progress(points: int) -> tuple[int, int, int, int]:
+    """Return `(level, into_level, band_span, to_next_level)` for progress displays."""
+    pts = max(0, int(points))
+    lv = stat_level(pts)
+    next_at = lv * STAT_POINTS_PER_LEVEL + 1
+    if lv == 1:
+        band_start = 0
+        band_span = STAT_POINTS_PER_LEVEL + 1
+    else:
+        band_start = (lv - 1) * STAT_POINTS_PER_LEVEL + 1
+        band_span = STAT_POINTS_PER_LEVEL
+    return lv, pts - band_start, band_span, max(0, next_at - pts)
+
+
+def stat_rank_title(stat: str, level: int) -> str:
+    """Persona 5 Royal rank title for `stat` at `level`."""
+    ranks = SOCIAL_STATS.get(stat, {}).get("ranks", ("Rank 1",))
+    idx = max(0, min(len(ranks) - 1, int(level) - 1))
+    return ranks[idx]
+
+
+def default_time_block(hour: int | None = None) -> str:
+    """Suggest a P5 time block from the current local hour."""
+    h = datetime.now().hour if hour is None else int(hour)
+    if h < 12:
+        return TIME_BLOCKS[0]
+    if h < 18:
+        return TIME_BLOCKS[1]
+    return TIME_BLOCKS[2]
+
+
+class SocialStatsStore(JsonListStore):
+    """Activity log: {"id", "stat", "activity", "points", "date", "block", "created"}."""
+
+    def add(self, stat: str, activity: str, points: int = DEFAULT_STAT_POINTS,
+            block: str | None = None, day: str | None = None) -> tuple[dict | None, int, int]:
+        if stat not in SOCIAL_STATS:
+            return None, 1, 1
+        pts = max(1, min(500, int(points)))
+        text = (activity or "").strip() or SOCIAL_STATS[stat]["label"] + " block"
+        blk = block if block in TIME_BLOCKS else default_time_block()
+        date_str = day or datetime.now().strftime("%Y-%m-%d")
+        old_lv = stat_level(self.total_for(stat))
+        entry = {
+            "id": uuid.uuid4().hex[:12],
+            "stat": stat,
+            "activity": text,
+            "points": pts,
+            "date": date_str,
+            "block": blk,
+            "created": now_iso(),
+        }
+        self._items.append(entry)
+        self.save()
+        new_lv = stat_level(self.total_for(stat))
+        return entry, old_lv, new_lv
+
+    def restore(self, entry: dict) -> dict | None:
+        if not isinstance(entry, dict) or not entry.get("id"):
+            return None
+        if self.get(entry["id"]) is None:
+            copy = dict(entry)
+            self._items.append(copy)
+            self.save()
+            return copy
+        return None
+
+    def total_for(self, stat: str) -> int:
+        return sum(max(0, int(i.get("points", 0))) for i in self._items if i.get("stat") == stat)
+
+    def totals(self) -> dict[str, int]:
+        res = {k: 0 for k in SOCIAL_STAT_KEYS}
+        for i in self._items:
+            k = i.get("stat")
+            if k in res:
+                res[k] += max(0, int(i.get("points", 0)))
+        return res
+
+    def today_entries(self, day: str | None = None) -> list[dict]:
+        target = day or datetime.now().strftime("%Y-%m-%d")
+        return [i for i in self._items if i.get("date") == target]
+
+    def recent(self, limit: int = 50, stat_filter: str = "all") -> list[dict]:
+        items = self._items if stat_filter == "all" else [i for i in self._items if i.get("stat") == stat_filter]
+        return list(reversed(items))[:max(1, limit)]
+
+
+# ---------------------------------------------------------------------------
 # Pengaturan (settings.json)
 # ---------------------------------------------------------------------------
 SETTINGS_DEFAULTS = {
