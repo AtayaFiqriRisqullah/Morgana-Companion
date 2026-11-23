@@ -57,8 +57,8 @@ import sprites
 from sprites import EYE_CLOSED, EYE_HALF, EYE_OPEN, MOUTH_BASE, MorganaSprites
 from storage_manager import NoteStore, SettingsStore, TaskStore, parse_dt
 from theme import (BLACK, BLACK_BURST_SHARDS, BLUE, LIGHT_RED, MENU_QSS, RED,
-                   RED_BURST_SHARDS, WHITE, lerp_color, p5_dialogue_font, p5_font, pen,
-                   scale_polygon, star_polygon, tapered_wedge)
+                   RED_BURST_SHARDS, WHITE, lerp_color, load_fonts, p5_dialogue_font,
+                   p5_font, pen, scale_polygon, star_polygon, tapered_wedge)
 from ui_dialogs import NotesDialog, SettingsDialog, TasksDialog
 
 try:
@@ -714,105 +714,158 @@ def wrap_text(text: str, measure, max_w: int) -> list[str]:
     return lines
 
 
+def paginate_text(text: str, measure, max_w: int, max_lines: int = 3) -> list[list[str]]:
+    """Wrap `text` and split into Persona 5 dialogue pages of at most `max_lines` lines."""
+    blocks = [blk.strip() for blk in text.split("\n\n") if blk.strip()]
+    if not blocks:
+        return [[""]]
+    pages: list[list[str]] = []
+    cur: list[str] = []
+    for blk in blocks:
+        wrapped = [ln for ln in wrap_text(blk, measure, max_w) if ln != ""]
+        if not wrapped:
+            continue
+        if cur and len(cur) + len(wrapped) <= max_lines:
+            cur.extend(wrapped)
+            continue
+        if cur:
+            pages.append(cur)
+            cur = []
+        while len(wrapped) > max_lines:
+            pages.append(wrapped[:max_lines])
+            wrapped = wrapped[max_lines:]
+        cur = wrapped
+    if cur:
+        pages.append(cur)
+    return pages or [[""]]
+
+
 class BubbleWindow(QWidget):
-    """Balon dialog: muncul membesar dari kepala karakter (pegas + sedikit putar), teks
-    mengetik per huruf, tutup dengan menyusut. Bingkai memakai Morgana/textbox.png (dipotong 3
-    supaya melebar mengikuti teks, nama MORGANA ditulis miring di dalam kotak nama putihnya).
-    Jika textbox.png tidak ada: kotak miring hitam + bayangan merah + ekor runcing."""
+    """Persona 5 dialogue bubble using `Morgana/textbox.png`.
+
+    Always scales `textbox.png` UNIFORMLY (sx == sy, capped at 1.0) so the silhouette,
+    white nameplate, fangs, and right accent triangle NEVER stretch vertically.
+    Messages longer than 3 lines automatically paginate like Persona 5 dialogue
+    (click or wait to advance pages). Falls back to a drawn P5 box if the PNG is missing.
+    """
 
     dismissed = pyqtSignal()
-    typing_finished = pyqtSignal()          # semua huruf sudah tampil (mulut karakter berhenti)
+    typing_finished = pyqtSignal()          # current page finished typing
+    page_started = pyqtSignal()             # new page started typing (resumes lip-sync)
 
-    MAX_TEXT_W = 320
-    M, PADX, PADY = 22, 16, 8
-    TAIL_H, TAG_OVER, SHADOW, SLANT = 16, 12, 7, 10   # hanya untuk bingkai cadangan
-    # textbox.png (600x173): kotak nama putih miring di kiri atas; area hitam teks mulai x=114
-    # sampai x=460 (spike putih kanan mulai masuk di ~470). Dipotong di IMG_L & IMG_R supaya
-    # bagian tengah direntangkan tanpa merusak sudut kiri/kanan.
+    MAX_TEXT_W = 355
+    MAX_PAGE_LINES = 3
+    M, PADX, PADY = 22, 18, 8
+    TAIL_H, TAG_OVER, SHADOW, SLANT = 16, 12, 7, 10   # fallback box only
+    # textbox.png (600x173): white tilted nameplate at top-left, black text area x=126..460,
+    # y=56..126. Only the middle horizontal slice [IMG_L..IMG_R] stretches horizontally;
+    # height & side caps always share one uniform scale `self._s` (0.86..1.0).
     IMG_W, IMG_H = 600, 173
     IMG_L, IMG_R = 225, 460
-    TEXT_L = 114
-    IMG_TOP, IMG_BOT = 62, 124
+    TEXT_L = 126
+    IMG_TOP, IMG_BOT = 61, 130
 
     def __init__(self, pet: PetWindow) -> None:
         super().__init__()
         setup_overlay(self)
         self._pet = pet
+        self._pages: list[list[str]] = []
+        self._page_idx = 0
         self._lines: list[str] = []
         self._total = 0
         self._reveal = 0.0
         self._speed = 60.0
+        self._per_page_ms = 4000
         self._bw = self._bh = 0
-        self._line_h = 18
-        self._ascent = 12
+        self._line_h = 20
+        self._ascent = 14
         self._below = False
         self._tail_x = 0
         self._closing = False
-        self._font = p5_dialogue_font(14)
-        self._tag_font = p5_font(10)
+        self._font = p5_dialogue_font(15)
+        self._tag_font = p5_font(11, italic=False)
+        self._page_font = p5_font(11, italic=False)
         self._box = QPixmap(str(sprites.SPRITE_DIR / "textbox.png"))
         self._use_img = not self._box.isNull()
         self._tail_h = 0 if self._use_img else self.TAIL_H
-        self._sx = self._sy = 1.0                  # skala horizontal sisi & skala vertikal bingkai
+        self._s = 0.9                              # uniform scale for both X caps and Y height
         self._cap_l = self._cap_r = 0.0
         self._mid_w = 0.0
         self._text_h = 0
-        self._show = Spring(0.0, 300.0, 19.0)      # 0 = hilang, 1 = tampil (overshoot sedikit)
+        self._show = Spring(0.0, 300.0, 19.0)
         self._hide_timer = QTimer(self)
         self._hide_timer.setSingleShot(True)
-        self._hide_timer.timeout.connect(self.dismiss)
+        self._hide_timer.timeout.connect(self._on_page_timeout)
         self._ticker = FrameTicker(self._frame, self)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
-    def show_message(self, text: str, ms: int) -> None:
+    def _apply_page(self, idx: int, pop_bounce: bool = False) -> None:
+        self._page_idx = idx
+        self._lines = self._pages[idx]
         fm = QFontMetrics(self._font)
-        self._lines = wrap_text(text, fm.horizontalAdvance, self.MAX_TEXT_W)
-        self._line_h = fm.height() + 5
+        self._line_h = fm.height() + 1
         self._ascent = fm.ascent()
-        tw = max((fm.horizontalAdvance(ln) for ln in self._lines), default=0) + 6
-        self._text_h = len(self._lines) * self._line_h - 5
+        tw = max((fm.horizontalAdvance(ln) for ln in self._lines), default=0) + 8
+        badge_pad = 54 if len(self._pages) > 1 else 0
+        self._text_h = len(self._lines) * self._line_h - 1
         if self._use_img:
-            self._sy = max(0.76, (self._text_h + 18) / (self.IMG_BOT - self.IMG_TOP))
-            self._sx = min(self._sy, 0.96)         # sisi spike & kotak nama tetap proporsional
-            self._cap_l = self.IMG_L * self._sx
-            self._cap_r = (self.IMG_W - self.IMG_R) * self._sx
-            left_usable = (self.IMG_L - self.TEXT_L) * self._sx
-            self._mid_w = max(36.0, tw + self.PADX - left_usable)
+            # Uniform scale ONLY — never distort vertically!
+            self._s = 0.88 if len(self._lines) <= 2 else 1.04
+            self._cap_l = self.IMG_L * self._s
+            self._cap_r = (self.IMG_W - self.IMG_R) * self._s
+            left_usable = (self.IMG_L - self.TEXT_L) * self._s
+            self._mid_w = max(48.0, tw + self.PADX + badge_pad - left_usable)
             self._bw = int(self._cap_l + self._mid_w + self._cap_r)
-            self._bh = int(self.IMG_H * self._sy)
+            self._bh = int(self.IMG_H * self._s)
         else:
             self._bw = max(tw, 60) + 2 * self.PADX
             self._bh = len(self._lines) * self._line_h + 2 * self.PADY - 2
         self._total = sum(len(ln) for ln in self._lines)
         self._reveal = 0.0
-        self._speed = max(55.0, self._total / 1.15)            # teks panjang tetap selesai ~1 detik
+        self._speed = max(55.0, self._total / 1.05)
         tag_over = 0 if self._use_img else self.TAG_OVER
         shadow = 0 if self._use_img else self.SHADOW
         self.setFixedSize(self._bw + 2 * self.M + shadow,
                           self._bh + tag_over + self._tail_h + 2 * self.M + shadow)
+        if pop_bounce and self.isVisible():
+            self._show.value = min(self._show.value, 0.86)
+            self._show.velocity = 0.0
+        self._place()
+        self._ticker.start()
+        self._hide_timer.start(self._per_page_ms + int(1000 * self._total / self._speed))
 
+    def show_message(self, text: str, ms: int) -> None:
+        fm = QFontMetrics(self._font)
+        if self._use_img:
+            self._pages = paginate_text(text, fm.horizontalAdvance, self.MAX_TEXT_W, self.MAX_PAGE_LINES)
+        else:
+            self._pages = [wrap_text(text, fm.horizontalAdvance, self.MAX_TEXT_W)]
+        self._per_page_ms = max(3500, ms // max(1, len(self._pages)))
         self._closing = False
         self._show.configure(300.0, 19.0)
-        if self.isVisible():                                    # pesan baru: pantul ulang
-            self._show.value = min(self._show.value, 0.8)
-            self._show.velocity = 0.0
-        else:
+        was_visible = self.isVisible()
+        if not was_visible:
             self._show.snap(0.0)
         self._show.target = 1.0
-        self._place()
+        self._apply_page(0, pop_bounce=was_visible)
         self.show()
         self.raise_()
-        self._ticker.start()
-        self._hide_timer.start(ms + int(1000 * self._total / self._speed))
+
+    def _on_page_timeout(self) -> None:
+        if self._page_idx + 1 < len(self._pages):
+            self._apply_page(self._page_idx + 1, pop_bounce=True)
+            self.page_started.emit()
+        else:
+            self.dismiss()
 
     def dismiss(self) -> None:
         self._hide_timer.stop()
         if self.isVisible() and not self._closing:
             self._closing = True
-            self._show.configure(360.0)                         # redaman kritis: menyusut mulus
+            self._show.configure(360.0)
             self._show.target = 0.0
             self._ticker.start()
-            self.dismissed.emit()                               # karakter langsung kembali ke state dasar
+            self.dismissed.emit()
 
     def follow(self) -> None:
         if self.isVisible():
@@ -841,11 +894,11 @@ class BubbleWindow(QWidget):
         size = self._pet.sprite_size
         tag_over = 0 if self._use_img else self.TAG_OVER
 
-        head_y = pet.top() + PAD + int(size * 0.10)          # titik acuan di atas kepala
+        head_y = pet.top() + PAD + int(size * 0.10)
         tip_local = self.M + tag_over + self._bh + self._tail_h
         y = head_y - tip_local
         self._below = y < area.top()
-        if self._below:                                      # tidak muat di atas -> taruh di bawah
+        if self._below:
             foot_y = pet.bottom() - PAD - int(size * 0.04)
             y = foot_y - (self.M + tag_over)
         x = pet.center().x() - w // 2
@@ -854,9 +907,10 @@ class BubbleWindow(QWidget):
         self.move(x, y)
 
     def _paint_box(self, p: QPainter, x0: float, y0: float) -> None:
-        """Gambar textbox.png (3 potongan) lalu tulis PET_NAME di dalam kotak nama putih miring."""
+        """Draw uniformly-scaled textbox.png (3 horizontal slices) + MORGANA inside its white nameplate."""
         pm = self._box
-        h = self.IMG_H * self._sy
+        s_ = self._s
+        h = self.IMG_H * s_
         L, R = self.IMG_L, self.IMG_R
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         p.drawPixmap(QRectF(x0 + self._cap_l - 0.6, y0, self._mid_w + 1.2, h), pm,
@@ -865,15 +919,14 @@ class BubbleWindow(QWidget):
         p.drawPixmap(QRectF(x0 + self._cap_l + self._mid_w, y0, self._cap_r, h), pm,
                      QRectF(R, 0, self.IMG_W - R, self.IMG_H))
 
-        # Kotak nama putih miring bawaan textbox.png: tepi atas (60,44)->(185,11), pusat (129,38)
+        # White tilted nameplate inside textbox.png: constant -14.8 deg angle since sx == sy
         p.save()
-        p.translate(x0 + 129.0 * self._sx, y0 + 38.0 * self._sy)
-        angle = math.degrees(math.atan2((11.0 - 44.0) * self._sy, (185.0 - 60.0) * self._sx))
-        p.rotate(angle)
-        tag_f = p5_font(max(11, int(17 * min(self._sx, self._sy))), italic=False)
+        p.translate(x0 + 129.0 * s_, y0 + 38.0 * s_)
+        p.rotate(math.degrees(math.atan2(11.0 - 44.0, 185.0 - 60.0)))
+        tag_f = p5_font(max(16, int(21 * s_)), italic=False)
         p.setFont(tag_f)
         p.setPen(BLACK)
-        p.drawText(QRectF(-65.0 * self._sx, -14.0 * self._sy, 130.0 * self._sx, 28.0 * self._sy),
+        p.drawText(QRectF(-64.0 * s_, -15.0 * s_, 128.0 * s_, 30.0 * s_),
                    Qt.AlignmentFlag.AlignCenter.value, PET_NAME)
         p.restore()
 
@@ -893,7 +946,7 @@ class BubbleWindow(QWidget):
         tail_path.closeSubpath()
         path = path.united(tail_path)
 
-        p.save()                                  # bayangan merah miring
+        p.save()
         p.translate(self.SHADOW, self.SHADOW)
         p.fillPath(path, RED)
         p.restore()
@@ -901,7 +954,7 @@ class BubbleWindow(QWidget):
         p.setBrush(BLACK)
         p.drawPath(path)
 
-        p.save()                                  # bintang bergerigi di sudut kanan atas
+        p.save()
         p.translate(x1 + 1, y0 - 1)
         p.rotate((1.0 - clamp(sv)) * 90.0 + 12.0)
         p.setPen(pen(WHITE, 2))
@@ -909,7 +962,7 @@ class BubbleWindow(QWidget):
         p.drawPolygon(star_polygon(0, 0, 11, 5, 5))
         p.restore()
 
-        p.setFont(self._tag_font)                 # name tag merah cadangan
+        p.setFont(self._tag_font)
         tag_w = QFontMetrics(self._tag_font).horizontalAdvance(PET_NAME) + 20
         tx0, ty0, th = x0 + 4, y0 - self.TAG_OVER, 20
         tag = QPolygonF([QPointF(tx0 + 7, ty0), QPointF(tx0 + tag_w, ty0),
@@ -935,7 +988,6 @@ class BubbleWindow(QWidget):
         tx = self._tail_x
         tip_y = (y0 - self._tail_h) if self._below else (y1 + self._tail_h)
 
-        # pop: membesar dari titik di atas kepala karakter, sedikit berputar lalu tegak
         scale = 0.55 + 0.45 * max(sv, 0.0)
         p.translate(tx, tip_y)
         p.rotate((1.0 - clamp(sv, 0.0, 1.5)) * -7.0)
@@ -944,15 +996,15 @@ class BubbleWindow(QWidget):
 
         if self._use_img:
             self._paint_box(p, x0, y0)
-            text_x = x0 + self.TEXT_L * self._sx
-            inner_h = (self.IMG_BOT - self.IMG_TOP) * self._sy      # tengah vertikal area hitam
-            text_y = y0 + self.IMG_TOP * self._sy + (inner_h - self._text_h) / 2 + self._ascent
+            text_x = x0 + self.TEXT_L * self._s
+            inner_h = (self.IMG_BOT - self.IMG_TOP) * self._s
+            text_y = y0 + self.IMG_TOP * self._s + (inner_h - self._text_h) / 2 + self._ascent
         else:
             self._paint_box_fallback(p, x0, y0, tx, sv)
             text_x = x0 + self.PADX
             text_y = y0 + self.PADY + self._ascent
 
-        p.setFont(self._font)                     # teks, muncul per huruf
+        p.setFont(self._font)
         p.setPen(WHITE)
         remaining = int(self._reveal)
         ty = text_y
@@ -963,8 +1015,31 @@ class BubbleWindow(QWidget):
             remaining -= len(line)
             ty += self._line_h
 
+        # Multi-page P5 badge (bottom-right of black interior)
+        if self._use_img and len(self._pages) > 1:
+            label = f"{self._page_idx + 1}/{len(self._pages)} ▼"
+            p.setFont(self._page_font)
+            bw = QFontMetrics(self._page_font).horizontalAdvance(label) + 12
+            bh = 17
+            bx = x0 + self._cap_l + self._mid_w - bw - 4
+            by = y0 + (self.IMG_BOT + 10) * self._s - bh
+            p.setPen(pen(WHITE, 1.4))
+            p.setBrush(RED)
+            p.drawRect(QRectF(bx, by, bw, bh))
+            p.setPen(WHITE)
+            p.drawText(QRectF(bx, by, bw, bh), Qt.AlignmentFlag.AlignCenter.value, label)
+
     def mousePressEvent(self, e) -> None:
-        self.dismiss()
+        if self._reveal < self._total:
+            self._reveal = float(self._total)
+            self.typing_finished.emit()
+            self.update()
+            return
+        if self._page_idx + 1 < len(self._pages):
+            self._apply_page(self._page_idx + 1, pop_bounce=True)
+            self.page_started.emit()
+        else:
+            self.dismiss()
 
 
 # ---------------------------------------------------------------------------
@@ -1109,8 +1184,7 @@ class RadialMenu(QWidget):
             t = i / max(1, n - 1)
             frac_outer = (1.0 - t) if b.side < 0 else t
             h_here = h_in + (h_out - h_in) * frac_outer
-            f = p5_font(max(13, int(h_here * 0.78)), italic=False)
-            f.setStretch(92)
+            f = p5_font(max(17, int(h_here * 0.84)), italic=False)
             fm = QFontMetrics(f)
             adv = fm.horizontalAdvance(ch)
             tb = fm.tightBoundingRect(ch)
@@ -1135,7 +1209,7 @@ class RadialMenu(QWidget):
             x += w_step
 
         # Subjudul di tepi bawah (path di-cache supaya 60 FPS ringan)
-        sub_f = p5_font(max(9, int(12 * u)), italic=True)
+        sub_f = p5_font(max(11, int(14 * u)), italic=True)
         tw = QFontMetrics(sub_f).horizontalAdvance(b.sub)
         tx = (-L * 0.54 if b.side < 0 else L * 0.54) - tw * 0.5
         ty = (h_in + h_out) * 0.24 + 5.0 * u
@@ -1571,6 +1645,7 @@ _FOCUS_REST = (
 class PetController(QObject):
     def __init__(self, args: argparse.Namespace) -> None:
         super().__init__()
+        load_fonts()
         self.args = args
         self.sprites = SpriteBank()
         self.pet = PetWindow(self.sprites, args.size)
@@ -1620,6 +1695,7 @@ class PetController(QObject):
         self.pet.context_requested.connect(self.context_menu.popup)
         self.bubble.dismissed.connect(self._restore_state)
         self.bubble.typing_finished.connect(lambda: self.pet.set_speaking(False))
+        self.bubble.page_started.connect(lambda: self.pet.set_speaking(True))
         self.menu.triggered.connect(self._on_menu_action)
         self.pomodoro.tick.connect(self._on_pomo_tick)
         self.pomodoro.phase_started.connect(self._on_pomo_phase)
@@ -1828,14 +1904,14 @@ class PetController(QObject):
                 last = self._remind_last.get(key)
                 if last is None or time.monotonic() - last >= interval_s:
                     self._remind_last[key] = time.monotonic()
-                    countdown.append(f"{title}\nStarts at {start:%H:%M}, in {human_delta(delta)}")
+                    countdown.append(f"{title} ({start:%H:%M}, in {human_delta(delta)})")
             elif (key.startswith("cal:") and key not in self._remind_started
                   and -timedelta(seconds=EVENT_STARTED_GRACE_S) < delta <= timedelta(0)):
                 self._remind_started.add(key)
                 messages.append(f"STARTING NOW: {title} ({start:%H:%M})")
         if countdown:
-            head = "Upcoming event:" if len(countdown) == 1 else "Upcoming events:"
-            messages.append(head + "\n" + "\n\n".join(countdown) + "\n\n" + self._bag_agenda.next())
+            head = "Upcoming:" if len(countdown) == 1 else "Upcoming events:"
+            messages.append(f"{head} " + " · ".join(countdown) + "\n" + self._bag_agenda.next())
 
         if messages:
             self.say("\n\n".join(messages), "talking", ms=12000)   # state talking + balon
@@ -2170,7 +2246,8 @@ def main() -> int:
         os.environ["QT_QPA_PLATFORM"] = "xcb"
 
     app = QApplication(qt_argv)
-    app.setApplicationName("Desktop Coding Pet")
+    load_fonts()
+    app.setApplicationName("Morgana Companion")
     app.setQuitOnLastWindowClosed(False)           # semua jendela bertipe Tool/overlay
     signal.signal(signal.SIGINT, signal.SIG_DFL)   # Ctrl+C di terminal tetap bisa menutup app
 

@@ -36,4 +36,5 @@ python main.py        # see: python main.py --help
 | `emotions.py` | picks an expression from the dialogue text |
 | `sprites.py` | composes base sprite + eye/mouth patches at their pixel offsets |
 | `autostart.py` | start on boot |
+| `fonts/` | bundled Persona 5-style SIL OFL fonts (`Anton`, `Barlow Condensed`, `Arsenal`) |
 | `Morgana/` | sprite images and `textbox.png` (`_e1` closed eyes, `_e2` half-closed, `_m1`-`_m3` mouth) |
