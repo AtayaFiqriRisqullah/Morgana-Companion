@@ -1382,9 +1382,9 @@ class RadialMenu(QWidget):
             p.setFont(f)
             if is_hi:
                 p.setPen(Qt.PenStyle.NoPen)
-                p.setBrush(BLACK if hov > 0.5 else WHITE)
+                p.setBrush(WHITE)
                 p.drawRect(box)
-                p.setPen(WHITE if hov > 0.5 else BLACK)
+                p.setPen(BLACK)
             else:
                 p.setPen(WHITE)
             p.drawText(QPointF(gx, gy), ch)
@@ -1546,6 +1546,28 @@ class CalendarFetcher(QObject):
 # ---------------------------------------------------------------------------
 # 8. CONTROLLER
 # ---------------------------------------------------------------------------
+_FOCUS_START = (
+    "Focus session started ({t})! Take it one step at a time—you've got this!",
+    "All right, {t} of focused work! Stay steady at your own pace—I'm rooting for you!",
+    "Time to lock in for {t}! Small progress still counts, so let's make it a great one.",
+    "Here we go—{t} of focus! Take a deep breath; you're more than ready for this.",
+)
+_FOCUS_PROGRESS = (
+    "You're doing great! {t} left in this focus session—keep that momentum going!",
+    "Hang in there! Only {t} left to go—you've got this!",
+    "Steady progress! {t} remaining in your focus session. Keep it up!",
+)
+_REST_PROGRESS = (
+    "Take it easy—{t} left on your break. You earned this breather!",
+    "Enjoy your rest! {t} left before we get back to it.",
+)
+_FOCUS_REST = (
+    "Awesome work! Take a {t} break—drink some water, stretch, and let your mind recharge.",
+    "You made it through! Enjoy a {t} break—you really earned it!",
+    "Great effort! Step back for {t}, breathe, and recharge your energy.",
+)
+
+
 class PetController(QObject):
     def __init__(self, args: argparse.Namespace) -> None:
         super().__init__()
@@ -1681,8 +1703,9 @@ class PetController(QObject):
         shown = pending[:STARTUP_TASK_LIMIT]
         lines = [f"{i}. {clip(t['title'], 44)}" for i, t in enumerate(shown, 1)]
         if len(pending) > len(shown):
-            lines.append(f"...dan {len(pending) - len(shown)} lagi")
-        self.say(f"{greeting}\n\nHari ini ada {len(pending)} tugas belum selesai:\n" + "\n".join(lines),
+            lines.append(f"...and {len(pending) - len(shown)} more")
+        word = "task" if len(pending) == 1 else "tasks"
+        self.say(f"{greeting}\n\nYou have {len(pending)} pending {word} today:\n" + "\n".join(lines),
                  "talking", ms=13000)
 
     # -- interaksi pet ---------------------------------------------------------
@@ -1697,18 +1720,37 @@ class PetController(QObject):
         self.bubble.follow()
         self.menu.follow()
 
+    def _open_tasks(self) -> None:
+        if self.tasks_dialog is None:
+            self.tasks_dialog = TasksDialog(self.tasks)
+            self.tasks_dialog.open_settings.connect(self._open_settings)
+            self.tasks_dialog.tasks_changed.connect(self._sync_notes_tasks)
+        self.tasks_dialog.show_near(self.pet.geometry())
+
+    def _open_notes(self) -> None:
+        if self.notes_dialog is None:
+            self.notes_dialog = NotesDialog(self.notes, self.tasks)
+            self.notes_dialog.open_settings.connect(self._open_settings)
+            self.notes_dialog.open_tasks.connect(self._open_tasks)
+            self.notes_dialog.tasks_changed.connect(self._sync_tasks_dialog)
+        self.notes_dialog.show_near(self.pet.geometry())
+
+    def _sync_notes_tasks(self) -> None:
+        if self.notes_dialog is not None and self.notes_dialog.isVisible():
+            self.notes_dialog.refresh_tasks()
+
+    def _sync_tasks_dialog(self) -> None:
+        if self.tasks_dialog is not None and self.tasks_dialog.isVisible():
+            self.tasks_dialog.refresh()
+
     def _on_menu_action(self, key: str, anchor: QPoint) -> None:
         self.menu.close_menu()
         if key == "agenda":
             self._act_agenda()
         elif key == "tasks":
-            if self.tasks_dialog is None:
-                self.tasks_dialog = TasksDialog(self.tasks)
-            self.tasks_dialog.show_near(self.pet.geometry())
+            self._open_tasks()
         elif key == "notes":
-            if self.notes_dialog is None:
-                self.notes_dialog = NotesDialog(self.notes)
-            self.notes_dialog.show_near(self.pet.geometry())
+            self._open_notes()
         elif key == "system":
             self.system_menu.popup(anchor)
 
@@ -1722,10 +1764,10 @@ class PetController(QObject):
             return
         self._agenda_wanted = True
         if self.calendar.has_token():
-            self.say("Mengecek kalender...", ms=5000)
+            self.say("Checking your calendar...", ms=5000)
         else:
-            self.say("Aku buka browser untuk izin Google Calendar (cukup sekali). "
-                     "Selesaikan login di sana ya!", ms=9000)
+            self.say("Opening your browser to connect Google Calendar (one-time setup). "
+                     "Finish signing in there!", ms=9000)
         self.fetcher.fetch(interactive=True)   # jika sedang sibuk, hasilnya tetap ditampilkan nanti
 
     def _show_agenda(self, result: CalendarResult) -> None:
@@ -1748,7 +1790,7 @@ class PetController(QObject):
             return
         if result.status == "auth_needed":     # fetch latar gagal login -> ulangi interaktif
             if self.fetcher.fetch(interactive=True):
-                self.say("Izin Google kedaluwarsa. Aku buka browser untuk login ulang...", ms=9000)
+                self.say("Your Google authorization expired. Opening your browser to sign in again...", ms=9000)
             return
         self._agenda_wanted = False
         self._show_agenda(result)
@@ -1762,8 +1804,8 @@ class PetController(QObject):
         # 1) catatan yang deadline-nya sudah tiba (termasuk yang terlewat saat aplikasi mati)
         for note in self.notes.due(now):
             self.notes.mark_notified(note["id"])
-            title = note.get("title") or "Catatan"
-            line = f"DEADLINE SEKARANG: {title}"
+            title = note.get("title") or "Note"
+            line = f"DUE NOW: {title}"
             snippet = clip(note.get("content", ""), 70)
             if snippet and snippet != title:
                 line += f"\n{snippet}"
@@ -1780,7 +1822,7 @@ class PetController(QObject):
             for n in self.notes.with_deadline():
                 dl = parse_dt(n.get("deadline"))
                 if dl is not None:
-                    upcoming.append((f"note:{n['id']}@{n['deadline']}", n.get("title") or "Catatan",
+                    upcoming.append((f"note:{n['id']}@{n['deadline']}", n.get("title") or "Note",
                                      dl.astimezone()))
         countdown: list[str] = []
         for key, title, start in upcoming:
@@ -1789,13 +1831,13 @@ class PetController(QObject):
                 last = self._remind_last.get(key)
                 if last is None or time.monotonic() - last >= interval_s:
                     self._remind_last[key] = time.monotonic()
-                    countdown.append(f"{title}\nMulai {start:%H:%M}, {human_delta(delta)} lagi")
+                    countdown.append(f"{title}\nStarts at {start:%H:%M}, in {human_delta(delta)}")
             elif (key.startswith("cal:") and key not in self._remind_started
                   and -timedelta(seconds=EVENT_STARTED_GRACE_S) < delta <= timedelta(0)):
                 self._remind_started.add(key)
-                messages.append(f"SEKARANG: {title} ({start:%H:%M})")
+                messages.append(f"STARTING NOW: {title} ({start:%H:%M})")
         if countdown:
-            head = "Acara berikutnya:" if len(countdown) == 1 else "Acara mendekat:"
+            head = "Upcoming event:" if len(countdown) == 1 else "Upcoming events:"
             messages.append(head + "\n" + "\n\n".join(countdown) + "\n\n" + self._bag_agenda.next())
 
         if messages:
@@ -1808,37 +1850,37 @@ class PetController(QObject):
         m = QMenu()
         m.setStyleSheet(MENU_QSS)
         self.system_menu = m
-        self.act_sys_status = m.addAction("Status Sistem (CPU / RAM)", self._act_item)
-        self.act_sys_pomo = m.addAction("Pomodoro", self._act_heal)
-        self.act_sys_sleep = m.addAction("Mode Tidur", self._toggle_sleep_mode)
-        self.act_sys_bed = m.addAction("Waktu tidur")
-        self.act_sys_bed.setEnabled(False)                 # hanya info
-        m.addAction("Pengaturan...", self._open_settings)
+        self.act_sys_status = m.addAction("System Status (CPU / RAM)", self._act_item)
+        self.act_sys_pomo = m.addAction("Focus Timer", self._act_heal)
+        self.act_sys_sleep = m.addAction("Sleep Mode", self._toggle_sleep_mode)
+        self.act_sys_bed = m.addAction("Bedtime")
+        self.act_sys_bed.setEnabled(False)
+        m.addAction("Settings...", self._open_settings)
         m.addSeparator()
-        m.addAction("Buka VS Code", self._launch_vscode)
-        m.addAction("Buka Terminal", self._launch_terminal)
+        m.addAction("Open VS Code", self._launch_vscode)
+        m.addAction("Open Terminal", self._launch_terminal)
         m.aboutToShow.connect(self._refresh_system_menu)
 
     def _refresh_system_menu(self) -> None:
         if self.pomodoro.running:
-            self.act_sys_pomo.setText(f"Pomodoro: sisa {fmt_mmss(self.pomodoro.remaining())}")
+            self.act_sys_pomo.setText(f"Focus Timer: {fmt_mmss(self.pomodoro.remaining())} left")
         else:
-            self.act_sys_pomo.setText(f"Mulai Pomodoro ({self.args.focus:g} menit)")
-        self.act_sys_sleep.setText("Bangunkan Aku (matikan Mode Tidur)" if self.sleep_mode
-                                   else "Mode Tidur (istirahat)")
+            self.act_sys_pomo.setText(f"Start Focus Session ({self.args.focus:g} min)")
+        self.act_sys_sleep.setText("Wake Up (disable Sleep Mode)" if self.sleep_mode
+                                   else "Sleep Mode (take a break)")
         self.act_sys_bed.setText(self._bedtime_text())
 
     def _bedtime_text(self) -> str:
         if not self.curfew_enabled:
-            return "Pengingat tidur: nonaktif"
+            return "Bedtime reminder: off"
         bed = self.settings.bedtime
         if self.curfew_active:
-            return f"Sudah lewat waktu tidur ({bed:%H:%M})"
+            return f"Past bedtime ({bed:%H:%M})"
         now = datetime.now()
         target = datetime.combine(now.date(), bed)
         if target <= now:
             target += timedelta(days=1)
-        return f"Waktu tidur {bed:%H:%M} ({human_delta(target - now)} lagi)"
+        return f"Bedtime at {bed:%H:%M} (in {human_delta(target - now)})"
 
     def _open_settings(self) -> None:
         if self.settings_dialog is None:
@@ -1858,65 +1900,70 @@ class PetController(QObject):
     def _toggle_sleep_mode(self) -> None:
         self.sleep_mode = not self.sleep_mode
         if self.sleep_mode:
-            self.say("Mode Tidur aktif. Pengingat tetap berjalan; "
-                     "buka SYSTEM lagi untuk membangunkanku.", "sleepy", 6000)
+            self.say("Sleep Mode is on. Reminders will still run—open SYSTEM again "
+                     "whenever you want to wake me up.", "sleepy", 6000)
         else:
-            self.say("Mode Tidur dimatikan.", "talking", 3000)
+            self.say("I'm awake! Sleep Mode is off.", "talking", 3000)
         self._restore_state()
 
     def _act_item(self) -> None:
         snap = self.monitor.snapshot()
         if snap is None:
-            self.say("Modul psutil belum terpasang. Jalankan: pip install psutil")
+            self.say("The psutil package isn't installed yet. Run: pip install psutil")
             return
         text = (f"SYSTEM STATUS\nCPU : {snap.cpu:.0f}%\n"
                 f"RAM : {snap.ram_percent:.0f}% ({snap.ram_used_gb:.1f} / {snap.ram_total_gb:.1f} GB)")
         heavy = snap.cpu >= 85 or snap.ram_percent >= 90
         if heavy:
-            text += "\nCPU/RAM tinggi. Tutup aplikasi yang tidak perlu."
+            text += "\nCPU/RAM usage is high. Try closing apps you don't need."
         self.say(text, "action" if heavy else "talking", ms=6500)
 
-    # -- Pomodoro ----------------------------------------------------------------
+    # -- Pomodoro (supportive focus companion) -----------------------------------
     def _act_heal(self) -> None:
         if self.pomodoro.running:
-            label = "fokus" if self.pomodoro.phase == PomodoroTimer.FOCUS else "istirahat"
-            self.say(f"Sisa {fmt_mmss(self.pomodoro.remaining())} untuk sesi {label}.")
+            t = fmt_mmss(self.pomodoro.remaining())
+            pool = _FOCUS_PROGRESS if self.pomodoro.phase == PomodoroTimer.FOCUS else _REST_PROGRESS
+            self.say(random.choice(pool).format(t=t))
         else:
             self.pomodoro.start()
 
     def _on_pomo_tick(self, phase: str, left: int) -> None:
-        name = "FOKUS" if phase == PomodoroTimer.FOCUS else "REST"
+        name = "FOCUS" if phase == PomodoroTimer.FOCUS else "REST"
         self.pet.set_badge(f"{name} {fmt_mmss(left)}")
 
     def _on_pomo_phase(self, phase: str) -> None:
         if phase == PomodoroTimer.FOCUS:
-            self.say(f"Sesi fokus {fmt_mmss(self.pomodoro.focus_s)} dimulai! Matikan distraksi.", "action")
+            t = fmt_mmss(self.pomodoro.focus_s)
+            self.say(random.choice(_FOCUS_START).format(t=t), "action")
         else:
-            self.say(f"Kerja bagus! Istirahat {fmt_mmss(self.pomodoro.rest_s)}. Minum air dan regangkan badan.")
+            t = fmt_mmss(self.pomodoro.rest_s)
+            self.say(random.choice(_FOCUS_REST).format(t=t))
 
     def _on_pomo_finished(self) -> None:
         self.pet.set_badge("")
-        self.say(f"Istirahat selesai. Sudah {self.pomodoro.completed} sesi fokus hari ini. "
-                 "Buka SYSTEM untuk lanjut!", "action")
+        n = self.pomodoro.completed
+        word = "session" if n == 1 else "sessions"
+        self.say(f"Break's over! That's {n} focus {word} completed today—you're doing awesome! "
+                 "Open SYSTEM whenever you're ready for another round.", "action")
 
     def _stop_pomodoro(self) -> None:
         self.pomodoro.stop()
-        self.say("Timer dihentikan. Mulai lagi lewat SYSTEM kapan pun kamu siap.")
+        self.say("Timer paused! Rest up if you need to—start a new session from SYSTEM whenever you're ready.")
 
-    # -- peluncur ----------------------------------------------------------------
+    # -- launchers ---------------------------------------------------------------
     def _launch_vscode(self) -> None:
         cmd = find_vscode()
         if cmd and launch_detached(cmd):
-            self.say("VS Code dibuka. Ayo mulai ngoding!", "action")
+            self.say("VS Code is open! Let's get some good work done.", "action")
         else:
-            self.say("VS Code tidak ditemukan. Pastikan perintah 'code' ada di PATH.")
+            self.say("Couldn't find VS Code. Make sure the 'code' command is on your PATH.")
 
     def _launch_terminal(self) -> None:
         cmd = find_terminal()
         if cmd and launch_detached(cmd):
-            self.say("Terminal dibuka.", "action")
+            self.say("Terminal is open!", "action")
         else:
-            self.say("Terminal tidak ditemukan. Atur variabel TERMINAL atau edit find_terminal().")
+            self.say("Couldn't find a terminal. Set the TERMINAL environment variable or edit find_terminal().")
 
     # -- curfew ------------------------------------------------------------------
     def _check_curfew(self) -> None:
@@ -1942,7 +1989,7 @@ class PetController(QObject):
         m.setStyleSheet(MENU_QSS)
         self.context_menu = m
 
-        state_menu = m.addMenu("Ganti State")
+        state_menu = m.addMenu("Change State")
         state_group = QActionGroup(m)
         state_group.setExclusive(True)
         for label, key in (("Auto", "auto"), ("Idle", "idle"), ("Talking", "talking"),
@@ -1955,7 +2002,7 @@ class PetController(QObject):
             state_menu.addAction(act)
         state_group.triggered.connect(lambda a: self.set_forced_state(a.data()))
 
-        expr_menu = m.addMenu("Ganti Ekspresi")
+        expr_menu = m.addMenu("Change Expression")
         expr_group = QActionGroup(m)
         expr_group.setExclusive(True)
         for key in ("auto",) + tuple(EXPRESSIONS):
@@ -1967,7 +2014,7 @@ class PetController(QObject):
             expr_menu.addAction(act)
         expr_group.triggered.connect(lambda a: self.set_forced_expression(a.data()))
 
-        size_menu = m.addMenu("Ukuran Sprite")
+        size_menu = m.addMenu("Sprite Size")
         size_group = QActionGroup(m)
         size_group.setExclusive(True)
         for px in SPRITE_SIZES:
@@ -1985,21 +2032,21 @@ class PetController(QObject):
         top.setChecked(True)
         top.toggled.connect(self.set_always_on_top)
 
-        self.act_curfew = m.addAction("Pengingat Tidur")
+        self.act_curfew = m.addAction("Bedtime Reminder")
         self.act_curfew.setCheckable(True)
         self.act_curfew.setChecked(self.curfew_enabled)
         self.act_curfew.toggled.connect(self.set_curfew_enabled)
-        m.addAction("Pengaturan...", self._open_settings)
+        m.addAction("Settings...", self._open_settings)
 
-        self.act_autostart = m.addAction("Auto-Start saat Boot")
+        self.act_autostart = m.addAction("Start on Boot")
         self.act_autostart.setCheckable(True)
         self.act_autostart.setChecked(autostart.is_enabled())
-        self.act_autostart.triggered.connect(self._toggle_autostart)   # hanya aksi pengguna
+        self.act_autostart.triggered.connect(self._toggle_autostart)
 
-        self.act_stop_pomo = m.addAction("Hentikan Pomodoro", self._stop_pomodoro)
-        m.addAction("Reset Posisi ke Pojok Layar", self.reset_position)
+        self.act_stop_pomo = m.addAction("Stop Focus Timer", self._stop_pomodoro)
+        m.addAction("Reset Position to Corner", self.reset_position)
         m.addSeparator()
-        m.addAction("Keluar", self.quit)
+        m.addAction("Quit", self.quit)
         m.aboutToShow.connect(self._refresh_context_menu)
 
     def _refresh_context_menu(self) -> None:
@@ -2029,11 +2076,11 @@ class PetController(QObject):
     def _toggle_autostart(self, checked: bool) -> None:
         ok, info = autostart.set_enabled(checked, SCRIPT_PATH)
         if ok:
-            self.say("Auto-start aktif. Aku akan muncul otomatis saat komputer menyala!" if checked
-                     else "Auto-start dimatikan.", ms=5000)
+            self.say("Start on boot is enabled! I'll show up automatically next time you turn on your PC." if checked
+                     else "Start on boot is disabled.", ms=5000)
         else:
             self.act_autostart.setChecked(autostart.is_enabled())
-            self.say(f"Gagal mengatur auto-start: {clip(info, 90)}", ms=8000)
+            self.say(f"Couldn't update start on boot: {clip(info, 90)}", ms=8000)
 
     def set_forced_state(self, key: str) -> None:
         self.forced_state = None if key == "auto" else key
@@ -2079,16 +2126,16 @@ def hhmm(value: str) -> dtime:
 
 
 def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
-    ap = argparse.ArgumentParser(description="Desktop Coding Pet - gaya Persona 5")
-    ap.add_argument("--size", type=int, default=DEFAULT_SPRITE, help="ukuran sprite dalam px (default 180)")
-    ap.add_argument("--focus", type=float, default=25, help="durasi fokus Pomodoro, menit (default 25)")
-    ap.add_argument("--rest", type=float, default=5, help="durasi istirahat, menit (default 5)")
-    ap.add_argument("--curfew", type=hhmm, default=None, help="jam mulai pengingat tidur HH:MM untuk sesi ini (biasanya diatur lewat menu Pengaturan)")
-    ap.add_argument("--wake", type=hhmm, default=None, help="jam pengingat tidur berhenti HH:MM untuk sesi ini")
-    ap.add_argument("--chatter", type=float, default=4.0, help="rata-rata menit antar komentar acak (default 4)")
+    ap = argparse.ArgumentParser(description="Morgana Companion - Persona 5 desktop pet")
+    ap.add_argument("--size", type=int, default=DEFAULT_SPRITE, help="sprite size in px (default 180)")
+    ap.add_argument("--focus", type=float, default=25, help="Pomodoro focus duration in minutes (default 25)")
+    ap.add_argument("--rest", type=float, default=5, help="Pomodoro break duration in minutes (default 5)")
+    ap.add_argument("--curfew", type=hhmm, default=None, help="bedtime start HH:MM for this session (normally set in Settings)")
+    ap.add_argument("--wake", type=hhmm, default=None, help="bedtime reminder stop HH:MM for this session")
+    ap.add_argument("--chatter", type=float, default=4.0, help="average minutes between idle remarks (default 4)")
     ap.add_argument("--demo-reminders", action="store_true",
-                    help="uji: jadwal dummy (tanpa credentials.json) ikut memicu pengingat 15 menit sebelum acara")
-    ap.add_argument("--multi", action="store_true", help="izinkan lebih dari satu instance (untuk uji)")
+                    help="test: sample schedule (without credentials.json) also triggers upcoming reminders")
+    ap.add_argument("--multi", action="store_true", help="allow multiple instances (for testing)")
     args, qt_args = ap.parse_known_args(argv[1:])
     return args, [argv[0]] + qt_args
 
@@ -2113,7 +2160,7 @@ def main() -> int:
     lock = QLockFile(os.path.join(QDir.tempPath(), "desktop-coding-pet.lock"))
     lock.setStaleLockTime(0)                       # 0 = jangan anggap basi hanya karena lama
     if not args.multi and not lock.tryLock(300):
-        msg = "Desktop Coding Pet sudah berjalan (lock: desktop-coding-pet.lock di folder temp)."
+        msg = "Morgana Companion is already running (lock: desktop-coding-pet.lock in temp folder)."
         logging.getLogger("pet").info(msg)
         if sys.stderr:
             print(msg, file=sys.stderr)
