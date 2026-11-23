@@ -109,15 +109,35 @@ class JsonListStore:
 class TaskStore(JsonListStore):
     """Tugas: {"id", "title", "done", "created", "done_at"}."""
 
-    def add(self, title: str) -> dict | None:
+    def add(self, title: str, priority: str = "normal") -> dict | None:
         title = (title or "").strip()
         if not title:
             return None
+        prio = "high" if priority == "high" else "normal"
         task = {"id": uuid.uuid4().hex[:12], "title": title, "done": False,
-                "created": now_iso(), "done_at": None}
+                "priority": prio, "created": now_iso(), "done_at": None}
         self._items.append(task)
         self.save()
         return task
+
+    def set_priority(self, task_id: str, priority: str) -> bool:
+        task = self.get(task_id)
+        if task is None:
+            return False
+        task["priority"] = "high" if priority == "high" else "normal"
+        self.save()
+        return True
+
+    def restore(self, items: list[dict]) -> None:
+        existing = {i.get("id") for i in self._items}
+        added = False
+        for item in items:
+            if isinstance(item, dict) and item.get("id") and item["id"] not in existing:
+                self._items.append(dict(item))
+                existing.add(item["id"])
+                added = True
+        if added:
+            self.save()
 
     def rename(self, task_id: str, title: str) -> bool:
         task = self.get(task_id)
@@ -160,7 +180,7 @@ class NoteStore(JsonListStore):
             category: str = "Personal") -> dict:
         stamp = now_iso()
         note = {"id": uuid.uuid4().hex[:12], "title": title.strip(), "content": content.strip(),
-                "category": (category or "Personal").strip() or "Personal",
+                "category": (category or "Personal").strip() or "Personal", "pinned": False,
                 "deadline": deadline.isoformat(timespec="minutes") if deadline else None,
                 "done": False, "notified": False, "created": stamp, "updated": stamp}
         self._items.append(note)
@@ -192,6 +212,24 @@ class NoteStore(JsonListStore):
         self.save()
         return True
 
+    def set_pinned(self, note_id: str, pinned: bool) -> bool:
+        note = self.get(note_id)
+        if note is None:
+            return False
+        note["pinned"] = bool(pinned)
+        self.save()
+        return True
+
+    def restore(self, note: dict) -> dict | None:
+        if not isinstance(note, dict) or not note.get("id"):
+            return None
+        if self.get(note["id"]) is None:
+            copy = dict(note)
+            self._items.append(copy)
+            self.save()
+            return copy
+        return None
+
     def with_deadline(self) -> list[dict]:
         """Catatan aktif (belum selesai) yang punya deadline."""
         return [n for n in self._items if n.get("deadline") and not n.get("done")]
@@ -217,15 +255,22 @@ class NoteStore(JsonListStore):
 # Pengaturan (settings.json)
 # ---------------------------------------------------------------------------
 SETTINGS_DEFAULTS = {
-    "bedtime": "23:30",            # mulai pengingat tidur
-    "wake": "05:00",               # pengingat tidur berhenti
+    "bedtime": "23:30",            # bedtime reminder start
+    "wake": "05:00",               # bedtime reminder stop
     "curfew_enabled": True,
-    "curfew_interval_min": 1,      # jeda kalimat saat lewat jam tidur
-    "event_window_min": 120,       # mulai mengingatkan acara H-2 jam
-    "event_interval_min": 10,      # jeda pengingat acara
+    "curfew_interval_min": 1,      # interval between bedtime remarks (min)
+    "event_window_min": 120,       # start reminding before event/deadline (min)
+    "event_interval_min": 10,      # repeat interval for event reminders (min)
+    "focus_min": 25,               # Pomodoro focus duration (min)
+    "rest_min": 5,                 # Pomodoro break duration (min)
 }
-_INT_RANGES = {"curfew_interval_min": (1, 120), "event_window_min": (5, 1440),
-               "event_interval_min": (1, 120)}
+_INT_RANGES = {
+    "curfew_interval_min": (1, 120),
+    "event_window_min": (5, 1440),
+    "event_interval_min": (1, 120),
+    "focus_min": (1, 180),
+    "rest_min": (1, 60),
+}
 
 
 def _valid_hhmm(value) -> bool:
