@@ -304,18 +304,21 @@ class P5CheckBox(QCheckBox):
 # P5FluidPanel: obsidian + white-bordered Persona 5 frame with Windows-safe reveal
 # ---------------------------------------------------------------------------
 class P5FluidPanel(QWidget):
+    closed = pyqtSignal()
     M, SHADOW, HEADER, SLIDE = 10, 6, 48, 12
 
-    def __init__(self, title: str, size: QSize) -> None:
+    def __init__(self, title: str, size: QSize, on_top: bool = True) -> None:
         super().__init__()
         load_fonts()
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
-                            | Qt.WindowType.WindowStaysOnTopHint)
+        flags = Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
+        if on_top:
+            flags |= Qt.WindowType.WindowStaysOnTopHint
+        self.setWindowFlags(flags)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setFixedSize(size)
         self.setStyleSheet(DIALOG_QSS)
         self._title = title
-        self._on_top = True
+        self._on_top = bool(on_top)
         self._drag_offset: QPoint | None = None
 
         self._open = Spring(1.0, 340.0)
@@ -361,15 +364,19 @@ class P5FluidPanel(QWidget):
         self.header_bar.addWidget(close_btn)
 
     def set_on_top(self, on: bool) -> None:
+        on = bool(on)
+        if on == self._on_top:
+            return
         self._on_top = on
         was_visible = self.isVisible()
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, on)
         if was_visible:
             self.show()
-            QTimer.singleShot(0, self._bring_to_front)
+            QTimer.singleShot(30, self._bring_to_front)
 
     def _bring_to_front(self) -> None:
         if self.isVisible() and not self._closing:
+            self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized)
             self.raise_()
             self.activateWindow()
 
@@ -382,6 +389,7 @@ class P5FluidPanel(QWidget):
             self._closing = False
             self._open.snap(0.0)
             QWidget.hide(self)
+            self.closed.emit()
             return False
         return moving
 
@@ -456,6 +464,15 @@ class P5FluidPanel(QWidget):
     def on_closing(self) -> None:
         """Called right before closing."""
 
+    def closeEvent(self, e) -> None:
+        # Handle OS/Alt+F4 close identically to clicking X so cleanup & signals always run
+        self._ticker.stop()
+        self._closing = False
+        self.on_closing()
+        e.accept()
+        QWidget.hide(self)
+        self.closed.emit()
+
     def showEvent(self, e) -> None:
         super().showEvent(e)
         self.refresh()
@@ -484,8 +501,8 @@ class P5FluidPanel(QWidget):
         self._closing = False
         self.setWindowOpacity(1.0)
         if not self.isVisible():
-            self._open.snap(0.0)
-            self.move(self._base_pos.x(), self._base_pos.y() + self.SLIDE)
+            self._open.snap(0.35)
+            self.move(self._base_pos.x(), self._base_pos.y() + int(round(0.65 * self.SLIDE)))
             self.show()
         else:
             self.move(self._base_pos)
@@ -493,9 +510,9 @@ class P5FluidPanel(QWidget):
         self._open.configure(340.0)
         self._open.target = 1.0
         self._ticker.start()
-        self.raise_()
-        self.activateWindow()
+        self._bring_to_front()
         QTimer.singleShot(0, self._bring_to_front)
+        QTimer.singleShot(50, self._bring_to_front)
         self.on_shown()
 
 
@@ -904,8 +921,8 @@ class TasksDialog(P5FluidPanel):
     open_notes = pyqtSignal()
     tasks_changed = pyqtSignal()
 
-    def __init__(self, store: TaskStore) -> None:
-        super().__init__("TASKS", QSize(500, 610))
+    def __init__(self, store: TaskStore, on_top: bool = True) -> None:
+        super().__init__("TASKS", QSize(500, 610), on_top=on_top)
         self.store = store
         self._filter = "all"
         self._new_high = False
@@ -1184,8 +1201,9 @@ class NotesDialog(P5FluidPanel):
     open_tasks = pyqtSignal()
     tasks_changed = pyqtSignal()
 
-    def __init__(self, store: NoteStore, task_store: TaskStore | None = None) -> None:
-        super().__init__("NOTES", QSize(820, 600))
+    def __init__(self, store: NoteStore, task_store: TaskStore | None = None,
+                 on_top: bool = True) -> None:
+        super().__init__("NOTES", QSize(820, 600), on_top=on_top)
         self.store = store
         self.task_store = task_store
         self._current_id: str | None = None
@@ -1756,11 +1774,13 @@ class SettingsDialog(P5FluidPanel):
     always_on_top_changed = pyqtSignal(bool)
     autostart_changed = pyqtSignal(bool)
 
-    def __init__(self, store: SettingsStore, get_on_top=None, get_autostart=None) -> None:
-        super().__init__("SETTINGS", QSize(480, 625))
+    def __init__(self, store: SettingsStore, get_on_top=None, get_autostart=None,
+                 on_top: bool = True) -> None:
+        super().__init__("SETTINGS", QSize(480, 625), on_top=on_top)
         self.store = store
         self._get_on_top = get_on_top
         self._get_autostart = get_autostart
+        self._saving = False
         self._add_close_button()
 
         # Card 1: Bedtime reminder
@@ -1873,6 +1893,8 @@ class SettingsDialog(P5FluidPanel):
             self.autostart_check.setChecked(bool(self._get_autostart()))
 
     def refresh(self) -> None:
+        if self._saving:
+            return
         self._fill(self.store.data)
         self.status.setText("")
 
@@ -1881,25 +1903,32 @@ class SettingsDialog(P5FluidPanel):
         self.status.setText("Defaults loaded. Click SAVE to apply.")
 
     def _save(self) -> None:
-        b, w = self.bed_edit.time(), self.wake_edit.time()
-        self.store.set(
-            bedtime=f"{b.hour():02d}:{b.minute():02d}",
-            wake=f"{w.hour():02d}:{w.minute():02d}",
-            curfew_enabled=self.curfew_check.isChecked(),
-            curfew_interval_min=self.curfew_interval.value(),
-            event_window_min=self.event_window.value(),
-            event_interval_min=self.event_interval.value(),
-            focus_min=self.focus_spin.value(),
-            rest_min=self.rest_spin.value(),
-        )
-        self.saved.emit()
-        if self._get_on_top is not None and self.on_top_check.isChecked() != bool(self._get_on_top()):
-            self.always_on_top_changed.emit(self.on_top_check.isChecked())
-        if self._get_autostart is not None and self.autostart_check.isChecked() != bool(self._get_autostart()):
-            self.autostart_changed.emit(self.autostart_check.isChecked())
-        if self.store.last_error:
-            self.status.setText("Save failed: " + self.store.last_error)
-        elif b == w:
-            self.status.setText("Saved, but bedtime and wake times match—bedtime reminders won't trigger.")
-        else:
-            self.status.setText("Saved and applied.")
+        self._saving = True
+        try:
+            for w in (self.bed_edit, self.wake_edit, self.curfew_interval,
+                      self.event_window, self.event_interval, self.focus_spin, self.rest_spin):
+                w.interpretText()
+            b, w = self.bed_edit.time(), self.wake_edit.time()
+            self.store.set(
+                bedtime=f"{b.hour():02d}:{b.minute():02d}",
+                wake=f"{w.hour():02d}:{w.minute():02d}",
+                curfew_enabled=self.curfew_check.isChecked(),
+                curfew_interval_min=self.curfew_interval.value(),
+                event_window_min=self.event_window.value(),
+                event_interval_min=self.event_interval.value(),
+                focus_min=self.focus_spin.value(),
+                rest_min=self.rest_spin.value(),
+            )
+            self.saved.emit()
+            if self._get_on_top is not None and self.on_top_check.isChecked() != bool(self._get_on_top()):
+                self.always_on_top_changed.emit(self.on_top_check.isChecked())
+            if self._get_autostart is not None and self.autostart_check.isChecked() != bool(self._get_autostart()):
+                self.autostart_changed.emit(self.autostart_check.isChecked())
+            if self.store.last_error:
+                self.status.setText("Save failed: " + self.store.last_error)
+            elif b == w:
+                self.status.setText("Saved, but bedtime and wake times match—bedtime reminders won't trigger.")
+            else:
+                self.status.setText("Saved and applied.")
+        finally:
+            self._saving = False

@@ -1798,23 +1798,21 @@ class PetController(QObject):
 
     def _open_tasks(self) -> None:
         if self.tasks_dialog is None:
-            self.tasks_dialog = TasksDialog(self.tasks)
-            self.tasks_dialog.set_on_top(self.on_top)
+            self.tasks_dialog = TasksDialog(self.tasks, on_top=self.on_top)
             self.tasks_dialog.open_settings.connect(self._open_settings_deferred)
             self.tasks_dialog.open_notes.connect(self._open_notes)
         self.tasks_dialog.show_near(self.pet.geometry())
 
     def _open_notes(self) -> None:
         if self.notes_dialog is None:
-            self.notes_dialog = NotesDialog(self.notes, self.tasks)
-            self.notes_dialog.set_on_top(self.on_top)
+            self.notes_dialog = NotesDialog(self.notes, self.tasks, on_top=self.on_top)
             self.notes_dialog.open_settings.connect(self._open_settings_deferred)
             self.notes_dialog.open_tasks.connect(self._open_tasks)
         self.notes_dialog.show_near(self.pet.geometry())
 
     def _open_settings_deferred(self) -> None:
-        """Open Settings after any menu/button release finishes (prevents Windows focus burial)."""
-        QTimer.singleShot(0, self._open_settings)
+        """Open Settings after any QMenu/button release finishes (prevents Windows popup grab race)."""
+        QTimer.singleShot(60, self._open_settings)
 
     def _on_menu_action(self, key: str, anchor: QPoint) -> None:
         self.menu.close_menu()
@@ -1956,21 +1954,34 @@ class PetController(QObject):
             target += timedelta(days=1)
         return f"BEDTIME: {bed:%H:%M}  (in {human_delta(target - now)})"
 
+    def _on_settings_closed(self, dlg: SettingsDialog) -> None:
+        """Dispose closed SettingsDialog so every reopen creates a clean native window."""
+        if self.settings_dialog is dlg:
+            self.settings_dialog = None
+        dlg.deleteLater()
+
     def _open_settings(self) -> None:
+        if self.settings_dialog is not None and (not self.settings_dialog.isVisible() or self.settings_dialog._closing):
+            old = self.settings_dialog
+            self.settings_dialog = None
+            old.hide()
+            old.deleteLater()
         if self.settings_dialog is None:
-            self.settings_dialog = SettingsDialog(
+            dlg = SettingsDialog(
                 self.settings,
                 get_on_top=lambda: self.on_top,
                 get_autostart=autostart.is_enabled,
+                on_top=self.on_top,
             )
-            self.settings_dialog.set_on_top(self.on_top)
-            self.settings_dialog.saved.connect(self.apply_settings)
-            self.settings_dialog.always_on_top_changed.connect(self.set_always_on_top)
-            self.settings_dialog.autostart_changed.connect(self._toggle_autostart)
+            dlg.saved.connect(self.apply_settings)
+            dlg.always_on_top_changed.connect(self.set_always_on_top)
+            dlg.autostart_changed.connect(self._toggle_autostart)
+            dlg.closed.connect(lambda d=dlg: self._on_settings_closed(d))
+            self.settings_dialog = dlg
         # If Notes or Tasks is currently open, center Settings directly over it so it's never buried
-        for dlg in (self.notes_dialog, self.tasks_dialog):
-            if dlg is not None and dlg.isVisible():
-                self.settings_dialog.show_near(dlg.geometry(), prefer_center=True)
+        for panel in (self.notes_dialog, self.tasks_dialog):
+            if panel is not None and panel.isVisible():
+                self.settings_dialog.show_near(panel.geometry(), prefer_center=True)
                 return
         self.settings_dialog.show_near(self.pet.geometry())
 
@@ -2163,11 +2174,13 @@ class PetController(QObject):
     # -- aksi menu klik kanan ----------------------------------------------------
     def _toggle_autostart(self, checked: bool) -> None:
         ok, info = autostart.set_enabled(checked, SCRIPT_PATH)
+        self.act_autostart.blockSignals(True)
+        self.act_autostart.setChecked(autostart.is_enabled())
+        self.act_autostart.blockSignals(False)
         if ok:
             self.say("Start on boot is enabled! I'll show up automatically next time you turn on your PC." if checked
                      else "Start on boot is disabled.", ms=5000)
         else:
-            self.act_autostart.setChecked(autostart.is_enabled())
             self.say(f"Couldn't update start on boot: {clip(info, 90)}", ms=8000)
 
     def set_forced_state(self, key: str) -> None:
@@ -2192,11 +2205,11 @@ class PetController(QObject):
         for w in (self.pet, self.bubble):
             w.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, on)
         self.menu.set_on_top(on)
+        if was_visible:
+            self.pet.show()
         for dlg in (self.tasks_dialog, self.notes_dialog, self.settings_dialog):
             if dlg is not None:
                 dlg.set_on_top(on)
-        if was_visible:
-            self.pet.show()
 
     def set_curfew_enabled(self, on: bool) -> None:
         self.curfew_enabled = on
