@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Sprite Morgana dari folder `Morgana/` (butuh PyQt6).
+"""Sprite Morgana dari folder `assets/Morgana/` (butuh PyQt6).
 
 Tiap ekspresi punya:
   b003_XXX_00.png        badan penuh (mata terbuka, mulut sesuai pose)
@@ -28,7 +28,7 @@ from PyQt6.QtGui import QImage, QPainter, QPixmap
 
 import app_paths
 
-SPRITE_DIR = app_paths.resource_path("Morgana")
+SPRITE_DIR = app_paths.resource_path("assets/Morgana")
 
 # Indeks bingkai. eye: 0 = terbuka (gambar dasar), 1 = setengah, 2 = tertutup.
 #                 mouth: 0 = gambar dasar, 1 = tertutup, 2 = setengah, 3 = terbuka.

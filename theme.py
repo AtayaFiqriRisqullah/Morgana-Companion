@@ -3,7 +3,7 @@
 
 Palette : Persona Crimson (#E60012), Obsidian Black (#0E0E12 / #15151B / #1C1C24),
           Crisp White (#FFFFFF), and subtle Morgana Scarf Gold (#F5C400).
-Fonts   : Bundled SIL OFL fonts loaded from `fonts/` via QFontDatabase:
+Fonts   : Bundled SIL OFL fonts loaded from `assets/fonts/` via QFontDatabase:
             * Anton              — heavy condensed Persona 5 display titles & nameplate
             * Barlow Condensed   — crisp tall Persona 5 buttons, badges & popup menus
             * Arsenal            — Optima-inspired flared humanist sans for dialogue & UI text
@@ -19,7 +19,7 @@ from PyQt6.QtGui import QColor, QFont, QFontDatabase, QGuiApplication, QPen, QPo
 
 import app_paths
 
-FONTS_DIR = app_paths.resource_path("fonts")
+FONTS_DIR = app_paths.resource_path("assets/fonts")
 _FONTS_LOADED = False
 
 # Core Persona 5 palette

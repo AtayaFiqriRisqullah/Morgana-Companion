@@ -8,18 +8,17 @@ import sys
 from pathlib import Path
 
 ROOT = Path(SPECPATH)
-ICON = str(ROOT / "Morgana" / "morgana.ico") if sys.platform.startswith("win") else None
+ICON = str(ROOT / "assets" / "Morgana" / "morgana.ico") if sys.platform.startswith("win") else None
 
 a = Analysis(
     ["main.py"],
     pathex=[str(ROOT)],
     binaries=[],
     datas=[
-        (str(ROOT / "Morgana"), "Morgana"),
-        (str(ROOT / "fonts"), "fonts"),
+        (str(ROOT / "assets"), "assets"),
         (str(ROOT / "morgana_list.md"), "."),
     ],
-    hiddenimports=[],
+    hiddenimports=["PyQt6.QtMultimedia"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

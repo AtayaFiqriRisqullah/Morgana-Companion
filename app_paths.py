@@ -6,10 +6,10 @@ When running from source:
 
 When packaged with PyInstaller (`sys.frozen` is True):
   * `app_dir()` points to the folder beside the `.exe` (writable: stores
-    `tasks.json`, `notes.json`, `settings.json`, `token.json`, `pet.log`, and
-    lets users place `credentials.json` or a custom `morgana_list.md` there).
-  * `bundle_dir()` points to `sys._MEIPASS` (read-only bundled `Morgana/`,
-    `fonts/`, and default `morgana_list.md`).
+    `tasks.json`, `notes.json`, `social_stats.json`, `settings.json`, `token.json`,
+    `pet.log`, and lets users place `credentials.json` or a custom `morgana_list.md` there).
+  * `bundle_dir()` points to `sys._MEIPASS` (read-only bundled `assets/`
+    containing `Morgana/`, `fonts/`, `audio/`, and default `morgana_list.md`).
 """
 from __future__ import annotations
 
