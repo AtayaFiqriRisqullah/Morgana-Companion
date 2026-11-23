@@ -1,19 +1,24 @@
 # -*- coding: utf-8 -*-
-"""Shared Persona 5 visual theme: colors, typography hierarchy, shapes, and Qt stylesheets.
+"""Shared Persona 5 visual theme: bundled fonts, palette, shapes, and Qt stylesheets.
 
-Palette : Persona Crimson (#E60012), Obsidian Black (#0B0B0E / #131318 / #1B1B22),
-          Crisp White (#FFFFFF), and subtle Morgana Scarf Gold (#F5C400) for highlights.
-Type    : p5_font() for ALL-CAPS display headers, badges & action buttons;
-          p5_dialogue_font() for dialogue textbox & popup menus (crisp upright sans);
-          ui_font() for note bodies, task titles, and form inputs.
+Palette : Persona Crimson (#E60012), Obsidian Black (#0E0E12 / #15151B / #1C1C24),
+          Crisp White (#FFFFFF), and subtle Morgana Scarf Gold (#F5C400).
+Fonts   : Bundled SIL OFL fonts loaded from `fonts/` via QFontDatabase:
+            * Anton              — heavy condensed Persona 5 display titles & nameplate
+            * Barlow Condensed   — crisp tall Persona 5 buttons, badges & popup menus
+            * Arsenal            — Optima-inspired flared humanist sans for dialogue & UI text
 Rule    : Hover states shift surface/background/border only—never text color.
 """
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 from PyQt6.QtCore import QPointF, Qt
-from PyQt6.QtGui import QColor, QFont, QPen, QPolygonF
+from PyQt6.QtGui import QColor, QFont, QFontDatabase, QGuiApplication, QPen, QPolygonF
+
+FONTS_DIR = Path(__file__).resolve().parent / "fonts"
+_FONTS_LOADED = False
 
 # Core Persona 5 palette
 RED = QColor("#E60012")
@@ -43,30 +48,51 @@ P5_MINT_BG = QColor("#10281E")
 P5_MINT_FG = QColor("#5CE09A")
 
 
+def load_fonts() -> None:
+    """Register bundled Persona 5-style TTF fonts from `fonts/` once a QApplication exists."""
+    global _FONTS_LOADED
+    if _FONTS_LOADED or QGuiApplication.instance() is None:
+        return
+    _FONTS_LOADED = True
+    if FONTS_DIR.is_dir():
+        for path in sorted(FONTS_DIR.glob("*.ttf")):
+            QFontDatabase.addApplicationFont(str(path))
+
+
 def p5_font(px: int, italic: bool = True) -> QFont:
-    """Heavy Persona 5 display font for titles, section headers, menu wedges, and CTA buttons."""
+    """Persona 5 display & UI header font: Anton for big display (>=16px), Barlow Condensed below."""
+    load_fonts()
     f = QFont()
-    f.setFamilies(["Arial Black", "Bahnschrift", "Segoe UI", "Liberation Sans", "DejaVu Sans", "Sans Serif"])
+    if px >= 16:
+        f.setFamilies(["Anton", "Barlow Condensed", "Impact", "Arial Black", "DejaVu Sans"])
+        # Anton's Regular face is already Ultra-Black; avoid Qt faux-bold blur
+        f.setWeight(QFont.Weight.Normal)
+        f.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 104.0)
+    else:
+        f.setFamilies(["Barlow Condensed", "Anton", "Arial Black", "Segoe UI", "DejaVu Sans"])
+        f.setWeight(QFont.Weight.ExtraBold)
+        f.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 105.0)
     f.setPixelSize(px)
-    f.setWeight(QFont.Weight.Black)
-    f.setItalic(italic)
-    f.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 103.0)
+    if px < 16:
+        f.setItalic(italic)
     return f
 
 
-def p5_dialogue_font(px: int = 14) -> QFont:
-    """Crisp upright Persona 5 dialogue font for the textbox and popup menus."""
+def p5_dialogue_font(px: int = 15) -> QFont:
+    """Optima-inspired flared Persona 5 dialogue font (Arsenal Bold) for Morgana's textbox."""
+    load_fonts()
     f = QFont()
-    f.setFamilies(["Segoe UI", "Liberation Sans", "Noto Sans", "DejaVu Sans", "Sans Serif"])
+    f.setFamilies(["Arsenal", "Optima", "Segoe UI", "Liberation Sans", "DejaVu Sans"])
     f.setPixelSize(px)
-    f.setWeight(QFont.Weight.DemiBold)
+    f.setWeight(QFont.Weight.Bold)
     return f
 
 
 def ui_font(px: int, bold: bool = True) -> QFont:
-    """Clean upright sans-serif for note bodies, task items, search inputs, and settings rows."""
+    """Persona 5 flared humanist sans (Arsenal) for Notes, Tasks, and Settings content."""
+    load_fonts()
     f = QFont()
-    f.setFamilies(["Segoe UI", "Liberation Sans", "Noto Sans", "DejaVu Sans", "Sans Serif"])
+    f.setFamilies(["Arsenal", "Optima", "Segoe UI", "Liberation Sans", "DejaVu Sans"])
     f.setPixelSize(px)
     f.setWeight(QFont.Weight.Bold if bold else QFont.Weight.Normal)
     return f
@@ -141,19 +167,19 @@ def tapered_wedge(side: int, length: float, h_in: float, h_out: float) -> QPolyg
     ])
 
 
-# Context & SYSTEM popup menus (Persona 5 obsidian + white frame + crimson highlight, constant white text)
+# Context & SYSTEM popup menus (Barlow Condensed bold + obsidian + crimson highlight, constant white text)
 MENU_QSS = """
 QMenu {
     background-color: #0E0E12;
     color: #FFFFFF;
     border: 2px solid #FFFFFF;
     padding: 5px 0px;
-    font-family: "Segoe UI", "Liberation Sans", "Noto Sans", "DejaVu Sans", sans-serif;
-    font-size: 12px;
+    font-family: "Barlow Condensed", "Arsenal", "Segoe UI", sans-serif;
+    font-size: 15px;
     font-weight: bold;
 }
 QMenu::item {
-    padding: 7px 28px 7px 16px;
+    padding: 6px 28px 6px 16px;
     border-left: 4px solid transparent;
     color: #FFFFFF;
 }
@@ -183,34 +209,35 @@ QMenu::indicator:checked {
 }
 """
 
-# Popup windows (Notes, Tasks, Settings): cohesive dark Persona 5 obsidian / crimson / crisp white.
+# Popup windows (Notes, Tasks, Settings): Persona 5 obsidian / crimson / white + Arsenal & Barlow Condensed.
 # Hover changes background/border only—text color never changes.
 DIALOG_QSS = """
 QLabel {
     color: #F4F4F8;
-    font-family: "Segoe UI", "Liberation Sans", "Noto Sans", "DejaVu Sans", sans-serif;
+    font-family: "Arsenal", "Optima", "Segoe UI", sans-serif;
 }
 QLabel#heading {
     color: #FFFFFF;
-    font-family: "Arial Black", "Bahnschrift", "Segoe UI", "Liberation Sans", "DejaVu Sans", sans-serif;
-    font-size: 15px;
-    font-weight: 900;
+    font-family: "Anton", "Barlow Condensed", "Impact", sans-serif;
+    font-size: 18px;
 }
 QLabel#subhead {
     color: #FF4B55;
-    font-size: 11px;
+    font-family: "Barlow Condensed", "Arsenal", sans-serif;
+    font-size: 13px;
     font-weight: bold;
 }
 QLabel#tip {
-    color: #8E8EA0;
-    font-size: 11px;
+    color: #9292A4;
+    font-family: "Arsenal", "Optima", "Segoe UI", sans-serif;
+    font-size: 12px;
     font-weight: normal;
 }
 QLabel#section {
     color: #FF4B55;
-    font-family: "Arial Black", "Bahnschrift", "Segoe UI", "Liberation Sans", "DejaVu Sans", sans-serif;
-    font-size: 12px;
-    font-weight: 900;
+    font-family: "Barlow Condensed", "Anton", sans-serif;
+    font-size: 15px;
+    font-weight: 800;
 }
 QFrame#card {
     background-color: #15151B;
@@ -246,7 +273,8 @@ QToolTip {
     color: #FFFFFF;
     border: 1.5px solid #E60012;
     padding: 4px 8px;
-    font-size: 11px;
+    font-family: "Arsenal", "Segoe UI", sans-serif;
+    font-size: 12px;
 }
 QLineEdit, QTextEdit, QDateTimeEdit, QTimeEdit, QSpinBox {
     background-color: #1A1A22;
@@ -256,8 +284,8 @@ QLineEdit, QTextEdit, QDateTimeEdit, QTimeEdit, QSpinBox {
     selection-background-color: #E60012;
     selection-color: #FFFFFF;
     padding: 5px 10px;
-    font-size: 13px;
-    font-family: "Segoe UI", "Liberation Sans", "Noto Sans", "DejaVu Sans", sans-serif;
+    font-size: 14px;
+    font-family: "Arsenal", "Optima", "Segoe UI", sans-serif;
 }
 QLineEdit:focus, QTextEdit:focus, QDateTimeEdit:focus, QTimeEdit:focus, QSpinBox:focus {
     background-color: #14141A;
@@ -267,8 +295,8 @@ QLineEdit#titleInput {
     background-color: transparent;
     border: 1.5px solid transparent;
     border-radius: 6px;
-    font-family: "Segoe UI", "Liberation Sans", "Noto Sans", "DejaVu Sans", sans-serif;
-    font-size: 17px;
+    font-family: "Arsenal", "Optima", "Segoe UI", sans-serif;
+    font-size: 19px;
     font-weight: bold;
     color: #FFFFFF;
     padding: 3px 6px;
@@ -285,7 +313,7 @@ QLineEdit#searchInput {
     border: 1.5px solid #2C2C38;
     border-radius: 7px;
     padding: 5px 10px;
-    font-size: 12px;
+    font-size: 13px;
     color: #F4F4F8;
 }
 QLineEdit#searchInput:focus {
@@ -296,7 +324,7 @@ QTextEdit#noteBody {
     border: 1px solid #262632;
     border-radius: 8px;
     padding: 8px 10px;
-    font-size: 13px;
+    font-size: 14px;
     color: #EAEAF0;
 }
 QTextEdit#noteBody:focus {
@@ -326,6 +354,7 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
 QCalendarWidget QWidget {
     background-color: #15151B;
     color: #FFFFFF;
+    font-family: "Arsenal", "Segoe UI", sans-serif;
 }
 QCalendarWidget QAbstractItemView:enabled {
     color: #FFFFFF;

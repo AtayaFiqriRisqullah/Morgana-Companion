@@ -31,7 +31,7 @@ from storage_manager import (SETTINGS_DEFAULTS, NoteStore, SettingsStore, TaskSt
 from theme import (BLACK, DEEP_RED, DIALOG_QSS, GOLD, LIGHT_RED, P5_BG, P5_BORDER, P5_BORDER_HI,
                    P5_CARD, P5_GOLD_BG, P5_GOLD_FG, P5_HOVER, P5_MINT_BG, P5_MINT_FG, P5_MUTED,
                    P5_RED_BG, P5_RED_FG, P5_SELECTED, P5_SURFACE, P5_TEXT, RED, RED_HOVER, WHITE,
-                   lerp_color, p5_font, pen, ui_font)
+                   lerp_color, load_fonts, p5_font, pen, ui_font)
 
 ROLE_ID = Qt.ItemDataRole.UserRole.value      # item id; None = empty-state hint row
 ROLE_DONE = ROLE_ID + 1                       # bool: completed
@@ -170,7 +170,7 @@ class P5FluidButton(QPushButton):
         self._active = False
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.setFont(p5_font(px, italic=False) if display else ui_font(px, bold=True))
+        self.setFont(p5_font(px + 2, italic=False) if display else ui_font(px + 1, bold=True))
         self._hover = Spring(0.0, 380.0)
         self._press = Spring(0.0, 640.0)
         self._ticker = FrameTicker(self._frame, self)
@@ -269,7 +269,7 @@ class P5CheckBox(QCheckBox):
     def __init__(self, text: str, parent: QWidget | None = None) -> None:
         super().__init__(text, parent)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFont(ui_font(13, bold=True))
+        self.setFont(ui_font(14, bold=True))
 
     def sizeHint(self) -> QSize:
         fm = QFontMetrics(self.font())
@@ -308,6 +308,7 @@ class P5FluidPanel(QWidget):
 
     def __init__(self, title: str, size: QSize) -> None:
         super().__init__()
+        load_fonts()
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
                             | Qt.WindowType.WindowStaysOnTopHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
@@ -337,8 +338,10 @@ class P5FluidPanel(QWidget):
         av.setPixmap(_morgana_avatar(30))
         self.header_bar.addWidget(av)
         self._title_lbl = QLabel(title)
-        self._title_lbl.setFont(p5_font(17, italic=True))
-        self._title_lbl.setStyleSheet("color: #FFFFFF; background: transparent;")
+        self._title_lbl.setObjectName("heading")
+        self._title_lbl.setStyleSheet(
+            'color: #FFFFFF; background: transparent; font-family: "Anton", "Barlow Condensed", "Impact", sans-serif; font-size: 22px;'
+        )
         self.header_bar.addWidget(self._title_lbl)
         self.header_bar.addStretch(1)
         self.outer.addWidget(header_w)
@@ -546,12 +549,12 @@ class TaskRowDelegate(QStyledItemDelegate):
         super().__init__(view)
         self._springs: dict[str, Spring] = {}
         self._swallow_release = False
-        self._title_font = ui_font(13, bold=True)
-        self._done_font = ui_font(13, bold=True)
+        self._title_font = ui_font(15, bold=True)
+        self._done_font = ui_font(15, bold=True)
         self._done_font.setStrikeOut(True)
-        self._pill_font = p5_font(9, italic=False)
-        self._time_font = ui_font(10, bold=False)
-        self._hint_font = ui_font(12, bold=False)
+        self._pill_font = p5_font(11, italic=False)
+        self._time_font = ui_font(11, bold=False)
+        self._hint_font = ui_font(13, bold=False)
         self._ticker = FrameTicker(self._frame, self)
 
     def start_check_anim(self, item_id: str) -> None:
@@ -736,13 +739,13 @@ class TaskRowDelegate(QStyledItemDelegate):
 class NoteCardDelegate(QStyledItemDelegate):
     def __init__(self, view: QListWidget) -> None:
         super().__init__(view)
-        self._title_font = ui_font(13, bold=True)
-        self._done_font = ui_font(13, bold=True)
+        self._title_font = ui_font(15, bold=True)
+        self._done_font = ui_font(15, bold=True)
         self._done_font.setStrikeOut(True)
-        self._preview_font = ui_font(11, bold=False)
-        self._chip_font = p5_font(9, italic=False)
-        self._date_font = ui_font(10, bold=False)
-        self._hint_font = ui_font(12, bold=False)
+        self._preview_font = ui_font(12, bold=False)
+        self._chip_font = p5_font(11, italic=False)
+        self._date_font = ui_font(11, bold=False)
+        self._hint_font = ui_font(13, bold=False)
 
     def sizeHint(self, option, index) -> QSize:
         if index.data(ROLE_ID) is None:
@@ -1848,7 +1851,7 @@ class SettingsDialog(P5FluidPanel):
     def _row(layout: QVBoxLayout, text: str, widget: QWidget) -> None:
         row = QHBoxLayout()
         lbl = QLabel(text)
-        lbl.setStyleSheet("color: #D6D6E2; font-size: 13px;")
+        lbl.setStyleSheet("color: #D6D6E2; font-size: 14px;")
         row.addWidget(lbl, 1)
         widget.setMinimumWidth(112)
         widget.setMinimumHeight(30)
