@@ -14,8 +14,9 @@ import os
 import sys
 from pathlib import Path
 
-APP_ID = "DesktopCodingPet"
-DESKTOP_FILE = "desktop-coding-pet.desktop"
+APP_ID = "MorganaCompanion"
+LEGACY_APP_ID = "DesktopCodingPet"
+DESKTOP_FILE = "morgana-companion.desktop"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 IS_WINDOWS = sys.platform.startswith("win")
@@ -32,7 +33,10 @@ def windows_python(exe: str | None = None) -> str:
     return str(candidate) if candidate.is_file() else str(exe_path)
 
 
-def build_windows_command(python_exe: str, script: Path) -> str:
+def build_windows_command(python_exe: str, script: Path, frozen: bool | None = None) -> str:
+    is_frozen = getattr(sys, "frozen", False) if frozen is None else frozen
+    if is_frozen:
+        return f'"{Path(python_exe).resolve()}"'
     return f'"{python_exe}" "{script}"'
 
 
@@ -46,16 +50,23 @@ def _quote_exec_arg(arg: str) -> str:
     return f'"{esc}"'
 
 
-def build_desktop_entry(python_exe: str, script: Path) -> str:
-    exec_line = f"{_quote_exec_arg(python_exe)} {_quote_exec_arg(str(script))}"
+def build_desktop_entry(python_exe: str, script: Path, frozen: bool | None = None) -> str:
+    is_frozen = getattr(sys, "frozen", False) if frozen is None else frozen
+    if is_frozen:
+        exe_path = Path(python_exe).resolve()
+        exec_line = _quote_exec_arg(str(exe_path))
+        work_dir = exe_path.parent
+    else:
+        exec_line = f"{_quote_exec_arg(python_exe)} {_quote_exec_arg(str(script))}"
+        work_dir = script.parent
     return (
         "[Desktop Entry]\n"
         "Type=Application\n"
         "Version=1.0\n"
-        "Name=Desktop Coding Pet\n"
+        "Name=Morgana Companion\n"
         "Comment=Persona 5 style desktop companion\n"
         f"Exec={exec_line}\n"
-        f"Path={script.parent}\n"
+        f"Path={work_dir}\n"
         "Terminal=false\n"
         "X-GNOME-Autostart-enabled=true\n"
     )
@@ -72,8 +83,13 @@ def is_enabled() -> bool:
         if IS_WINDOWS:
             import winreg
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
-                winreg.QueryValueEx(key, APP_ID)
-            return True
+                for name in (APP_ID, LEGACY_APP_ID):
+                    try:
+                        winreg.QueryValueEx(key, name)
+                        return True
+                    except FileNotFoundError:
+                        pass
+            return False
         if IS_LINUX:
             return _linux_entry_path().is_file()
     except OSError:
@@ -103,9 +119,13 @@ def _set_windows(on: bool, script: Path) -> tuple[bool, str]:
         return True, cmd
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
-            winreg.DeleteValue(key, APP_ID)
+            for name in (APP_ID, LEGACY_APP_ID):
+                try:
+                    winreg.DeleteValue(key, name)
+                except FileNotFoundError:
+                    pass
     except FileNotFoundError:
-        pass                                           # memang belum terpasang
+        pass
     return True, "removed"
 
 

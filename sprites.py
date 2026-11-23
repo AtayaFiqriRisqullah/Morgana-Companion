@@ -26,7 +26,9 @@ from pathlib import Path
 from PyQt6.QtCore import QPointF, QRect, Qt
 from PyQt6.QtGui import QImage, QPainter, QPixmap
 
-SPRITE_DIR = Path(__file__).resolve().parent / "Morgana"
+import app_paths
+
+SPRITE_DIR = app_paths.resource_path("Morgana")
 
 # Indeks bingkai. eye: 0 = terbuka (gambar dasar), 1 = setengah, 2 = tertutup.
 #                 mouth: 0 = gambar dasar, 1 = tertutup, 2 = setengah, 3 = terbuka.

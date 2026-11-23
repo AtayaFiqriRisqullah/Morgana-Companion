@@ -17,7 +17,9 @@ from pathlib import Path
 from PyQt6.QtCore import QPointF, Qt
 from PyQt6.QtGui import QColor, QFont, QFontDatabase, QGuiApplication, QPen, QPolygonF
 
-FONTS_DIR = Path(__file__).resolve().parent / "fonts"
+import app_paths
+
+FONTS_DIR = app_paths.resource_path("fonts")
 _FONTS_LOADED = False
 
 # Core Persona 5 palette

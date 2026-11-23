@@ -25,6 +25,7 @@ from PyQt6.QtWidgets import (QAbstractItemView, QCheckBox, QDateTimeEdit, QFrame
                              QPushButton, QSpinBox, QStyle, QStyledItemDelegate, QTextEdit,
                              QTimeEdit, QVBoxLayout, QWidget)
 
+import sprites
 from calendar_service import human_delta
 from motion import FrameTicker, Spring, clamp
 from storage_manager import (SETTINGS_DEFAULTS, NoteStore, SettingsStore, TaskStore, parse_dt)
@@ -82,7 +83,7 @@ def _morgana_avatar(size: int = 30) -> QPixmap:
     p.setClipPath(clip)
     p.fillRect(0, 0, size, size, RED)
 
-    sprite = Path(__file__).resolve().parent / "Morgana" / "b003_000_00.png"
+    sprite = sprites.SPRITE_DIR / "b003_000_00.png"
     src = QPixmap(str(sprite)) if sprite.is_file() else QPixmap()
     if not src.isNull():
         crop = src.copy(QRect(120, 85, 485, 485))

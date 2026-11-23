@@ -48,6 +48,7 @@ from PyQt6.QtGui import (QAction, QActionGroup, QColor, QFontMetrics, QGuiApplic
                          QPainter, QPainterPath, QPen, QPixmap, QPolygonF, QRegion, QTransform)
 from PyQt6.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QWidget
 
+import app_paths
 import autostart
 from calendar_service import CalendarEvent, CalendarResult, CalendarService, format_agenda, human_delta
 from emotions import EXPRESSIONS, STATE_EXPRESSION, emotion_for_text
@@ -72,8 +73,8 @@ except ImportError:  # program tetap jalan; menu SYSTEM akan memberi tahu
 IS_WINDOWS = sys.platform.startswith("win")
 IS_LINUX = sys.platform.startswith("linux")
 
-SCRIPT_PATH = Path(__file__).resolve()
-APP_DIR = SCRIPT_PATH.parent
+SCRIPT_PATH = Path(sys.executable).resolve() if app_paths.is_frozen() else Path(__file__).resolve()
+APP_DIR = app_paths.app_dir()
 LOG_FILE = APP_DIR / "pet.log"
 
 PET_NAME = "MORGANA"
@@ -82,7 +83,7 @@ DEFAULT_SPRITE = 180          # px
 SPRITE_SIZES = (120, 150, 180, 240)
 PAD = 22                      # ruang di sekeliling sprite (untuk melayang, miring, squash & stretch)
 
-LINES_FILE = APP_DIR / "morgana_list.md"   # kalimat Morgana; edit file ini untuk mengganti percakapan
+LINES_FILE = app_paths.resource_path("morgana_list.md")   # custom beside exe, else bundled
 NOTE_COUNTDOWN_REMINDERS = True           # catatan ber-deadline ikut diingatkan H-2 jam seperti acara kalender
 EVENT_STARTED_GRACE_S = 90                # pesan "acara dimulai sekarang" dalam N detik setelah mulai
 REMINDER_CHECK_MS = 30_000    # cek deadline catatan & acara tiap 30 detik
@@ -2261,6 +2262,9 @@ def main() -> int:
     app = QApplication(qt_argv)
     load_fonts()
     app.setApplicationName("Morgana Companion")
+    ico_path = sprites.SPRITE_DIR / "morgana.ico"
+    if ico_path.is_file():
+        app.setWindowIcon(QIcon(str(ico_path)))
     app.setQuitOnLastWindowClosed(False)           # semua jendela bertipe Tool/overlay
     signal.signal(signal.SIGINT, signal.SIG_DFL)   # Ctrl+C di terminal tetap bisa menutup app
 
