@@ -169,208 +169,236 @@ def tapered_wedge(side: int, length: float, h_in: float, h_out: float) -> QPolyg
     ])
 
 
-# Context & SYSTEM popup menus (Barlow Condensed bold + obsidian + crimson highlight, constant white text)
-MENU_QSS = """
-QMenu {
+UI_SCALE_PRESETS = (85, 100, 115, 130)
+
+
+def _sp(px: float, scale: float, lo: int = 1) -> int:
+    return max(lo, int(round(px * scale)))
+
+
+def menu_qss(scale: float = 1.0) -> str:
+    """Context & SYSTEM popup menus scaled cleanly by `scale` (constant white text on hover)."""
+    fs = _sp(15, scale, 11)
+    pv = _sp(6, scale, 4)
+    pr = _sp(28, scale, 18)
+    pl = _sp(16, scale, 10)
+    ind = _sp(13, scale, 10)
+    return f"""
+QMenu {{
     background-color: #0E0E12;
     color: #FFFFFF;
     border: 2px solid #FFFFFF;
     padding: 5px 0px;
     font-family: "Barlow Condensed", "Arsenal", "Segoe UI", sans-serif;
-    font-size: 15px;
+    font-size: {fs}px;
     font-weight: bold;
-}
-QMenu::item {
-    padding: 6px 28px 6px 16px;
+}}
+QMenu::item {{
+    padding: {pv}px {pr}px {pv}px {pl}px;
     border-left: 4px solid transparent;
     color: #FFFFFF;
-}
-QMenu::item:selected {
+}}
+QMenu::item:selected {{
     background-color: #E60012;
     color: #FFFFFF;
     border-left: 4px solid #FFFFFF;
-}
-QMenu::item:disabled {
+}}
+QMenu::item:disabled {{
     color: #848496;
-}
-QMenu::separator {
+}}
+QMenu::separator {{
     height: 2px;
     background: #E60012;
     margin: 5px 10px;
-}
-QMenu::indicator {
-    width: 13px;
-    height: 13px;
+}}
+QMenu::indicator {{
+    width: {ind}px;
+    height: {ind}px;
     margin-left: 6px;
     border: 1.5px solid #FFFFFF;
     background: #0E0E12;
-}
-QMenu::indicator:checked {
+}}
+QMenu::indicator:checked {{
     background: #E60012;
     border: 1.5px solid #FFFFFF;
-}
+}}
 """
 
-# Popup windows (Notes, Tasks, Settings): Persona 5 obsidian / crimson / white + Arsenal & Barlow Condensed.
-# Hover changes background/border only—text color never changes.
-DIALOG_QSS = """
-QLabel {
+
+def dialog_qss(scale: float = 1.0) -> str:
+    """Popup windows (Notes, Tasks, Settings) scaled cleanly by `scale`."""
+    hd = _sp(18, scale, 14)
+    sub = _sp(13, scale, 10)
+    tip = _sp(12, scale, 10)
+    sec = _sp(15, scale, 12)
+    inp = _sp(14, scale, 11)
+    tit = _sp(19, scale, 14)
+    srch = _sp(13, scale, 10)
+    padv = _sp(5, scale, 3)
+    padh = _sp(10, scale, 7)
+    sbw = _sp(7, scale, 5)
+    return f"""
+QLabel {{
     color: #F4F4F8;
     font-family: "Arsenal", "Optima", "Segoe UI", sans-serif;
-}
-QLabel#heading {
+}}
+QLabel#heading {{
     color: #FFFFFF;
     font-family: "Anton", "Barlow Condensed", "Impact", sans-serif;
-    font-size: 18px;
-}
-QLabel#subhead {
+    font-size: {hd}px;
+}}
+QLabel#subhead {{
     color: #FF4B55;
     font-family: "Barlow Condensed", "Arsenal", sans-serif;
-    font-size: 13px;
+    font-size: {sub}px;
     font-weight: bold;
-}
-QLabel#tip {
+}}
+QLabel#tip {{
     color: #9292A4;
     font-family: "Arsenal", "Optima", "Segoe UI", sans-serif;
-    font-size: 12px;
+    font-size: {tip}px;
     font-weight: normal;
-}
-QLabel#section {
+}}
+QLabel#section {{
     color: #FF4B55;
     font-family: "Barlow Condensed", "Anton", sans-serif;
-    font-size: 15px;
+    font-size: {sec}px;
     font-weight: 800;
-}
-QFrame#card {
+}}
+QFrame#card {{
     background-color: #15151B;
     border: 1px solid #2C2C38;
     border-radius: 10px;
-}
-QFrame#subcard {
+}}
+QFrame#subcard {{
     background-color: #1B1B23;
     border: 1px solid #323240;
     border-radius: 8px;
-}
-QFrame#toolbarPill {
+}}
+QFrame#toolbarPill {{
     background-color: #1B1B23;
     border: 1px solid #2E2E3B;
     border-radius: 8px;
-}
-QFrame#undoBar {
+}}
+QFrame#undoBar {{
     background-color: #24090E;
     border: 1px solid #E60012;
     border-radius: 8px;
-}
-QProgressBar {
+}}
+QProgressBar {{
     background-color: #1E1E27;
     border: none;
     border-radius: 3px;
-}
-QProgressBar::chunk {
+}}
+QProgressBar::chunk {{
     background-color: #E60012;
     border-radius: 3px;
-}
-QToolTip {
+}}
+QToolTip {{
     background-color: #0B0B0E;
     color: #FFFFFF;
     border: 1.5px solid #E60012;
     padding: 4px 8px;
     font-family: "Arsenal", "Segoe UI", sans-serif;
-    font-size: 12px;
-}
-QLineEdit, QTextEdit, QDateTimeEdit, QTimeEdit, QSpinBox {
+    font-size: {tip}px;
+}}
+QLineEdit, QTextEdit, QDateTimeEdit, QTimeEdit, QSpinBox {{
     background-color: #1A1A22;
     color: #F4F4F8;
     border: 1.5px solid #323240;
     border-radius: 7px;
     selection-background-color: #E60012;
     selection-color: #FFFFFF;
-    padding: 5px 10px;
-    font-size: 14px;
+    padding: {padv}px {padh}px;
+    font-size: {inp}px;
     font-family: "Arsenal", "Optima", "Segoe UI", sans-serif;
-}
-QLineEdit:focus, QTextEdit:focus, QDateTimeEdit:focus, QTimeEdit:focus, QSpinBox:focus {
+}}
+QLineEdit:focus, QTextEdit:focus, QDateTimeEdit:focus, QTimeEdit:focus, QSpinBox:focus {{
     background-color: #14141A;
     border: 1.5px solid #E60012;
-}
-QLineEdit#titleInput {
+}}
+QLineEdit#titleInput {{
     background-color: transparent;
     border: 1.5px solid transparent;
     border-radius: 6px;
     font-family: "Arsenal", "Optima", "Segoe UI", sans-serif;
-    font-size: 19px;
+    font-size: {tit}px;
     font-weight: bold;
     color: #FFFFFF;
     padding: 3px 6px;
-}
-QLineEdit#titleInput:hover {
+}}
+QLineEdit#titleInput:hover {{
     background-color: #1D1D26;
-}
-QLineEdit#titleInput:focus {
+}}
+QLineEdit#titleInput:focus {{
     background-color: #1A1A22;
     border: 1.5px solid #E60012;
-}
-QLineEdit#searchInput {
+}}
+QLineEdit#searchInput {{
     background-color: #1A1A22;
     border: 1.5px solid #2C2C38;
     border-radius: 7px;
-    padding: 5px 10px;
-    font-size: 13px;
+    padding: {padv}px {padh}px;
+    font-size: {srch}px;
     color: #F4F4F8;
-}
-QLineEdit#searchInput:focus {
+}}
+QLineEdit#searchInput:focus {{
     border: 1.5px solid #E60012;
-}
-QTextEdit#noteBody {
+}}
+QTextEdit#noteBody {{
     background-color: #121217;
     border: 1px solid #262632;
     border-radius: 8px;
     padding: 8px 10px;
-    font-size: 14px;
+    font-size: {inp}px;
     color: #EAEAF0;
-}
-QTextEdit#noteBody:focus {
+}}
+QTextEdit#noteBody:focus {{
     border: 1px solid #4A1921;
-}
-QListWidget {
+}}
+QListWidget {{
     background-color: transparent;
     border: none;
     outline: none;
-}
-QScrollBar:vertical {
+}}
+QScrollBar:vertical {{
     background: transparent;
-    width: 7px;
+    width: {sbw}px;
     margin: 4px 0px;
-}
-QScrollBar::handle:vertical {
+}}
+QScrollBar::handle:vertical {{
     background: #3A3A4A;
     border-radius: 3px;
     min-height: 26px;
-}
-QScrollBar::handle:vertical:hover {
+}}
+QScrollBar::handle:vertical:hover {{
     background: #E60012;
-}
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+}}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
     height: 0px;
-}
-QCalendarWidget QWidget {
+}}
+QCalendarWidget QWidget {{
     background-color: #15151B;
     color: #FFFFFF;
     font-family: "Arsenal", "Segoe UI", sans-serif;
-}
-QCalendarWidget QAbstractItemView:enabled {
+}}
+QCalendarWidget QAbstractItemView:enabled {{
     color: #FFFFFF;
     background-color: #15151B;
     selection-background-color: #E60012;
     selection-color: #FFFFFF;
-}
-QCalendarWidget QAbstractItemView:disabled {
+}}
+QCalendarWidget QAbstractItemView:disabled {{
     color: #5C5C6E;
-}
-QCalendarWidget QToolButton {
+}}
+QCalendarWidget QToolButton {{
     color: #FFFFFF;
     background-color: #20202A;
     border-radius: 4px;
     padding: 3px 6px;
-}
+}}
 """
+
+
+MENU_QSS = menu_qss(1.0)
+DIALOG_QSS = dialog_qss(1.0)

@@ -263,6 +263,7 @@ SETTINGS_DEFAULTS = {
     "event_interval_min": 10,      # repeat interval for event reminders (min)
     "focus_min": 25,               # Pomodoro focus duration (min)
     "rest_min": 5,                 # Pomodoro break duration (min)
+    "ui_scale": 100,               # UI size percentage (75-150)
 }
 _INT_RANGES = {
     "curfew_interval_min": (1, 120),
@@ -270,6 +271,7 @@ _INT_RANGES = {
     "event_interval_min": (1, 120),
     "focus_min": (1, 180),
     "rest_min": (1, 60),
+    "ui_scale": (75, 150),
 }
 
 

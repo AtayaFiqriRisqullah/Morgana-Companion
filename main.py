@@ -58,8 +58,9 @@ import sprites
 from sprites import EYE_CLOSED, EYE_HALF, EYE_OPEN, MOUTH_BASE, MorganaSprites
 from storage_manager import NoteStore, SettingsStore, TaskStore, parse_dt
 from theme import (BLACK, BLACK_BURST_SHARDS, BLUE, LIGHT_RED, MENU_QSS, RED,
-                   RED_BURST_SHARDS, WHITE, lerp_color, load_fonts, p5_dialogue_font,
-                   p5_font, pen, scale_polygon, star_polygon, tapered_wedge)
+                   RED_BURST_SHARDS, UI_SCALE_PRESETS, WHITE, lerp_color, load_fonts,
+                   menu_qss, p5_dialogue_font, p5_font, pen, scale_polygon, star_polygon,
+                   tapered_wedge)
 from ui_dialogs import NotesDialog, SettingsDialog, TasksDialog
 
 try:
@@ -402,6 +403,7 @@ class PetWindow(QWidget):
         self._blink_t = -1.0                       # < 0 = tidak sedang berkedip
         self._mouth_t = 0.0
         self._badge = ""
+        self._ui_scale = 1.0
         self._phase = 0.0
 
         self._tilt = Spring(0.0, 170.0, 11.0)      # derajat; memantul saat dilepas
@@ -465,6 +467,10 @@ class PetWindow(QWidget):
         if text != self._badge:
             self._badge = text
             self.update()
+
+    def set_ui_scale(self, scale: float) -> None:
+        self._ui_scale = max(0.75, min(1.5, float(scale)))
+        self.update()
 
     def set_sprite_size(self, size: int) -> None:
         center = self.geometry().center()
@@ -611,10 +617,11 @@ class PetWindow(QWidget):
             self._paint_badge(p)
 
     def _paint_badge(self, p: QPainter) -> None:
-        font = p5_font(12)
+        sc = self._ui_scale
+        font = p5_font(max(10, int(round(12 * sc))))
         p.setFont(font)
         tw = QFontMetrics(font).horizontalAdvance(self._badge)
-        w, h = tw + 22, 22
+        w, h = tw + int(round(22 * sc)), max(18, int(round(22 * sc)))
         x = (self.width() - w) / 2
         y = self.height() - PAD - h + 2
         poly = QPolygonF([QPointF(x + 7, y), QPointF(x + w, y),
@@ -783,6 +790,7 @@ class BubbleWindow(QWidget):
         self._below = False
         self._tail_x = 0
         self._closing = False
+        self._ui_scale = 1.0
         self._font = p5_dialogue_font(15)
         self._tag_font = p5_font(11, italic=False)
         self._page_font = p5_font(11, italic=False)
@@ -800,6 +808,17 @@ class BubbleWindow(QWidget):
         self._ticker = FrameTicker(self._frame, self)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
+    def set_ui_scale(self, scale: float) -> None:
+        sc = max(0.75, min(1.5, float(scale)))
+        if abs(sc - self._ui_scale) < 0.001:
+            return
+        self._ui_scale = sc
+        self._font = p5_dialogue_font(max(11, int(round(15 * sc))))
+        self._tag_font = p5_font(max(9, int(round(11 * sc))), italic=False)
+        self._page_font = p5_font(max(9, int(round(11 * sc))), italic=False)
+        if self.isVisible() and self._pages:
+            self._apply_page(self._page_idx, pop_bounce=False)
+
     def _apply_page(self, idx: int, pop_bounce: bool = False) -> None:
         self._page_idx = idx
         self._lines = self._pages[idx]
@@ -811,11 +830,11 @@ class BubbleWindow(QWidget):
         self._text_h = len(self._lines) * self._line_h - 1
         if self._use_img:
             # Uniform scale ONLY — never distort vertically!
-            self._s = 0.88 if len(self._lines) <= 2 else 1.04
+            self._s = (0.88 if len(self._lines) <= 2 else 1.04) * self._ui_scale
             self._cap_l = self.IMG_L * self._s
             self._cap_r = (self.IMG_W - self.IMG_R) * self._s
             left_usable = (self.IMG_L - self.TEXT_L) * self._s
-            self._mid_w = max(48.0, tw + self.PADX + badge_pad - left_usable)
+            self._mid_w = max(48.0 * self._ui_scale, tw + self.PADX * self._ui_scale + badge_pad * self._ui_scale - left_usable)
             self._bw = int(self._cap_l + self._mid_w + self._cap_r)
             self._bh = int(self.IMG_H * self._s)
         else:
@@ -837,10 +856,11 @@ class BubbleWindow(QWidget):
 
     def show_message(self, text: str, ms: int) -> None:
         fm = QFontMetrics(self._font)
+        max_w = max(240, int(round(self.MAX_TEXT_W * self._ui_scale)))
         if self._use_img:
-            self._pages = paginate_text(text, fm.horizontalAdvance, self.MAX_TEXT_W, self.MAX_PAGE_LINES)
+            self._pages = paginate_text(text, fm.horizontalAdvance, max_w, self.MAX_PAGE_LINES)
         else:
-            self._pages = [wrap_text(text, fm.horizontalAdvance, self.MAX_TEXT_W)]
+            self._pages = [wrap_text(text, fm.horizontalAdvance, max_w)]
         self._per_page_ms = max(3500, ms // max(1, len(self._pages)))
         self._closing = False
         self._show.configure(300.0, 19.0)
@@ -1144,7 +1164,9 @@ class RadialMenu(QWidget):
             MenuButton("notes",  "NOTES",  "Quick Notes",     +1, +66, +38, +19.0, 178, 27, 52, 2, 3.4),
             MenuButton("system", "SYSTEM", "Options & Sleep", -1, -68, +34,  -7.5, 184, 26, 52, 2, 5.1),
         ]
-        self._u = 1.0                                    # faktor skala terhadap ukuran dasar 180 px
+        self._u = 1.0                                    # button & font scale
+        self._u_pos = 1.0                                # radial clearance from Morgana body
+        self._ui_scale = 1.0
         self._burst = Spring(0.0, 260.0, 17.0)           # animasi ledakan spike di belakang
         self._geom: dict[str, tuple] = {}                # cache poligon, huruf, dan path subjudul
         self._t = 0.0
@@ -1166,6 +1188,11 @@ class RadialMenu(QWidget):
     def set_on_top(self, on: bool) -> None:
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, on)
         self._backdrop.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, on)
+
+    def set_ui_scale(self, scale: float) -> None:
+        self._ui_scale = max(0.75, min(1.5, float(scale)))
+        if self.isVisible():
+            self.hide()
 
     def _build_button_cache(self, b: MenuButton, u: float) -> tuple:
         """Hitung sekali poligon bilah, tata letak huruf cutout, dan path subjudul untuk skala `u`."""
@@ -1219,12 +1246,15 @@ class RadialMenu(QWidget):
         return L, h_in, h_out, poly, shape, glyphs, sub_path
 
     def _layout(self) -> None:
-        u = max(0.72, self._pet.sprite_size / 180.0)
-        self._u = u
-        w, h = int(700 * u), int(380 * u)
+        u_pos = max(0.72, self._pet.sprite_size / 180.0)
+        u_btn = max(0.70, u_pos * self._ui_scale)
+        u_box = max(u_pos, u_btn)
+        self._u_pos = u_pos
+        self._u = u_btn
+        w, h = int(700 * u_box), int(380 * u_box)
         self.setFixedSize(w, h)
-        self._backdrop.configure(w, h, u)
-        self._geom = {b.key: self._build_button_cache(b, u) for b in self._buttons}
+        self._backdrop.configure(w, h, u_box)
+        self._geom = {b.key: self._build_button_cache(b, u_btn) for b in self._buttons}
 
     def open_menu(self) -> None:
         self._layout()
@@ -1322,9 +1352,9 @@ class RadialMenu(QWidget):
         fy = math.cos(self._t * 1.25 + b.phase * 1.3) * 2.4 * u * live if wobble else 0.0
         sway = math.sin(self._t * 1.1 + b.phase) * 0.7 * live if wobble else 0.0
         cx = self.width() / 2.0
-        cy = self.height() / 2.0 + 18.0 * u
+        cy = self.height() / 2.0 + 18.0 * self._u_pos
         t = QTransform()
-        t.translate(cx + b.ox * u * pop + fx, cy + b.oy * u * pop + fy)
+        t.translate(cx + b.ox * self._u_pos * pop + fx, cy + b.oy * self._u_pos * pop + fy)
         t.rotate(b.rot + (1.0 - live) * 20.0 * -b.side + sway)      # mengipas masuk saat muncul
         t.translate(b.side * 10.0 * u * hov, 0.0)                   # meluncur ke luar searah bilah saat hover
         s = (0.35 + 0.65 * max(pop, 0.0)) * (1.0 + 0.08 * hov) * (1.0 - 0.07 * prs)
@@ -1686,6 +1716,10 @@ class PetController(QObject):
         self.curfew_active = False
         self._last_curfew_msg: datetime | None = None
         self.on_top = True
+        self.ui_scale = self.settings["ui_scale"] / 100.0
+        self.pet.set_ui_scale(self.ui_scale)
+        self.bubble.set_ui_scale(self.ui_scale)
+        self.menu.set_ui_scale(self.ui_scale)
 
         self._build_context_menu()
         self._build_system_menu()
@@ -1799,14 +1833,14 @@ class PetController(QObject):
 
     def _open_tasks(self) -> None:
         if self.tasks_dialog is None:
-            self.tasks_dialog = TasksDialog(self.tasks, on_top=self.on_top)
+            self.tasks_dialog = TasksDialog(self.tasks, on_top=self.on_top, ui_scale=self.ui_scale)
             self.tasks_dialog.open_settings.connect(self._open_settings_deferred)
             self.tasks_dialog.open_notes.connect(self._open_notes)
         self.tasks_dialog.show_near(self.pet.geometry())
 
     def _open_notes(self) -> None:
         if self.notes_dialog is None:
-            self.notes_dialog = NotesDialog(self.notes, self.tasks, on_top=self.on_top)
+            self.notes_dialog = NotesDialog(self.notes, self.tasks, on_top=self.on_top, ui_scale=self.ui_scale)
             self.notes_dialog.open_settings.connect(self._open_settings_deferred)
             self.notes_dialog.open_tasks.connect(self._open_tasks)
         self.notes_dialog.show_near(self.pet.geometry())
@@ -1920,7 +1954,7 @@ class PetController(QObject):
     # -- SYSTEM: opsi cepat & mode tidur ---------------------------------------
     def _build_system_menu(self) -> None:
         m = QMenu()
-        m.setStyleSheet(MENU_QSS)
+        m.setStyleSheet(menu_qss(self.ui_scale))
         self.system_menu = m
         self.act_sys_status = m.addAction("SYSTEM STATUS (CPU / RAM)", self._act_item)
         self.act_sys_pomo = m.addAction("FOCUS TIMER", self._act_heal)
@@ -1973,6 +2007,7 @@ class PetController(QObject):
                 get_on_top=lambda: self.on_top,
                 get_autostart=autostart.is_enabled,
                 on_top=self.on_top,
+                ui_scale=self.ui_scale,
             )
             dlg.saved.connect(self.apply_settings)
             dlg.always_on_top_changed.connect(self.set_always_on_top)
@@ -1994,6 +2029,9 @@ class PetController(QObject):
         self.act_curfew.blockSignals(False)
         self.pomodoro.focus_s = max(1, int(self.settings["focus_min"] * 60))
         self.pomodoro.rest_s = max(1, int(self.settings["rest_min"] * 60))
+        new_pct = int(self.settings["ui_scale"])
+        if abs(new_pct / 100.0 - self.ui_scale) > 0.001:
+            self.set_ui_scale(new_pct, save=False, reopen_settings=True)
         self._last_curfew_msg = None
         self._check_curfew()
 
@@ -2086,7 +2124,7 @@ class PetController(QObject):
     # -- menu klik kanan & tray ------------------------------------------------
     def _build_context_menu(self) -> None:
         m = QMenu()
-        m.setStyleSheet(MENU_QSS)
+        m.setStyleSheet(menu_qss(self.ui_scale))
         self.context_menu = m
 
         state_menu = m.addMenu("STATE")
@@ -2125,6 +2163,20 @@ class PetController(QObject):
             size_group.addAction(act)
             size_menu.addAction(act)
         size_group.triggered.connect(lambda a: self.set_size(int(a.data())))
+
+        ui_menu = m.addMenu("UI SIZE")
+        self._ui_size_group = QActionGroup(m)
+        self._ui_size_group.setExclusive(True)
+        labels = {85: "85% (COMPACT)", 100: "100% (NORMAL)", 115: "115% (LARGE)", 130: "130% (XLARGE)"}
+        cur_pct = int(self.settings["ui_scale"])
+        for pct in UI_SCALE_PRESETS:
+            act = QAction(labels.get(pct, f"{pct}%"), m)
+            act.setCheckable(True)
+            act.setData(pct)
+            act.setChecked(pct == cur_pct)
+            self._ui_size_group.addAction(act)
+            ui_menu.addAction(act)
+        self._ui_size_group.triggered.connect(lambda a: self.set_ui_scale(int(a.data())))
 
         m.addSeparator()
         self.act_top = m.addAction("ALWAYS ON TOP")
@@ -2196,6 +2248,47 @@ class PetController(QObject):
         self.menu.hide()
         self.pet.set_sprite_size(px)
         self.bubble.follow()
+
+    def set_ui_scale(self, pct: int, save: bool = True, reopen_settings: bool = False) -> None:
+        """Scale dialogue textbox, radial menu, popup menus, and dialog windows live."""
+        pct = max(75, min(150, int(pct)))
+        if save:
+            self.settings.set(ui_scale=pct)
+        self.ui_scale = pct / 100.0
+        for act in self._ui_size_group.actions():
+            act.blockSignals(True)
+            act.setChecked(int(act.data()) == pct)
+            act.blockSignals(False)
+
+        self.pet.set_ui_scale(self.ui_scale)
+        self.bubble.set_ui_scale(self.ui_scale)
+        self.menu.set_ui_scale(self.ui_scale)
+        qss = menu_qss(self.ui_scale)
+        self.system_menu.setStyleSheet(qss)
+        self.context_menu.setStyleSheet(qss)
+
+        # Rebuild cached dialogs at the new scale (reopen any that were visible)
+        if self.tasks_dialog is not None:
+            was = self.tasks_dialog.isVisible()
+            self.tasks_dialog.hide()
+            self.tasks_dialog.deleteLater()
+            self.tasks_dialog = None
+            if was:
+                self._open_tasks()
+        if self.notes_dialog is not None:
+            was = self.notes_dialog.isVisible()
+            self.notes_dialog.on_closing()
+            self.notes_dialog.hide()
+            self.notes_dialog.deleteLater()
+            self.notes_dialog = None
+            if was:
+                self._open_notes()
+        if self.settings_dialog is not None:
+            was = self.settings_dialog.isVisible()
+            if reopen_settings or was:
+                old = self.settings_dialog
+                self.settings_dialog = None
+                QTimer.singleShot(0, lambda o=old: (o.hide(), o.deleteLater(), self._open_settings()))
 
     def set_always_on_top(self, on: bool) -> None:
         self.on_top = on

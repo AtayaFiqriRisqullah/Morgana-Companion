@@ -29,10 +29,10 @@ import sprites
 from calendar_service import human_delta
 from motion import FrameTicker, Spring, clamp
 from storage_manager import (SETTINGS_DEFAULTS, NoteStore, SettingsStore, TaskStore, parse_dt)
-from theme import (BLACK, DEEP_RED, DIALOG_QSS, GOLD, LIGHT_RED, P5_BG, P5_BORDER, P5_BORDER_HI,
+from theme import (BLACK, DEEP_RED, GOLD, LIGHT_RED, P5_BG, P5_BORDER, P5_BORDER_HI,
                    P5_CARD, P5_GOLD_BG, P5_GOLD_FG, P5_HOVER, P5_MINT_BG, P5_MINT_FG, P5_MUTED,
                    P5_RED_BG, P5_RED_FG, P5_SELECTED, P5_SURFACE, P5_TEXT, RED, RED_HOVER, WHITE,
-                   lerp_color, load_fonts, p5_font, pen, ui_font)
+                   dialog_qss, lerp_color, load_fonts, p5_font, pen, ui_font)
 
 ROLE_ID = Qt.ItemDataRole.UserRole.value      # item id; None = empty-state hint row
 ROLE_DONE = ROLE_ID + 1                       # bool: completed
@@ -44,6 +44,10 @@ ROLE_FLAG = ROLE_ID + 6                       # bool: high priority (tasks) or p
 
 NOTE_CATEGORIES = ("Personal", "Work", "Study")
 _AVATAR_CACHE: dict[int, QPixmap] = {}
+
+
+def _sc(val: float, scale: float, lo: int = 1) -> int:
+    return max(lo, int(round(val * scale)))
 
 
 def _to_qdt(dt: datetime) -> QDateTime:
@@ -162,16 +166,18 @@ class P5FluidButton(QPushButton):
 
     def __init__(self, text: str = "", variant: str = "soft", icon: str = "",
                  display: bool = False, px: int = 12, radius: float = 6.0,
-                 parent: QWidget | None = None) -> None:
+                 scale: float = 1.0, parent: QWidget | None = None) -> None:
         super().__init__(text, parent)
         self._variant = variant
         self._base_variant = variant
         self._icon = icon
         self._radius = radius
+        self._scale = max(0.75, min(1.5, float(scale)))
         self._active = False
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.setFont(p5_font(px + 2, italic=False) if display else ui_font(px + 1, bold=True))
+        fpx = _sc((px + 2) if display else (px + 1), self._scale, 9)
+        self.setFont(p5_font(fpx, italic=False) if display else ui_font(fpx, bold=True))
         self._hover = Spring(0.0, 380.0)
         self._press = Spring(0.0, 640.0)
         self._ticker = FrameTicker(self._frame, self)
@@ -188,10 +194,12 @@ class P5FluidButton(QPushButton):
     def sizeHint(self) -> QSize:
         fm = QFontMetrics(self.font())
         tw = fm.horizontalAdvance(self.text()) if self.text() else 0
-        iw = 15 if self._icon else 0
-        gap = 6 if (self._icon and self.text()) else 0
-        pad = 22 if self.text() else 14
-        return QSize(max(30, tw + iw + gap + pad), 30)
+        sc = self._scale
+        iw = _sc(15, sc, 11) if self._icon else 0
+        gap = _sc(6, sc, 4) if (self._icon and self.text()) else 0
+        pad = _sc(22, sc, 16) if self.text() else _sc(14, sc, 10)
+        h = _sc(30, sc, 24)
+        return QSize(max(h, tw + iw + gap + pad), h)
 
     def enterEvent(self, e) -> None:
         self._hover.target = 1.0
@@ -253,13 +261,16 @@ class P5FluidButton(QPushButton):
         if self._icon and txt:
             fm = QFontMetrics(self.font())
             tw = fm.horizontalAdvance(txt)
-            total = 14 + 6 + tw
+            ic = 15.0 * self._scale
+            gap = 5.0 * self._scale
+            total = ic + gap + tw
             x0 = r.center().x() - total / 2.0
-            _draw_icon(p, self._icon, QRectF(x0, r.center().y() - 7.5, 15, 15), fg)
-            p.drawText(QRectF(x0 + 20, r.top(), tw + 4, r.height()),
+            _draw_icon(p, self._icon, QRectF(x0, r.center().y() - ic / 2.0, ic, ic), fg)
+            p.drawText(QRectF(x0 + ic + gap, r.top(), tw + 4, r.height()),
                        Qt.AlignmentFlag.AlignVCenter.value | Qt.AlignmentFlag.AlignLeft.value, txt)
         elif self._icon:
-            _draw_icon(p, self._icon, QRectF(r.center().x() - 8.5, r.center().y() - 8.5, 17, 17), fg)
+            ic = 17.0 * self._scale
+            _draw_icon(p, self._icon, QRectF(r.center().x() - ic / 2.0, r.center().y() - ic / 2.0, ic, ic), fg)
         else:
             p.drawText(r, Qt.AlignmentFlag.AlignCenter.value, txt)
 
@@ -267,36 +278,40 @@ class P5FluidButton(QPushButton):
 class P5CheckBox(QCheckBox):
     """Crisp Persona 5 dark checkbox with crimson fill and painted white checkmark."""
 
-    def __init__(self, text: str, parent: QWidget | None = None) -> None:
+    def __init__(self, text: str, scale: float = 1.0, parent: QWidget | None = None) -> None:
         super().__init__(text, parent)
+        self._scale = max(0.75, min(1.5, float(scale)))
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFont(ui_font(14, bold=True))
+        self.setFont(ui_font(_sc(14, self._scale, 11), bold=True))
 
     def sizeHint(self) -> QSize:
         fm = QFontMetrics(self.font())
-        return QSize(28 + fm.horizontalAdvance(self.text()) + 6, 26)
+        return QSize(_sc(28, self._scale, 22) + fm.horizontalAdvance(self.text()) + 8, _sc(26, self._scale, 22))
 
     def paintEvent(self, _event) -> None:
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
-        box = QRectF(1.0, (self.height() - 18.0) / 2.0, 18.0, 18.0)
+        sc = self._scale
+        bs = 18.0 * sc
+        box = QRectF(1.0, (self.height() - bs) / 2.0, bs, bs)
         if self.isChecked():
             p.setPen(QPen(WHITE, 1.5))
             p.setBrush(RED)
             p.drawRoundedRect(box, 4.0, 4.0)
             c = box.center()
-            p.setPen(QPen(WHITE, 2.3, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
+            p.setPen(QPen(WHITE, 2.2 * sc, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
                           Qt.PenJoinStyle.RoundJoin))
-            p.drawLine(QPointF(c.x() - 4.4, c.y() + 0.4), QPointF(c.x() - 1.2, c.y() + 3.6))
-            p.drawLine(QPointF(c.x() - 1.2, c.y() + 3.6), QPointF(c.x() + 4.8, c.y() - 3.8))
+            p.drawLine(QPointF(c.x() - 4.4 * sc, c.y() + 0.4 * sc), QPointF(c.x() - 1.2 * sc, c.y() + 3.6 * sc))
+            p.drawLine(QPointF(c.x() - 1.2 * sc, c.y() + 3.6 * sc), QPointF(c.x() + 4.8 * sc, c.y() - 3.8 * sc))
         else:
             p.setPen(QPen(QColor("#8E8EA0"), 1.6))
             p.setBrush(P5_SURFACE)
             p.drawRoundedRect(box, 4.0, 4.0)
+        tx = bs + 9.0 * sc
         p.setFont(self.font())
         p.setPen(P5_TEXT)
-        p.drawText(QRectF(27.0, 0.0, self.width() - 27.0, self.height()),
+        p.drawText(QRectF(tx, 0.0, self.width() - tx, self.height()),
                    Qt.AlignmentFlag.AlignVCenter.value | Qt.AlignmentFlag.AlignLeft.value,
                    self.text())
 
@@ -308,16 +323,19 @@ class P5FluidPanel(QWidget):
     closed = pyqtSignal()
     M, SHADOW, HEADER, SLIDE = 10, 6, 48, 12
 
-    def __init__(self, title: str, size: QSize, on_top: bool = True) -> None:
+    def __init__(self, title: str, size: QSize, on_top: bool = True, ui_scale: float = 1.0) -> None:
         super().__init__()
         load_fonts()
+        sc = max(0.75, min(1.5, float(ui_scale)))
+        self._ui_scale = sc
+        self._header_h = _sc(self.HEADER, sc, 38)
         flags = Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
         if on_top:
             flags |= Qt.WindowType.WindowStaysOnTopHint
         self.setWindowFlags(flags)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setFixedSize(size)
-        self.setStyleSheet(DIALOG_QSS)
+        self.setFixedSize(_sc(size.width(), sc, 380), _sc(size.height(), sc, 420))
+        self.setStyleSheet(dialog_qss(sc))
         self._title = title
         self._on_top = bool(on_top)
         self._drag_offset: QPoint | None = None
@@ -334,17 +352,17 @@ class P5FluidPanel(QWidget):
 
         # Integrated Persona 5 header bar (subclasses can add quick buttons to self.header_bar)
         header_w = QWidget()
-        header_w.setFixedHeight(self.HEADER)
+        header_w.setFixedHeight(self._header_h)
         self.header_bar = QHBoxLayout(header_w)
-        self.header_bar.setContentsMargins(14, 6, 10, 6)
-        self.header_bar.setSpacing(8)
+        self.header_bar.setContentsMargins(_sc(14, sc, 10), _sc(6, sc, 4), _sc(10, sc, 8), _sc(6, sc, 4))
+        self.header_bar.setSpacing(_sc(8, sc, 5))
         av = QLabel()
-        av.setPixmap(_morgana_avatar(30))
+        av.setPixmap(_morgana_avatar(_sc(30, sc, 24)))
         self.header_bar.addWidget(av)
         self._title_lbl = QLabel(title)
         self._title_lbl.setObjectName("heading")
         self._title_lbl.setStyleSheet(
-            'color: #FFFFFF; background: transparent; font-family: "Anton", "Barlow Condensed", "Impact", sans-serif; font-size: 22px;'
+            f'color: #FFFFFF; background: transparent; font-family: "Anton", "Barlow Condensed", "Impact", sans-serif; font-size: {_sc(22, sc, 16)}px;'
         )
         self.header_bar.addWidget(self._title_lbl)
         self.header_bar.addStretch(1)
@@ -353,13 +371,19 @@ class P5FluidPanel(QWidget):
         # Main content area
         content_w = QWidget()
         self.body = QVBoxLayout(content_w)
-        self.body.setContentsMargins(14, 12, 14, 14)
-        self.body.setSpacing(10)
+        self.body.setContentsMargins(_sc(14, sc, 10), _sc(12, sc, 8), _sc(14, sc, 10), _sc(14, sc, 10))
+        self.body.setSpacing(_sc(10, sc, 7))
         self.outer.addWidget(content_w, 1)
 
+    def _btn(self, text: str = "", variant: str = "soft", icon: str = "",
+             display: bool = False, px: int = 12, radius: float = 6.0) -> P5FluidButton:
+        return P5FluidButton(text, variant=variant, icon=icon, display=display,
+                             px=px, radius=radius, scale=self._ui_scale)
+
     def _add_close_button(self) -> None:
-        close_btn = P5FluidButton("", variant="ghost", icon="close", radius=6.0)
-        close_btn.setFixedSize(30, 30)
+        sz = _sc(30, self._ui_scale, 24)
+        close_btn = self._btn("", variant="ghost", icon="close", radius=6.0)
+        close_btn.setFixedSize(sz, sz)
         close_btn.setToolTip("Close (Esc)")
         close_btn.clicked.connect(self.close_animated)
         self.header_bar.addWidget(close_btn)
@@ -406,7 +430,7 @@ class P5FluidPanel(QWidget):
     def paintEvent(self, _event) -> None:
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        M, S, H = self.M, self.SHADOW, self.HEADER
+        M, S, H = self.M, self.SHADOW, self._header_h
         o = clamp(self._open.value)
         body = QRectF(M, M, self.width() - 2 * M - S, self.height() - 2 * M - S)
 
@@ -420,7 +444,7 @@ class P5FluidPanel(QWidget):
         p.drawRect(body)
 
         # Slanted crimson title slash in top-left header
-        cut = min(body.width() * 0.38, 195.0) * o
+        cut = min(body.width() * 0.38, 195.0 * self._ui_scale) * o
         if cut > 20:
             p.setBrush(RED)
             p.drawPolygon(QPolygonF([
@@ -438,7 +462,7 @@ class P5FluidPanel(QWidget):
         p.drawRect(body)
 
     def mousePressEvent(self, e) -> None:
-        if e.button() == Qt.MouseButton.LeftButton and e.position().y() <= self.M + self.HEADER:
+        if e.button() == Qt.MouseButton.LeftButton and e.position().y() <= self.M + self._header_h:
             self._drag_offset = e.globalPosition().toPoint() - self.pos()
 
     def mouseMoveEvent(self, e) -> None:
@@ -523,17 +547,17 @@ class P5FluidPanel(QWidget):
 class UndoBar(QFrame):
     undo_clicked = pyqtSignal()
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(self, scale: float = 1.0, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("undoBar")
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(12, 6, 8, 6)
-        lay.setSpacing(8)
+        lay.setContentsMargins(_sc(12, scale, 8), _sc(6, scale, 4), _sc(8, scale, 6), _sc(6, scale, 4))
+        lay.setSpacing(_sc(8, scale, 6))
         self._lbl = QLabel("")
-        self._lbl.setStyleSheet("color: #FFFFFF; font-size: 12px; font-weight: bold;")
+        self._lbl.setStyleSheet(f"color: #FFFFFF; font-size: {_sc(13, scale, 10)}px; font-weight: bold;")
         lay.addWidget(self._lbl, 1)
-        btn = P5FluidButton("UNDO", variant="primary", display=True, px=11, radius=5.0)
-        btn.setFixedHeight(26)
+        btn = P5FluidButton("UNDO", variant="primary", display=True, px=11, radius=5.0, scale=scale)
+        btn.setFixedHeight(_sc(26, scale, 22))
         btn.clicked.connect(self._on_undo)
         lay.addWidget(btn)
         self._timer = QTimer(self)
@@ -563,16 +587,17 @@ class UndoBar(QFrame):
 class TaskRowDelegate(QStyledItemDelegate):
     CHECK_POINTS = ((-4.8, 0.4), (-1.4, 3.8), (5.2, -4.2))
 
-    def __init__(self, view: QListWidget) -> None:
+    def __init__(self, view: QListWidget, scale: float = 1.0) -> None:
         super().__init__(view)
+        self._sc = max(0.75, min(1.5, float(scale)))
         self._springs: dict[str, Spring] = {}
         self._swallow_release = False
-        self._title_font = ui_font(15, bold=True)
-        self._done_font = ui_font(15, bold=True)
+        self._title_font = ui_font(_sc(15, self._sc, 11), bold=True)
+        self._done_font = ui_font(_sc(15, self._sc, 11), bold=True)
         self._done_font.setStrikeOut(True)
-        self._pill_font = p5_font(11, italic=False)
-        self._time_font = ui_font(11, bold=False)
-        self._hint_font = ui_font(13, bold=False)
+        self._pill_font = p5_font(_sc(11, self._sc, 9), italic=False)
+        self._time_font = ui_font(_sc(11, self._sc, 9), bold=False)
+        self._hint_font = ui_font(_sc(13, self._sc, 11), bold=False)
         self._ticker = FrameTicker(self._frame, self)
 
     def start_check_anim(self, item_id: str) -> None:
@@ -593,17 +618,17 @@ class TaskRowDelegate(QStyledItemDelegate):
             view.viewport().update()
         return bool(self._springs)
 
-    @staticmethod
-    def _box_rect(card: QRectF) -> QRectF:
-        return QRectF(card.left() + 14, card.top() + 12, 20, 20)
+    def _box_rect(self, card: QRectF) -> QRectF:
+        bs = 20.0 * self._sc
+        return QRectF(card.left() + 14.0 * self._sc, card.top() + 12.0 * self._sc, bs, bs)
 
     def sizeHint(self, option, index) -> QSize:
         if index.data(ROLE_ID) is None:
-            return QSize(120, 74)
-        return QSize(120, 62)
+            return QSize(120, _sc(74, self._sc, 56))
+        return QSize(120, _sc(62, self._sc, 50))
 
     def updateEditorGeometry(self, editor, option, index) -> None:
-        editor.setGeometry(option.rect.adjusted(46, 7, -10, -24))
+        editor.setGeometry(option.rect.adjusted(_sc(46, self._sc, 36), _sc(7, self._sc, 4), -10, -_sc(24, self._sc, 18)))
 
     def _paint_checkbox(self, p: QPainter, box: QRectF, done: bool, prog: float) -> None:
         p.save()
@@ -697,12 +722,14 @@ class TaskRowDelegate(QStyledItemDelegate):
                          fm.elidedText(title, Qt.TextElideMode.ElideRight, int(tw)))
 
         # Second line: optional HIGH chip + status chip + creation time
-        py = card.top() + 33
+        sc = self._sc
+        ph = 16.0 * sc
+        py = card.top() + 33.0 * sc
         x_cur = tx
         pfm = QFontMetrics(self._pill_font)
         if high and not done:
-            pw = pfm.horizontalAdvance("HIGH") + 14
-            pill = QRectF(x_cur, py, pw, 16)
+            pw = pfm.horizontalAdvance("HIGH") + 14.0 * sc
+            pill = QRectF(x_cur, py, pw, ph)
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(P5_RED_BG)
             painter.drawRoundedRect(pill, 4.0, 4.0)
@@ -712,8 +739,8 @@ class TaskRowDelegate(QStyledItemDelegate):
             x_cur = pill.right() + 6
 
         st_txt = "DONE" if done else "PENDING"
-        sw = pfm.horizontalAdvance(st_txt) + 14
-        spill = QRectF(x_cur, py, sw, 16)
+        sw = pfm.horizontalAdvance(st_txt) + 14.0 * sc
+        spill = QRectF(x_cur, py, sw, ph)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(P5_MINT_BG if done else P5_GOLD_BG)
         painter.drawRoundedRect(spill, 4.0, 4.0)
@@ -726,7 +753,7 @@ class TaskRowDelegate(QStyledItemDelegate):
         if time_txt:
             painter.setFont(self._time_font)
             painter.setPen(P5_MUTED)
-            painter.drawText(QRectF(x_cur, py, max(0.0, card.right() - x_cur - 8), 16),
+            painter.drawText(QRectF(x_cur, py, max(0.0, card.right() - x_cur - 8), ph),
                              Qt.AlignmentFlag.AlignVCenter.value | Qt.AlignmentFlag.AlignLeft.value,
                              time_txt)
         painter.restore()
@@ -755,20 +782,21 @@ class TaskRowDelegate(QStyledItemDelegate):
 # NoteCardDelegate: Persona 5 dark note cards with pin & reminder badges
 # ---------------------------------------------------------------------------
 class NoteCardDelegate(QStyledItemDelegate):
-    def __init__(self, view: QListWidget) -> None:
+    def __init__(self, view: QListWidget, scale: float = 1.0) -> None:
         super().__init__(view)
-        self._title_font = ui_font(15, bold=True)
-        self._done_font = ui_font(15, bold=True)
+        self._sc = max(0.75, min(1.5, float(scale)))
+        self._title_font = ui_font(_sc(15, self._sc, 11), bold=True)
+        self._done_font = ui_font(_sc(15, self._sc, 11), bold=True)
         self._done_font.setStrikeOut(True)
-        self._preview_font = ui_font(12, bold=False)
-        self._chip_font = p5_font(11, italic=False)
-        self._date_font = ui_font(11, bold=False)
-        self._hint_font = ui_font(13, bold=False)
+        self._preview_font = ui_font(_sc(12, self._sc, 10), bold=False)
+        self._chip_font = p5_font(_sc(11, self._sc, 9), italic=False)
+        self._date_font = ui_font(_sc(11, self._sc, 9), bold=False)
+        self._hint_font = ui_font(_sc(13, self._sc, 11), bold=False)
 
     def sizeHint(self, option, index) -> QSize:
         if index.data(ROLE_ID) is None:
-            return QSize(180, 90)
-        return QSize(180, 94)
+            return QSize(180, _sc(90, self._sc, 70))
+        return QSize(180, _sc(96, self._sc, 78))
 
     def paint(self, painter, option, index) -> None:
         r = QRectF(option.rect)
@@ -838,19 +866,21 @@ class NoteCardDelegate(QStyledItemDelegate):
                 rest = words[i_w:]
                 break
             line1 = trial
-        y_p = card.top() + 28 + pfm.ascent()
+        y_p = card.top() + 28.0 * self._sc + pfm.ascent()
         painter.drawText(QPointF(tx, y_p), pfm.elidedText(line1, Qt.TextElideMode.ElideRight, max_w))
         if rest:
             painter.drawText(QPointF(tx, y_p + pfm.height() + 1),
                              pfm.elidedText(" ".join(rest), Qt.TextElideMode.ElideRight, max_w))
 
         # Bottom strip: category chip + status badge + date
-        by = card.bottom() - 21
+        sc = self._sc
+        ch = 16.0 * sc
+        by = card.bottom() - ch - 5.0
         x_cur = tx
         cfm = QFontMetrics(self._chip_font)
         cat = (index.data(ROLE_CAT) or "Personal").upper()
-        cw = cfm.horizontalAdvance(cat) + 12
-        cpill = QRectF(x_cur, by, cw, 16)
+        cw = cfm.horizontalAdvance(cat) + 12.0 * sc
+        cpill = QRectF(x_cur, by, cw, ch)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor("#242430"))
         painter.drawRoundedRect(cpill, 4.0, 4.0)
@@ -861,8 +891,8 @@ class NoteCardDelegate(QStyledItemDelegate):
 
         badge = index.data(ROLE_BADGE) or ""
         if badge:
-            bw = cfm.horizontalAdvance(badge) + 12
-            bpill = QRectF(x_cur, by, bw, 16)
+            bw = cfm.horizontalAdvance(badge) + 12.0 * sc
+            bpill = QRectF(x_cur, by, bw, ch)
             if badge == "OVERDUE":
                 bbg, bfg = P5_RED_BG, P5_RED_FG
             elif badge == "DONE":
@@ -881,7 +911,7 @@ class NoteCardDelegate(QStyledItemDelegate):
         if date_txt:
             painter.setFont(self._date_font)
             painter.setPen(QColor("#7C7C90"))
-            painter.drawText(QRectF(x_cur, by, max(0.0, card.right() - x_cur - 8), 16),
+            painter.drawText(QRectF(x_cur, by, max(0.0, card.right() - x_cur - 8), ch),
                              Qt.AlignmentFlag.AlignVCenter.value | Qt.AlignmentFlag.AlignRight.value,
                              date_txt)
         painter.restore()
@@ -922,8 +952,9 @@ class TasksDialog(P5FluidPanel):
     open_notes = pyqtSignal()
     tasks_changed = pyqtSignal()
 
-    def __init__(self, store: TaskStore, on_top: bool = True) -> None:
-        super().__init__("TASKS", QSize(500, 610), on_top=on_top)
+    def __init__(self, store: TaskStore, on_top: bool = True, ui_scale: float = 1.0) -> None:
+        super().__init__("TASKS", QSize(500, 610), on_top=on_top, ui_scale=ui_scale)
+        sc = self._ui_scale
         self.store = store
         self._filter = "all"
         self._new_high = False
@@ -934,12 +965,12 @@ class TasksDialog(P5FluidPanel):
         self._count_lbl.setObjectName("subhead")
         self.header_bar.addWidget(self._count_lbl)
 
-        notes_btn = P5FluidButton("NOTES", variant="soft", display=True, px=10)
+        notes_btn = self._btn("NOTES", variant="soft", display=True, px=10)
         notes_btn.clicked.connect(lambda _c=False: self.open_notes.emit())
         self.header_bar.addWidget(notes_btn)
 
-        set_btn = P5FluidButton("", variant="soft", icon="gear")
-        set_btn.setFixedSize(30, 30)
+        set_btn = self._btn("", variant="soft", icon="gear")
+        set_btn.setFixedSize(_sc(30, sc, 24), _sc(30, sc, 24))
         set_btn.setToolTip("Settings (Ctrl+,)")
         set_btn.clicked.connect(lambda _c=False: self.open_settings.emit())
         self.header_bar.addWidget(set_btn)
@@ -959,12 +990,12 @@ class TasksDialog(P5FluidPanel):
         self.input.returnPressed.connect(self._add)
         add_row.addWidget(self.input, 1)
 
-        self._prio_btn = P5FluidButton("HIGH", variant="soft", icon="bolt", display=True, px=10)
+        self._prio_btn = self._btn("HIGH", variant="soft", icon="bolt", display=True, px=10)
         self._prio_btn.setToolTip("Mark new task as high priority")
         self._prio_btn.clicked.connect(self._toggle_new_priority)
         add_row.addWidget(self._prio_btn)
 
-        add_btn = P5FluidButton("ADD", variant="primary", icon="plus", display=True, px=11)
+        add_btn = self._btn("ADD", variant="primary", icon="plus", display=True, px=11)
         add_btn.clicked.connect(self._add)
         add_row.addWidget(add_btn)
         self.body.addLayout(add_row)
@@ -974,8 +1005,8 @@ class TasksDialog(P5FluidPanel):
         bar.setSpacing(5)
         self._chips: dict[str, P5FluidButton] = {}
         for label, key in self.FILTERS:
-            chip = P5FluidButton(label, variant="soft", display=True, px=10)
-            chip.setFixedHeight(26)
+            chip = self._btn(label, variant="soft", display=True, px=10)
+            chip.setFixedHeight(_sc(26, sc, 22))
             chip.clicked.connect(lambda _c=False, k=key: self._set_filter(k))
             self._chips[key] = chip
             bar.addWidget(chip)
@@ -985,7 +1016,7 @@ class TasksDialog(P5FluidPanel):
         self.search_edit.setObjectName("searchInput")
         self.search_edit.setPlaceholderText("Search...")
         self.search_edit.setClearButtonEnabled(True)
-        self.search_edit.setMaximumWidth(150)
+        self.search_edit.setMaximumWidth(_sc(150, sc, 110))
         self.search_edit.textChanged.connect(self.refresh)
         bar.addWidget(self.search_edit)
         self.body.addLayout(bar)
@@ -1000,7 +1031,7 @@ class TasksDialog(P5FluidPanel):
         self.list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.list.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked
                                   | QAbstractItemView.EditTrigger.EditKeyPressed)
-        self._delegate = TaskRowDelegate(self.list)
+        self._delegate = TaskRowDelegate(self.list, scale=sc)
         self.list.setItemDelegate(self._delegate)
         self.list.itemChanged.connect(self._on_item_changed)
         self.list.delete_pressed.connect(self._delete_selected)
@@ -1009,7 +1040,7 @@ class TasksDialog(P5FluidPanel):
         self.body.addWidget(card, 1)
 
         # Undo strip (hidden unless something was deleted)
-        self._undo = UndoBar()
+        self._undo = UndoBar(scale=sc)
         self._undo.undo_clicked.connect(self._undo_delete)
         self.body.addWidget(self._undo)
 
@@ -1020,19 +1051,19 @@ class TasksDialog(P5FluidPanel):
         tip.setObjectName("tip")
         foot.addWidget(tip, 1)
 
-        tog_prio = P5FluidButton("PRIORITY", variant="gold", icon="bolt", display=True, px=10)
-        tog_prio.setFixedHeight(28)
+        tog_prio = self._btn("PRIORITY", variant="gold", icon="bolt", display=True, px=10)
+        tog_prio.setFixedHeight(_sc(28, sc, 24))
         tog_prio.setToolTip("Toggle High priority on selected task(s)")
         tog_prio.clicked.connect(self._toggle_selected_priority)
         foot.addWidget(tog_prio)
 
-        del_btn = P5FluidButton("DELETE", variant="danger", display=True, px=10)
-        del_btn.setFixedHeight(28)
+        del_btn = self._btn("DELETE", variant="danger", display=True, px=10)
+        del_btn.setFixedHeight(_sc(28, sc, 24))
         del_btn.clicked.connect(self._delete_selected)
         foot.addWidget(del_btn)
 
-        clear_btn = P5FluidButton("CLEAR DONE", variant="soft", display=True, px=10)
-        clear_btn.setFixedHeight(28)
+        clear_btn = self._btn("CLEAR DONE", variant="soft", display=True, px=10)
+        clear_btn.setFixedHeight(_sc(28, sc, 24))
         clear_btn.clicked.connect(self._clear_done)
         foot.addWidget(clear_btn)
         self.body.addLayout(foot)
@@ -1203,8 +1234,9 @@ class NotesDialog(P5FluidPanel):
     tasks_changed = pyqtSignal()
 
     def __init__(self, store: NoteStore, task_store: TaskStore | None = None,
-                 on_top: bool = True) -> None:
-        super().__init__("NOTES", QSize(820, 600), on_top=on_top)
+                 on_top: bool = True, ui_scale: float = 1.0) -> None:
+        super().__init__("NOTES", QSize(820, 600), on_top=on_top, ui_scale=ui_scale)
+        sc = self._ui_scale
         self.store = store
         self.task_store = task_store
         self._current_id: str | None = None
@@ -1216,12 +1248,12 @@ class NotesDialog(P5FluidPanel):
         self._undo_note: dict | None = None
 
         # Header quick actions (1-click jump to Tasks or Settings)
-        tasks_btn = P5FluidButton("TASKS", variant="soft", display=True, px=10)
+        tasks_btn = self._btn("TASKS", variant="soft", display=True, px=10)
         tasks_btn.clicked.connect(lambda _c=False: self.open_tasks.emit())
         self.header_bar.addWidget(tasks_btn)
 
-        set_btn = P5FluidButton("", variant="soft", icon="gear")
-        set_btn.setFixedSize(30, 30)
+        set_btn = self._btn("", variant="soft", icon="gear")
+        set_btn.setFixedSize(_sc(30, sc, 24), _sc(30, sc, 24))
         set_btn.setToolTip("Settings (Ctrl+,)")
         set_btn.clicked.connect(lambda _c=False: self.open_settings.emit())
         self.header_bar.addWidget(set_btn)
@@ -1233,13 +1265,14 @@ class NotesDialog(P5FluidPanel):
 
         # -- Left sidebar: New button, search, filters, note list --
         left_card = _make_card()
-        left_card.setFixedWidth(284)
+        left_card.setMinimumWidth(_sc(210, sc, 185))
+        left_card.setMaximumWidth(_sc(284, sc, 225))
         ll = QVBoxLayout(left_card)
         ll.setContentsMargins(10, 10, 10, 10)
         ll.setSpacing(8)
 
-        new_btn = P5FluidButton("NEW NOTE", variant="primary", icon="plus", display=True, px=11)
-        new_btn.setFixedHeight(32)
+        new_btn = self._btn("NEW NOTE", variant="primary", icon="plus", display=True, px=11)
+        new_btn.setFixedHeight(_sc(32, sc, 26))
         new_btn.clicked.connect(self._new)
         ll.addWidget(new_btn)
 
@@ -1254,8 +1287,8 @@ class NotesDialog(P5FluidPanel):
         frow.setSpacing(4)
         self._fchips: dict[str, P5FluidButton] = {}
         for label, key in self.FILTERS:
-            fb = P5FluidButton(label, variant="soft", display=True, px=9)
-            fb.setFixedHeight(24)
+            fb = self._btn(label, variant="soft", display=True, px=9)
+            fb.setFixedHeight(_sc(24, sc, 20))
             fb.clicked.connect(lambda _c=False, k=key: self._set_filter(k))
             self._fchips[key] = fb
             frow.addWidget(fb)
@@ -1267,8 +1300,8 @@ class NotesDialog(P5FluidPanel):
         self.count_label.setObjectName("subhead")
         mrow.addWidget(self.count_label)
         mrow.addStretch(1)
-        self._sort_btn = P5FluidButton("DEADLINES", variant="ghost", icon="sort", px=10)
-        self._sort_btn.setFixedHeight(22)
+        self._sort_btn = self._btn("DEADLINES", variant="ghost", icon="sort", px=10)
+        self._sort_btn.setFixedHeight(_sc(22, sc, 20))
         self._sort_btn.setToolTip("Switch sort order (Deadlines / Recent)")
         self._sort_btn.clicked.connect(self._toggle_sort)
         mrow.addWidget(self._sort_btn)
@@ -1278,11 +1311,11 @@ class NotesDialog(P5FluidPanel):
         self.list.setMouseTracking(True)
         self.list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.list.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self._delegate = NoteCardDelegate(self.list)
+        self._delegate = NoteCardDelegate(self.list, scale=sc)
         self.list.setItemDelegate(self._delegate)
         self.list.itemSelectionChanged.connect(self._on_select)
         ll.addWidget(self.list, 1)
-        cols.addWidget(left_card)
+        cols.addWidget(left_card, 34)
 
         # -- Right panel: Full-height Note Editor --
         editor_card = _make_card()
@@ -1299,21 +1332,21 @@ class NotesDialog(P5FluidPanel):
         self.title_edit.textChanged.connect(self._on_edited)
         eh.addWidget(self.title_edit, 1)
 
-        self._pin_btn = P5FluidButton("", variant="soft", icon="pin")
-        self._pin_btn.setFixedSize(30, 30)
+        self._pin_btn = self._btn("", variant="soft", icon="pin")
+        self._pin_btn.setFixedSize(_sc(30, sc, 24), _sc(30, sc, 24))
         self._pin_btn.setToolTip("Pin note to top")
         self._pin_btn.setEnabled(False)
         self._pin_btn.clicked.connect(self._toggle_pin)
         eh.addWidget(self._pin_btn)
 
-        self._done_btn = P5FluidButton("DONE", variant="soft", icon="check", display=True, px=10)
-        self._done_btn.setFixedHeight(30)
+        self._done_btn = self._btn("DONE", variant="soft", icon="check", display=True, px=10)
+        self._done_btn.setFixedHeight(_sc(30, sc, 24))
         self._done_btn.setEnabled(False)
         self._done_btn.clicked.connect(self._toggle_done)
         eh.addWidget(self._done_btn)
 
-        self._del_btn = P5FluidButton("", variant="danger", icon="trash")
-        self._del_btn.setFixedSize(30, 30)
+        self._del_btn = self._btn("", variant="danger", icon="trash")
+        self._del_btn.setFixedSize(_sc(30, sc, 24), _sc(30, sc, 24))
         self._del_btn.setToolTip("Delete note (can undo)")
         self._del_btn.setEnabled(False)
         self._del_btn.clicked.connect(self._delete)
@@ -1325,15 +1358,15 @@ class NotesDialog(P5FluidPanel):
         meta.setSpacing(5)
         self._cat_btns: dict[str, P5FluidButton] = {}
         for cat in NOTE_CATEGORIES:
-            cb = P5FluidButton(cat.upper(), variant="soft", display=True, px=9)
-            cb.setFixedHeight(24)
+            cb = self._btn(cat.upper(), variant="soft", display=True, px=9)
+            cb.setFixedHeight(_sc(24, sc, 20))
             cb.clicked.connect(lambda _c=False, c=cat: self._set_category(c))
             self._cat_btns[cat] = cb
             meta.addWidget(cb)
         self._sync_category_ui()
 
-        self._rem_btn = P5FluidButton("REMINDER", variant="soft", icon="clock", display=True, px=9)
-        self._rem_btn.setFixedHeight(24)
+        self._rem_btn = self._btn("REMINDER", variant="soft", icon="clock", display=True, px=9)
+        self._rem_btn.setFixedHeight(_sc(24, sc, 20))
         self._rem_btn.clicked.connect(self._toggle_reminder_bar)
         meta.addWidget(self._rem_btn)
         meta.addStretch(1)
@@ -1350,13 +1383,13 @@ class NotesDialog(P5FluidPanel):
         db.setSpacing(6)
         r1 = QHBoxLayout()
         r1.setSpacing(5)
-        self.deadline_check = P5CheckBox("Remind me")
+        self.deadline_check = P5CheckBox("Remind me", scale=sc)
         self.deadline_check.toggled.connect(self._on_deadline_toggled)
         r1.addWidget(self.deadline_check)
         r1.addStretch(1)
         for text, kind in (("+30m", "30m"), ("+1h", "1h"), ("+3h", "3h"), ("Tomorrow 9:00", "tomorrow")):
-            pb = P5FluidButton(text, variant="soft", px=11)
-            pb.setFixedHeight(25)
+            pb = self._btn(text, variant="soft", px=11)
+            pb.setFixedHeight(_sc(25, sc, 21))
             pb.clicked.connect(lambda _c=False, k=kind: self._apply_preset(k))
             r1.addWidget(pb)
         db.addLayout(r1)
@@ -1367,7 +1400,7 @@ class NotesDialog(P5FluidPanel):
         self.deadline_edit.setCalendarPopup(True)
         self.deadline_edit.setDisplayFormat("dd MMM yyyy   HH:mm")
         self.deadline_edit.setDateTime(self._default_deadline())
-        self.deadline_edit.setMinimumHeight(30)
+        self.deadline_edit.setMinimumHeight(_sc(30, sc, 25))
         self.deadline_edit.dateTimeChanged.connect(self._on_deadline_changed)
         r2.addWidget(self.deadline_edit)
         self.deadline_hint = QLabel("")
@@ -1386,7 +1419,7 @@ class NotesDialog(P5FluidPanel):
         el.addWidget(self.content_edit, 1)
 
         # Undo strip (hidden unless a note was deleted)
-        self._undo = UndoBar()
+        self._undo = UndoBar(scale=sc)
         self._undo.undo_clicked.connect(self._undo_delete)
         el.addWidget(self._undo)
 
@@ -1403,8 +1436,8 @@ class NotesDialog(P5FluidPanel):
             ("—", "", "Insert divider", lambda: self._insert_snippet("\n---\n")),
             ("", "clock", "Insert current timestamp", self._insert_timestamp),
         ):
-            tb_btn = P5FluidButton(label, variant="ghost", icon=ic, px=12)
-            tb_btn.setFixedSize(30, 26)
+            tb_btn = self._btn(label, variant="ghost", icon=ic, px=12)
+            tb_btn.setFixedSize(_sc(30, sc, 24), _sc(26, sc, 22))
             tb_btn.setToolTip(tip)
             tb_btn.clicked.connect(lambda _c=False, f=fn: f())
             pl.addWidget(tb_btn)
@@ -1414,13 +1447,13 @@ class NotesDialog(P5FluidPanel):
         self.status.setObjectName("tip")
         bf.addWidget(self.status, 1)
 
-        save_btn = P5FluidButton("SAVE", variant="primary", display=True, px=11)
-        save_btn.setMinimumWidth(82)
+        save_btn = self._btn("SAVE", variant="primary", display=True, px=11)
+        save_btn.setMinimumWidth(_sc(82, sc, 68))
         save_btn.clicked.connect(self._save)
         bf.addWidget(save_btn)
         el.addLayout(bf)
 
-        cols.addWidget(editor_card, 1)
+        cols.addWidget(editor_card, 66)
         self.body.addLayout(cols, 1)
 
         # Keyboard shortcuts
@@ -1776,8 +1809,9 @@ class SettingsDialog(P5FluidPanel):
     autostart_changed = pyqtSignal(bool)
 
     def __init__(self, store: SettingsStore, get_on_top=None, get_autostart=None,
-                 on_top: bool = True) -> None:
-        super().__init__("SETTINGS", QSize(480, 625), on_top=on_top)
+                 on_top: bool = True, ui_scale: float = 1.0) -> None:
+        super().__init__("SETTINGS", QSize(480, 665), on_top=on_top, ui_scale=ui_scale)
+        sc = self._ui_scale
         self.store = store
         self._get_on_top = get_on_top
         self._get_autostart = get_autostart
@@ -1792,7 +1826,7 @@ class SettingsDialog(P5FluidPanel):
         h1 = QLabel("BEDTIME REMINDER")
         h1.setObjectName("section")
         l1.addWidget(h1)
-        self.curfew_check = P5CheckBox("Remind me to go to sleep")
+        self.curfew_check = P5CheckBox("Remind me to go to sleep", scale=sc)
         l1.addWidget(self.curfew_check)
         self.bed_edit = QTimeEdit()
         self.bed_edit.setDisplayFormat("HH:mm")
@@ -1840,8 +1874,13 @@ class SettingsDialog(P5FluidPanel):
         self.rest_spin.setRange(1, 60)
         self.rest_spin.setSuffix(" min")
         self._row(l3, "Break duration", self.rest_spin)
-        self.on_top_check = P5CheckBox("Keep Morgana always on top")
-        self.autostart_check = P5CheckBox("Start Morgana automatically on boot")
+        self.ui_scale_spin = QSpinBox()
+        self.ui_scale_spin.setRange(75, 150)
+        self.ui_scale_spin.setSingleStep(5)
+        self.ui_scale_spin.setSuffix("%")
+        self._row(l3, "UI size", self.ui_scale_spin)
+        self.on_top_check = P5CheckBox("Keep Morgana always on top", scale=sc)
+        self.autostart_check = P5CheckBox("Start Morgana automatically on boot", scale=sc)
         l3.addWidget(self.on_top_check)
         l3.addWidget(self.autostart_check)
         self.body.addWidget(c3)
@@ -1856,26 +1895,26 @@ class SettingsDialog(P5FluidPanel):
         self.status.setWordWrap(True)
         foot.addWidget(self.status, 1)
 
-        reset_btn = P5FluidButton("RESET", variant="soft", display=True, px=11)
+        reset_btn = self._btn("RESET", variant="soft", display=True, px=11)
         reset_btn.clicked.connect(self._reset)
         foot.addWidget(reset_btn)
 
-        save_btn = P5FluidButton("SAVE", variant="primary", display=True, px=11)
-        save_btn.setMinimumWidth(88)
+        save_btn = self._btn("SAVE", variant="primary", display=True, px=11)
+        save_btn.setMinimumWidth(_sc(88, sc, 72))
         save_btn.clicked.connect(self._save)
         foot.addWidget(save_btn)
         self.body.addLayout(foot)
 
         QShortcut(QKeySequence("Ctrl+S"), self).activated.connect(self._save)
 
-    @staticmethod
-    def _row(layout: QVBoxLayout, text: str, widget: QWidget) -> None:
+    def _row(self, layout: QVBoxLayout, text: str, widget: QWidget) -> None:
+        sc = self._ui_scale
         row = QHBoxLayout()
         lbl = QLabel(text)
-        lbl.setStyleSheet("color: #D6D6E2; font-size: 14px;")
+        lbl.setStyleSheet(f"color: #D6D6E2; font-size: {_sc(14, sc, 11)}px;")
         row.addWidget(lbl, 1)
-        widget.setMinimumWidth(112)
-        widget.setMinimumHeight(30)
+        widget.setMinimumWidth(_sc(112, sc, 92))
+        widget.setMinimumHeight(_sc(30, sc, 25))
         row.addWidget(widget)
         layout.addLayout(row)
 
@@ -1888,6 +1927,7 @@ class SettingsDialog(P5FluidPanel):
         self.event_interval.setValue(int(values["event_interval_min"]))
         self.focus_spin.setValue(int(values.get("focus_min", SETTINGS_DEFAULTS["focus_min"])))
         self.rest_spin.setValue(int(values.get("rest_min", SETTINGS_DEFAULTS["rest_min"])))
+        self.ui_scale_spin.setValue(int(values.get("ui_scale", SETTINGS_DEFAULTS["ui_scale"])))
         if self._get_on_top is not None:
             self.on_top_check.setChecked(bool(self._get_on_top()))
         if self._get_autostart is not None:
@@ -1907,7 +1947,8 @@ class SettingsDialog(P5FluidPanel):
         self._saving = True
         try:
             for w in (self.bed_edit, self.wake_edit, self.curfew_interval,
-                      self.event_window, self.event_interval, self.focus_spin, self.rest_spin):
+                      self.event_window, self.event_interval, self.focus_spin,
+                      self.rest_spin, self.ui_scale_spin):
                 w.interpretText()
             b, w = self.bed_edit.time(), self.wake_edit.time()
             self.store.set(
@@ -1919,6 +1960,7 @@ class SettingsDialog(P5FluidPanel):
                 event_interval_min=self.event_interval.value(),
                 focus_min=self.focus_spin.value(),
                 rest_min=self.rest_spin.value(),
+                ui_scale=self.ui_scale_spin.value(),
             )
             self.saved.emit()
             if self._get_on_top is not None and self.on_top_check.isChecked() != bool(self._get_on_top()):
