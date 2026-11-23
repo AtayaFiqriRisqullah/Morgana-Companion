@@ -35,6 +35,12 @@ _DEFAULTS: dict[str, list[str]] = {
         'Hmm, you look pretty tired. Maybe you should take a bath?',
         "You're already so worn out, you wouldn't be able to concentrate.",
         "Make sure you're well-rested before the deadline.",
+        "Hey! Still staring at that screen? Lights out—go to bed!",
+        "Good grief, your eyes are getting heavy. Close your apps and hit the pillow!",
+        "Everything else can wait until tomorrow. Seriously, go get some sleep!",
+        "I'm not letting this slide—it's way past bedtime! Time to rest!",
+        "A sharp mind needs proper rest. Wrap it up and lie down already!",
+        "Yawn... Even I'm getting sleepy watching you stay up this late. Bedtime!",
     ],
     "agenda": [
         "If we don't hurry, the train's gonna leave without us!",
@@ -116,3 +122,341 @@ def greeting_pool(lines: list[str], hour: int) -> list[str]:
         return list(lines)
     pool = [ln for ln in lines if not ln.lower().startswith("good morning")]
     return pool or list(lines)
+
+
+def _clip(text: str, n: int = 34) -> str:
+    s = (text or "").strip()
+    return s if len(s) <= n else s[: n - 1].rstrip() + "…"
+
+
+class ContextualDialogue:
+    """Qt-free contextual Morgana dialogue generator.
+
+    Produces `(text, emotion, voice)` triples tailored to the user's live state
+    (bedtime, active timers, tasks, notes, calendar events, daily stats blocks,
+    time of day, and enabled radial tabs) while rotating naturally across all 8
+    Morgana voicelines without immediate repeats.
+    """
+
+    def __init__(self) -> None:
+        self._last: dict[str, str] = {}
+
+    def _pick(self, slot: str, options: list[tuple[str, str, str]]) -> tuple[str, str, str]:
+        if not options:
+            return ("What's our next move?", "neutral", "dousuru")
+        last = self._last.get(slot)
+        pool = [o for o in options if o[0] != last] if len(options) > 1 else options
+        choice = random.choice(pool or options)
+        self._last[slot] = choice[0]
+        return choice
+
+    def radial_open(self, ctx: dict) -> tuple[str, str, str]:
+        """Relevant line when the user opens Morgana's radial menu."""
+        tabs = set(ctx.get("enabled_tabs") or ())
+        hour = int(ctx.get("hour", 12))
+
+        if ctx.get("curfew_active"):
+            return self._pick("radial_open_bed", [
+                ("Hey! It's past bedtime—what are you opening menus for? Go get some sleep!", "angry", "hoi"),
+                ("Good grief, you're still awake? Only check what you must, then hit the bed!", "sad", "yareyare"),
+                ("You're going to wear yourself out! Wrap up quick and call it a night.", "worried", "yareyare"),
+                ("Oi, it's late! Don't tell me you're starting a whole new project right now...", "angry", "hoi"),
+            ])
+
+        if ctx.get("sleep_mode"):
+            return self._pick("radial_open_sleep", [
+                ("Mm? Need something while I'm napping? Go ahead and pick a menu.", "sad", "oh_asking"),
+                ("Oh? Waking me up? Let me know what you need!", "neutral", "oh_asking"),
+                ("Still on duty even in Sleep Mode—what's the plan?", "wink", "dousuru"),
+            ])
+
+        pool: list[tuple[str, str, str]] = []
+
+        # Live timer context
+        if ctx.get("focus_running"):
+            rem = ctx.get("focus_rem", "")
+            if ctx.get("focus_phase") == "rest":
+                pool.append((f"Break time! {rem} left to recharge—what do you want to check?", "wink", "hmm"))
+                pool.append((f"Enjoying your breather? {rem} left before we lock back in!", "neutral", "naa"))
+            else:
+                pool.append((f"Focus session is rolling with {rem} left! Need a quick look at something?", "smug", "hmm"))
+                pool.append((f"Stay sharp—{rem} left on the focus clock. What's the move?", "serious", "dousuru"))
+        elif ctx.get("manual_nearest_label"):
+            lbl = _clip(ctx["manual_nearest_label"], 28)
+            rem = ctx.get("manual_nearest_rem", "")
+            pool.append((f"Your '{lbl}' timer has {rem} left! Anything else on your mind?", "neutral", "naa"))
+
+        # Live calendar event context (only if Events tab is enabled)
+        if "events" in tabs:
+            if ctx.get("ongoing_event_title"):
+                title = _clip(ctx["ongoing_event_title"], 30)
+                pool.append((f"Hey, '{title}' is happening right now! Need to check Events?", "shout", "hoi"))
+            elif ctx.get("next_event_title"):
+                title = _clip(ctx["next_event_title"], 28)
+                delta = ctx.get("next_event_delta", "")
+                pool.append((f"Heads up—'{title}' starts in {delta}! Want to peek at Events?", "worried", "naa"))
+                pool.append((f"Don't forget '{title}' coming up in {delta}. How should we play this?", "serious", "dousuru"))
+
+        # Live tasks context (only if Tasks tab is enabled)
+        pending = int(ctx.get("pending_tasks", 0))
+        if "tasks" in tabs and pending > 0:
+            top = _clip(ctx.get("top_task", ""), 28)
+            word = "task" if pending == 1 else "tasks"
+            if ctx.get("high_tasks", 0) > 0 and top:
+                pool.append((f"'{top}' is marked high priority! Ready to knock it out in Tasks?", "serious", "hoi"))
+            elif top:
+                pool.append((f"You've got {pending} pending {word}—maybe tackle '{top}' next?", "neutral", "dousuru"))
+                pool.append((f"Hey, '{top}' is still waiting on your list. What's the plan?", "neutral", "naa"))
+
+        # Live due notes context (only if Notes tab is enabled)
+        due_notes = int(ctx.get("due_notes", 0))
+        if "notes" in tabs and due_notes > 0:
+            word = "note" if due_notes == 1 else "notes"
+            pool.append((f"You have {due_notes} {word} with an active deadline—want to check Notes?", "worried", "oh_asking"))
+
+        # Live Social Stats context (only if Stats tab is enabled)
+        blocks = int(ctx.get("today_blocks", 0))
+        if "stats" in tabs:
+            if blocks >= 3:
+                pool.append((f"Whoa, {blocks} blocks logged today! Look at you leveling up!", "excited", "oh_excited"))
+            elif blocks == 0 and hour >= 13:
+                pool.append(("Haven't logged a Social Stat block yet today! What have you been training?", "neutral", "oh_asking"))
+            elif blocks > 0:
+                pool.append((f"Nice—{blocks}/3 time blocks logged today! Going for another stat boost?", "smug", "hmm"))
+
+        # Time-of-day conversational variety (so even with empty lists, Morgana feels fresh!)
+        if 5 <= hour < 12:
+            pool.extend([
+                ("Fresh morning! What's our first move today?", "wink", "dousuru"),
+                ("Ooh, ready to kick off the day? Pick a tab!", "excited", "oh_excited"),
+                ("Hey hey, got a plan for this morning?", "neutral", "naa"),
+            ])
+        elif 12 <= hour < 18:
+            pool.extend([
+                ("Afternoon check-in! What are we tackling next?", "neutral", "dousuru"),
+                ("Oh? Need something? Let's see what's on the board!", "neutral", "oh_asking"),
+                ("Keeping up a good pace today—where to next?", "smug", "hmm"),
+            ])
+        elif 18 <= hour < 23:
+            pool.extend([
+                ("Evening already! Checking what's left before you wind down?", "neutral", "oh_asking"),
+                ("Hey, let's review your evening game plan!", "neutral", "naa"),
+                ("Alright, what's the next move for tonight?", "smug", "dousuru"),
+            ])
+        else:
+            pool.extend([
+                ("Burning the midnight oil? Don't push yourself too hard!", "sad", "yareyare"),
+                ("Oh, still up? Pick what you need and remember to rest!", "worried", "oh_asking"),
+            ])
+
+        return self._pick("radial_open", pool)
+
+    def radial_close(self, ctx: dict) -> tuple[str, str, str]:
+        """Short natural line when the user closes the radial menu without opening a window."""
+        if ctx.get("curfew_active"):
+            return self._pick("radial_close_bed", [
+                ("Good call—now close your eyes and get some sleep!", "wink", "hmm"),
+                ("Alright, menu's closed! Now go hit the pillow already!", "sad", "yareyare"),
+            ])
+        if ctx.get("focus_running") and ctx.get("focus_phase") != "rest":
+            return self._pick("radial_close_focus", [
+                ("Back to the grind! I'll keep an eye on your focus clock.", "smug", "hmm"),
+                ("Locked back in! Just tap me if you need a break.", "wink", "hmm"),
+            ])
+        return self._pick("radial_close", [
+            ("Changed your mind? I'll be right here if you need me!", "wink", "hmm"),
+            ("Alright then! Just tap me whenever you're ready.", "neutral", "hmm"),
+            ("Nothing for now? Fair enough—take it at your own pace!", "wink", "naa"),
+            ("Oh, all set? Holler if you need a hand!", "neutral", "oh_asking"),
+            ("Gotcha! I'll keep watch over here.", "smug", "hmm"),
+        ])
+
+    def window_open(self, kind: str, ctx: dict) -> tuple[str, str, str]:
+        """Relevant reaction when opening a specific dialog window or System menu."""
+        if kind == "tasks":
+            pending = int(ctx.get("pending_tasks", 0))
+            total = int(ctx.get("total_tasks", pending))
+            top = _clip(ctx.get("top_task", ""), 30)
+            if total == 0:
+                return self._pick("open_tasks_empty", [
+                    ("Blank slate! Add a task and let's start knocking 'em down.", "neutral", "dousuru"),
+                    ("No tasks on the board yet! What's the first goal?", "neutral", "oh_asking"),
+                ])
+            if pending == 0:
+                return self._pick("open_tasks_clear", [
+                    ("Whoa, your task list is completely clear! Awesome work!", "excited", "oh_excited"),
+                    ("Not a single pending task left! You really crushed it!", "wink", "hmm"),
+                ])
+            word = "task" if pending == 1 else "tasks"
+            opts = [
+                (f"Let's check your tasks! {pending} {word} left—which one's first?", "neutral", "dousuru"),
+                (f"Alright, {pending} pending {word} on the board. One step at a time!", "smug", "hmm"),
+            ]
+            if ctx.get("high_tasks", 0) > 0 and top:
+                opts.append((f"'{top}' is high priority! Let's focus on that one!", "serious", "hoi"))
+            elif top:
+                opts.append((f"Hey, '{top}' is right up top—ready to cross it off?", "neutral", "naa"))
+            return self._pick("open_tasks", opts)
+
+        if kind == "notes":
+            cnt = int(ctx.get("notes_count", 0))
+            due = int(ctx.get("due_notes", 0))
+            if cnt == 0:
+                return self._pick("open_notes_empty", [
+                    ("No notes yet! Jot down anything you don't want to forget.", "neutral", "naa"),
+                    ("Fresh notebook! Start typing whenever an idea hits you.", "wink", "hmm"),
+                ])
+            opts = [
+                (f"Opening your notes! {cnt} saved—need to add or review something?", "neutral", "oh_asking"),
+                ("Let's see what you've jotted down! Everything auto-saves too.", "wink", "hmm"),
+            ]
+            if due > 0:
+                word = "note" if due == 1 else "notes"
+                opts.append((f"Heads up—you've got {due} {word} with deadlines set!", "worried", "naa"))
+            return self._pick("open_notes", opts)
+
+        if kind == "events":
+            ongoing = ctx.get("ongoing_event_title")
+            nxt = ctx.get("next_event_title")
+            delta = ctx.get("next_event_delta", "")
+            week_cnt = int(ctx.get("week_events_count", 0))
+            if ongoing:
+                return (f"Hey, '{_clip(ongoing, 32)}' is happening right now! Check the schedule!", "shout", "hoi")
+            if nxt:
+                return self._pick("open_events_next", [
+                    (f"Let's check the week! Next up is '{_clip(nxt, 30)}' in {delta}.", "worried", "naa"),
+                    (f"Here's your 7-day calendar—'{_clip(nxt, 30)}' is coming up in {delta}!", "serious", "dousuru"),
+                ])
+            if week_cnt == 0:
+                return self._pick("open_events_clear", [
+                    ("Ooh, your 7-day schedule is wide open! Plenty of free time!", "excited", "oh_excited"),
+                    ("Nothing on the calendar this week! Nice and peaceful.", "wink", "hmm"),
+                ])
+            return self._pick("open_events", [
+                ("Here's your 7-day calendar! Let's plan the week ahead.", "smug", "dousuru"),
+                ("Checking the schedule? Smart—staying ahead always pays off!", "wink", "hmm"),
+            ])
+
+        if kind == "stats":
+            blocks = int(ctx.get("today_blocks", 0))
+            if blocks >= 3:
+                return self._pick("open_stats_full", [
+                    (f"Whoa, {blocks} blocks logged today already! Your stats are soaring!", "excited", "oh_excited"),
+                    (f"All {blocks} blocks in today! Let's check how close you are to the next rank!", "smug", "hmm"),
+                ])
+            if blocks == 0:
+                return self._pick("open_stats_zero", [
+                    ("Zero time blocks logged today so far! Which stat are we leveling up?", "neutral", "dousuru"),
+                    ("Social Stats board is open! What did you spend your last 2-hour block on?", "neutral", "oh_asking"),
+                ])
+            return self._pick("open_stats", [
+                (f"Social Stats time! {blocks}/3 blocks done today—what did you train?", "smug", "oh_asking"),
+                (f"Nice momentum with {blocks}/3 blocks today! Ready to log another?", "wink", "hmm"),
+            ])
+
+        if kind == "timer":
+            if ctx.get("focus_running"):
+                rem = ctx.get("focus_rem", "")
+                if ctx.get("focus_phase") == "rest":
+                    return (f"Break timer is ticking with {rem} left—take it easy!", "wink", "hmm")
+                return (f"Focus Mode is live with {rem} left! Keep that streak going!", "smug", "hmm")
+            mcnt = int(ctx.get("manual_count", 0))
+            if mcnt > 0:
+                word = "timer" if mcnt == 1 else "timers"
+                return (f"You've got {mcnt} manual {word} ticking! Need another reminder?", "neutral", "oh_asking")
+            return self._pick("open_timer", [
+                ("Ready to lock in? Start a Focus session or set a quick manual timer!", "smug", "dousuru"),
+                ("Timer's up! Pick a Pomodoro block or set a custom countdown.", "neutral", "hmm"),
+            ])
+
+        if kind == "settings":
+            return self._pick("open_settings", [
+                ("Tuning the controls? Let's get everything set just how you like it!", "wink", "hmm"),
+                ("Oh, tweaking Settings? Don't forget to hit Save when you're done!", "neutral", "oh_asking"),
+                ("Customizing your setup? You can toggle tabs, audio, and bedtime right here!", "neutral", "naa"),
+            ])
+
+        if kind == "system":
+            return self._pick("open_system", [
+                ("System menu's up! Need CPU status, Sleep Mode, or Settings?", "neutral", "oh_asking"),
+                ("Looking under the hood? Pick whatever you need!", "smug", "dousuru"),
+            ])
+
+        return ("Let's take a look!", "neutral", "hmm")
+
+    def window_close(self, kind: str, ctx: dict) -> tuple[str, str, str]:
+        """Short contextual reaction when the user closes a dialog window."""
+        if ctx.get("curfew_active"):
+            return self._pick("close_bed", [
+                ("Done with that? Great—now seriously, go get some sleep!", "sad", "yareyare"),
+                ("Window's closed! Now close your eyes too—it's bedtime!", "angry", "hoi"),
+            ])
+
+        if kind == "tasks":
+            pending = int(ctx.get("pending_tasks", 0))
+            total = int(ctx.get("total_tasks", pending))
+            if total > 0 and pending == 0:
+                return ("All tasks cleared! You're on fire today!", "excited", "oh_excited")
+            word = "task" if pending == 1 else "tasks"
+            return self._pick("close_tasks", [
+                (f"Tasks tucked away! {pending} {word} left whenever you're ready." if pending else "Tasks closed! Let me know when you add a new goal.", "wink", "hmm"),
+                ("Alright, back to action! Keep chipping away at that list.", "smug", "hmm"),
+            ])
+
+        if kind == "notes":
+            return self._pick("close_notes", [
+                ("Notes safely saved! Everything's locked in.", "wink", "hmm"),
+                ("Got your notes sorted? I'll keep watch on any deadlines for you!", "neutral", "naa"),
+            ])
+
+        if kind == "events":
+            return self._pick("close_events", [
+                ("Schedule checked! Don't worry, I'll remind you before events start.", "wink", "hmm"),
+                ("Got the week mapped out? Let's make it count!", "smug", "oh_excited"),
+            ])
+
+        if kind == "stats":
+            return self._pick("close_stats", [
+                ("Keep stacking those daily blocks—you'll rank up in no time!", "smug", "hmm"),
+                ("Nice work tracking your growth! Every block counts.", "wink", "hmm"),
+            ])
+
+        if kind == "timer":
+            if ctx.get("focus_running") or int(ctx.get("manual_count", 0)) > 0:
+                return self._pick("close_timer_active", [
+                    ("I've got the countdown right on my HUD—stay focused!", "smug", "hmm"),
+                    ("Timer's ticking! I'll shout as soon as time's up.", "wink", "naa"),
+                ])
+            return self._pick("close_timer", [
+                ("Timer closed! Pop it back open whenever you need a countdown.", "neutral", "hmm"),
+                ("Alright, no clock running for now. Take a breather!", "wink", "hmm"),
+            ])
+
+        if kind == "settings":
+            return self._pick("close_settings", [
+                ("Settings closed! Let me know if you want to tweak anything else.", "wink", "hmm"),
+                ("All tuned up! Ready when you are.", "smug", "hmm"),
+            ])
+
+        return ("Alright, all closed!", "neutral", "hmm")
+
+    def task_completed(self, title: str, remaining: int) -> tuple[str, str, str]:
+        t = _clip(title, 32)
+        if remaining == 0:
+            return self._pick("task_done_all", [
+                (f"Ooh, '{t}' was the last one! Every single task is done—awesome work!", "excited", "oh_excited"),
+                (f"Boom! '{t}' cleared—your whole task list is spotless!", "excited", "oh_excited"),
+            ])
+        word = "more" if remaining == 1 else "left"
+        return self._pick("task_done", [
+            (f"Nice! '{t}' checked off—{remaining} {word} to go!", "wink", "hmm"),
+            (f"Whoa, look at that progress! '{t}' is done!", "excited", "oh_excited"),
+            (f"One down! '{t}' is off the board—keep that momentum rolling!", "smug", "hmm"),
+        ])
+
+    def wall_bump(self) -> tuple[str, str, str]:
+        return self._pick("wall_bump", [
+            ("Uwooh! Hey, watch where you're tossing me!", "shout", "uwooh"),
+            ("Whoa! Easy there—I'm a companion, not a stress ball!", "shout", "uwooh"),
+            ("Uwooh! Careful! My scarf almost flew off!", "uneasy", "uwooh"),
+        ])

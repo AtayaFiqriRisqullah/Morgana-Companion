@@ -400,21 +400,32 @@ class SocialStatsStore(JsonListStore):
 # ---------------------------------------------------------------------------
 # Pengaturan (settings.json)
 # ---------------------------------------------------------------------------
+RADIAL_TABS: tuple[tuple[str, str], ...] = (
+    ("events", "Events (7-Day Calendar)"),
+    ("tasks",  "Tasks (To-Do List)"),
+    ("timer",  "Timer (Focus & Manual)"),
+    ("notes",  "Notes (Quick Notes)"),
+    ("stats",  "Social Stats"),
+    ("system", "System Menu"),
+)
+RADIAL_TAB_KEYS: tuple[str, ...] = tuple(k for k, _ in RADIAL_TABS)
+
 SETTINGS_DEFAULTS = {
-    "bedtime": "23:30",            # bedtime reminder start
-    "wake": "05:00",               # bedtime reminder stop
+    "bedtime": "23:30",                 # bedtime reminder start
+    "wake": "05:00",                    # bedtime reminder stop
     "curfew_enabled": True,
-    "curfew_interval_min": 1,      # interval between bedtime remarks (min)
-    "event_window_min": 120,       # start reminding before event/deadline (min)
-    "event_interval_min": 10,      # repeat interval for event reminders (min)
-    "focus_min": 25,               # Pomodoro focus duration (min)
-    "rest_min": 5,                 # Pomodoro break duration (min)
-    "ui_scale": 100,               # UI size percentage (75-150)
-    "sound_enabled": True,         # UI SFX, Social Stats fanfare, and Morgana voice
-    "sound_volume": 80,            # Master audio volume percentage (0-100)
+    "curfew_interval_sec": 30,          # interval between bedtime remarks (sec)
+    "event_window_min": 120,            # start reminding before event/deadline (min)
+    "event_interval_min": 10,           # repeat interval for event reminders (min)
+    "focus_min": 25,                    # Pomodoro focus duration (min)
+    "rest_min": 5,                      # Pomodoro break duration (min)
+    "ui_scale": 100,                    # UI size percentage (75-150)
+    "sound_enabled": True,              # UI SFX, Social Stats fanfare, and Morgana voice
+    "sound_volume": 80,                 # Master audio volume percentage (0-100)
+    "enabled_tabs": list(RADIAL_TAB_KEYS),  # Active tabs shown in Morgana's radial menu
 }
 _INT_RANGES = {
-    "curfew_interval_min": (1, 120),
+    "curfew_interval_sec": (10, 3600),
     "event_window_min": (5, 1440),
     "event_interval_min": (1, 120),
     "focus_min": (1, 180),
@@ -432,17 +443,28 @@ def _valid_hhmm(value) -> bool:
         return False
 
 
+def normalize_enabled_tabs(value) -> list[str] | None:
+    """Validate and order radial menu tab keys; returns None if empty or invalid."""
+    if not isinstance(value, (list, tuple, set)):
+        return None
+    wanted = {str(v).strip().lower() for v in value}
+    cleaned = [k for k in RADIAL_TAB_KEYS if k in wanted]
+    return cleaned if cleaned else None
+
+
 class SettingsStore:
     """Pengaturan pengguna; nilai tidak valid diabaikan dan diganti bawaan."""
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
         self.data: dict = dict(SETTINGS_DEFAULTS)
+        self.data["enabled_tabs"] = list(RADIAL_TAB_KEYS)
         self.last_error = ""
         self.load()
 
     def load(self) -> None:
         self.data = dict(SETTINGS_DEFAULTS)
+        self.data["enabled_tabs"] = list(RADIAL_TAB_KEYS)
         if not self.path.is_file():
             return
         try:
@@ -453,9 +475,21 @@ class SettingsStore:
             log.warning("Gagal membaca %s: %s", self.path.name, exc)
             backup_corrupt(self.path)
             return
-        self.set(save=False, **{k: v for k, v in raw.items() if k in SETTINGS_DEFAULTS})
+        patch = {k: v for k, v in raw.items() if k in SETTINGS_DEFAULTS}
+        # Migrate legacy curfew_interval_min -> curfew_interval_sec (preserve >1 min custom values;
+        # upgrade the old 1-minute default cleanly to the new 30-second cadence).
+        if "curfew_interval_sec" not in patch and "curfew_interval_min" in raw:
+            old_m = raw.get("curfew_interval_min")
+            if isinstance(old_m, (int, float)) and not isinstance(old_m, bool) and int(old_m) > 1:
+                patch["curfew_interval_sec"] = int(old_m) * 60
+        self.set(save=False, **patch)
 
     def set(self, save: bool = True, **values) -> None:
+        # Accept legacy curfew_interval_min keyword cleanly
+        if "curfew_interval_min" in values and "curfew_interval_sec" not in values:
+            old_m = values.pop("curfew_interval_min")
+            if isinstance(old_m, (int, float)) and not isinstance(old_m, bool):
+                values["curfew_interval_sec"] = int(old_m) * 60
         for key, value in values.items():
             if key not in SETTINGS_DEFAULTS:
                 continue
@@ -465,6 +499,10 @@ class SettingsStore:
             elif key in ("curfew_enabled", "sound_enabled"):
                 if isinstance(value, bool):
                     self.data[key] = value
+            elif key == "enabled_tabs":
+                cleaned = normalize_enabled_tabs(value)
+                if cleaned is not None:
+                    self.data["enabled_tabs"] = cleaned
             else:
                 lo, hi = _INT_RANGES[key]
                 if isinstance(value, (int, float)) and not isinstance(value, bool):

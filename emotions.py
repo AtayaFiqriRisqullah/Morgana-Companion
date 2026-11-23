@@ -32,8 +32,10 @@ STATE_EXPRESSION = {
 
 # Order matters: first matching rule wins. All keywords are lowercase.
 _RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("shout", ("hurry", "leave without us", "due now:", "starting now:", "go to bed!", "almost morning", "time's up")),
-    ("angry", ("shouldn't be staying up", "shouldn't skip meals", "usage is high", "closing apps")),
+    ("shout", ("hurry", "leave without us", "due now:", "starting now:", "go to bed!",
+               "lights out", "almost morning", "time's up", "uwooh")),
+    ("angry", ("shouldn't be staying up", "shouldn't skip meals", "usage is high",
+               "closing apps", "not letting this slide", "past bedtime")),
     ("uneasy", ("are you sure", "cats can't", "couldn't find", "couldn't load", "couldn't update",
                 "isn't installed", "expired", "failed", "error")),
     ("excited", ("ooh", "whoa", "paying off", "awesome work", "great effort", "you made it",
@@ -45,7 +47,8 @@ _RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
               "enjoy your rest", "start on boot is enabled")),
     ("worried", ("test tomorrow", "don't forget", "deadline", "part-time", "raining",
                  "time flies", "upcoming event", "next up:", "pending task")),
-    ("sad", ("tired", "worn out", "sleep", "rest up", "well-rested", "bath", "sleep mode is on")),
+    ("sad", ("tired", "worn out", "sleep", "rest up", "well-rested", "bath",
+             "sleep mode is on", "pillow", "yawn", "eyes are getting heavy", "lie down")),
     ("serious", ("shouldn't you", "study", "read a book", "guard down",
                  "money", "gym", "water your plant")),
 )
@@ -53,14 +56,17 @@ _RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
 # Voice rules matched by text cues before falling back to expression.
 _VOICE_TEXT_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("hoi", ("time's up", "due now:", "starting now:", "hurry", "leave without us",
-             "shouldn't be staying up", "usage is high", "go to bed!")),
-    ("uwooh", ("whoa!", "almost morning", "crash")),
+             "shouldn't be staying up", "usage is high", "go to bed!", "lights out",
+             "not letting this slide", "past bedtime")),
+    ("uwooh", ("uwooh", "whoa!", "almost morning", "crash")),
     ("oh_excited", ("rank up", "leveled up", "level up", "ooh", "whoa", "awesome",
                     "great effort", "you made it", "paying off", "you're doing great",
                     "you're doing awesome", "rooting for you")),
     ("yareyare", ("tired", "worn out", "sleep mode", "rest up", "well-rested",
-                  "shouldn't skip meals", "go to sleep", "bedtime", "good grief")),
-    ("dousuru", ("what should", "what's next", "ready for another", "ready for this",
+                  "shouldn't skip meals", "go to sleep", "bedtime", "good grief",
+                  "pillow", "yawn", "eyes are getting heavy", "lie down")),
+    ("dousuru", ("what should", "what's next", "what's the move", "what's the plan",
+                 "first move", "ready for another", "ready for this",
                  "shouldn't you", "plan")),
     ("oh_asking", ("are you sure", "checking", "couldn't find", "couldn't load",
                    "couldn't update", "isn't installed", "expired", "failed", "error")),
@@ -95,8 +101,6 @@ def emotion_for_text(text: str, default: str = "neutral") -> str:
 def voice_for_dialogue(text: str, emotion: str = "neutral", context: str = "") -> str:
     """Select the best Morgana voiceline key for `text`, `emotion`, and `context`."""
     low = (text or "").lower()
-    if context == "menu_open":
-        return "dousuru"
     if context == "bump_wall":
         return "uwooh"
     if context == "rank_up":

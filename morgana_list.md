@@ -19,6 +19,12 @@ Daftar ini dikategorikan berdasarkan kondisi waktu atau aktivitas pengguna (*tri
 * "Hmm, you look pretty tired. Maybe you should take a bath?"
 * "You're already so worn out, you wouldn't be able to concentrate."
 * "Make sure you're well-rested before the deadline."
+* "Hey! Still staring at that screen? Lights out—go to bed!"
+* "Good grief, your eyes are getting heavy. Close your apps and hit the pillow!"
+* "Everything else can wait until tomorrow. Seriously, go get some sleep!"
+* "I'm not letting this slide—it's way past bedtime! Time to rest!"
+* "A sharp mind needs proper rest. Wrap it up and lie down already!"
+* "Yawn... Even I'm getting sleepy watching you stay up this late. Bedtime!"
 
 ## 3. Mendekati Agenda / Jadwal Penting
 
