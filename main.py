@@ -978,17 +978,39 @@ class MenuButton:
     pop: Spring = field(default_factory=lambda: Spring(0.0, 230.0, 15.0))     # muncul (memantul)
     hover: Spring = field(default_factory=lambda: Spring(0.0, 380.0, 26.0))   # sapuan merah
     press: Spring = field(default_factory=lambda: Spring(0.0, 700.0, 36.0))   # mengempis saat ditekan
+    px: float = 0.0    # posisi relatif (kali rx / ry); tersebar berselang-seling seperti menu battle P5
+    py: float = 0.0
+    icon: str = ""     # simbol tombol controller: triangle / square / circle / cross
+    red: QPolygonF = field(default_factory=QPolygonF)     # spike merah di belakang tombol
+    black: QPolygonF = field(default_factory=QPolygonF)   # spike hitam di atas spike merah
+
+
+def draw_symbol(p: QPainter, kind: str, r: float) -> None:
+    """Simbol tombol controller (garis saja) di titik (0, 0)."""
+    if kind == "triangle":
+        p.drawPolygon(QPolygonF([QPointF(0, -r), QPointF(r * 0.95, r * 0.7), QPointF(-r * 0.95, r * 0.7)]))
+    elif kind == "square":
+        p.drawRect(QRectF(-r * 0.78, -r * 0.78, r * 1.56, r * 1.56))
+    elif kind == "circle":
+        p.drawEllipse(QPointF(0, 0), r * 0.88, r * 0.88)
+    elif kind == "cross":
+        k = r * 0.78
+        p.drawLine(QPointF(-k, -k), QPointF(k, k))
+        p.drawLine(QPointF(k, -k), QPointF(-k, k))
 
 
 class RadialMenu(QWidget):
-    """Menu radial: tombol muncul bergantian dari karakter (pegas, berputar sambil
-    mengembang), melayang pelan, hover = sapuan merah diagonal + bintang berputar,
-    klik = mengempis. Menutup dengan redaman kritis (tanpa pantulan)."""
+    """Menu radial ala menu battle Persona 5: tombol hitam miring bergaris putih dengan spike
+    merah-hitam di belakangnya, tersebar berselang-seling di kiri & kanan karakter, tiap tombol
+    punya simbol controller. Muncul bergantian dari karakter (pegas, berputar sambil mengembang),
+    melayang pelan, hover = sapuan merah diagonal + spike membesar, klik = mengempis.
+    Menutup dengan redaman kritis (tanpa pantulan)."""
 
     triggered = pyqtSignal(str, QPoint)   # key tombol, titik global di dekat tombol
     closed = pyqtSignal()
 
-    BTN_W, BTN_H = 140, 52
+    BTN_W, BTN_H = 150, 54
+    ICON_R = 15                           # jari-jari lingkaran simbol di tepi kiri tombol
     SHEAR = -0.28
     STAGGER = 0.05                        # jeda antar tombol saat membuka (detik)
     OPEN_STIFFNESS, OPEN_DAMPING = 230.0, 15.0
@@ -999,13 +1021,25 @@ class RadialMenu(QWidget):
         setup_overlay(self)
         self.setMouseTracking(True)
         self._pet = pet
+        # semua miring naik ke kanan seperti teks di menu battle; posisi berselang-seling
         self._buttons = [
-            MenuButton("agenda", "AGENDA", "NEXT EVENT", -1, -1, -4, 0.0),
-            MenuButton("tasks", "TASKS", "TO-DO LIST", +1, -1, 3, 1.7),
-            MenuButton("notes", "NOTES", "QUICK NOTES", +1, +1, -3, 3.4),
-            MenuButton("system", "SYSTEM", "OPTIONS / SLEEP", -1, +1, 4, 5.1),
+            MenuButton("agenda", "AGENDA", "NEXT EVENT", -1, -1, -9, 0.0, px=-1.0, py=-1.0, icon="triangle"),
+            MenuButton("tasks", "TASKS", "TO-DO LIST", +1, -1, -8, 1.7, px=+0.92, py=-0.95, icon="square"),
+            MenuButton("notes", "NOTES", "QUICK NOTES", +1, +1, -6, 3.4, px=+1.1, py=+0.95, icon="circle"),
+            MenuButton("system", "SYSTEM", "OPTIONS / SLEEP", -1, +1, -7, 5.1, px=-1.12, py=+0.95, icon="cross"),
         ]
-        self._base = QPolygonF(QRectF(-self.BTN_W / 2, -self.BTN_H / 2, self.BTN_W, self.BTN_H))
+        W, H = self.BTN_W, self.BTN_H
+        rect = QRectF(-W / 2, -H / 2, W, H)
+        # badan tombol: jajargenjang tidak simetris (seperti serpihan), bukan persegi panjang
+        self._base = QPolygonF([QPointF(-W / 2 + 10, -H / 2), QPointF(W / 2 + 4, -H / 2 + 3),
+                                QPointF(W / 2 - 8, H / 2), QPointF(-W / 2 - 2, H / 2 - 3)])
+        self._shape = QPainterPath()
+        self._shape.addPolygon(self._base)
+        self._shape.closeSubpath()
+        for i, b in enumerate(self._buttons):
+            b.red = spike_border(rect.adjusted(-3, -3, 3, 3), length=19, step=25, seed=21 + i * 7)
+            b.black = spike_border(rect.adjusted(2, 3, -2, -3).translated(4, 2), length=11, step=19,
+                                   seed=5 + i * 13)
         self._label_font = p5_font(22)
         self._sub_font = p5_font(9)
         self._rx = self._ry = 0.0
@@ -1027,10 +1061,10 @@ class RadialMenu(QWidget):
 
     def _layout(self) -> None:
         size = self._pet.sprite_size
-        self._rx = size / 2 + 82
+        self._rx = size / 2 + 90
         self._ry = max(30.0, 0.4 * size - 21)
-        self.setFixedSize(int(2 * (self._rx + self.BTN_W / 2 + 46)),
-                          int(2 * (self._ry + self.BTN_H / 2 + 46)))
+        self.setFixedSize(int(2 * (self._rx * 1.15 + self.BTN_W / 2 + 60)),
+                          int(2 * (self._ry * 1.0 + self.BTN_H / 2 + 56)))
 
     def open_menu(self) -> None:
         self._layout()
@@ -1109,8 +1143,8 @@ class RadialMenu(QWidget):
         fy = math.cos(self._t * 1.25 + b.phase * 1.3) * 2.6 * live if wobble else 0.0
         sway = math.sin(self._t * 1.1 + b.phase) * 0.7 * live if wobble else 0.0
         t = QTransform()
-        t.translate(self.width() / 2.0 + b.sx * self._rx * pop + fx,
-                    self.height() / 2.0 + b.sy * self._ry * pop + fy)
+        t.translate(self.width() / 2.0 + b.px * self._rx * pop + fx,
+                    self.height() / 2.0 + b.py * self._ry * pop + fy)
         t.translate(b.sx * 8.0 * hov, b.sy * 5.0 * hov)            # bergeser ke luar saat hover
         t.rotate(b.rot + (1.0 - live) * 28.0 * -b.sx + sway)       # berputar masuk saat muncul
         s = (0.4 + 0.6 * max(pop, 0.0)) * (1.0 + 0.09 * hov) * (1.0 - 0.07 * prs)
@@ -1123,17 +1157,25 @@ class RadialMenu(QWidget):
             b = self._buttons[i]
             if b.pop.value < 0.5:
                 continue
-            if self._xf(b).map(self._base).containsPoint(pos, Qt.FillRule.OddEvenFill):
+            xf = self._xf(b)
+            if xf.map(self._base).containsPoint(pos, Qt.FillRule.OddEvenFill):
+                return i
+            icon = xf.map(QPointF(-self.BTN_W / 2 - 2, 0.0))            # lingkaran simbol juga bisa diklik
+            if math.hypot(pos.x() - icon.x(), pos.y() - icon.y()) <= self.ICON_R:
                 return i
         return -1
 
     def _build_mask(self) -> QRegion:
         region = QRegion()
         W, H = self.BTN_W, self.BTN_H
-        grow = QPolygonF(QRectF(-W / 2 - 30, -H / 2 - 8, W + 56, H + 16))   # ruang bintang + bayangan + melayang
+        bulge = QTransform().scale(1.14, 1.14)                      # spike membesar saat hover
         for b in self._buttons:
-            poly = self._xf(b, pop=1.0, hover=1.0, wobble=False).map(grow)
-            region = region.united(QRegion(poly.toPolygon()))
+            xf = self._xf(b, pop=1.0, hover=1.0, wobble=False)
+            region = region.united(QRegion(xf.map(bulge.map(b.red)).toPolygon()))
+            icon = xf.map(QPointF(-W / 2 - 2, 0.0))
+            r = self.ICON_R + 4
+            region = region.united(QRegion(int(icon.x() - r), int(icon.y() - r), 2 * r, 2 * r,
+                                           QRegion.RegionType.Ellipse))
         return region
 
     # -- event ---------------------------------------------------------------
@@ -1190,43 +1232,50 @@ class RadialMenu(QWidget):
         p.setOpacity(opacity)
         p.setTransform(self._xf(b))
 
-        off = 6.0 + 3.0 * hov                                       # bayangan miring (putih saat hover)
+        p.save()                                                     # spike merah + hitam di belakang
+        grow = 1.0 + 0.12 * hov
+        p.scale(grow, grow)
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(lerp_color(RED, WHITE, hov))
-        p.drawRect(rect.translated(off, off))
+        p.setBrush(RED)
+        p.drawPolygon(b.red)
+        p.setBrush(BLACK)
+        p.drawPolygon(b.black)
+        p.restore()
+
         p.setPen(pen(WHITE, 3))                                      # badan hitam + garis putih
         p.setBrush(BLACK)
-        p.drawRect(rect)
+        p.drawPath(self._shape)
 
         if hov > 0.01:
             p.save()                                                 # sapuan merah diagonal
-            p.setClipRect(rect.adjusted(1.5, 1.5, -1.5, -1.5))
+            p.setClipPath(self._shape)
             edge = rect.left() + hv * (W + 40) - 20
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(RED)
-            p.drawPolygon(QPolygonF([QPointF(rect.left() - 6, rect.top()), QPointF(edge + 16, rect.top()),
-                                     QPointF(edge - 16, rect.bottom()), QPointF(rect.left() - 6, rect.bottom())]))
+            p.drawPolygon(QPolygonF([QPointF(rect.left() - 12, rect.top()), QPointF(edge + 16, rect.top()),
+                                     QPointF(edge - 16, rect.bottom()), QPointF(rect.left() - 12, rect.bottom())]))
             p.setPen(pen(WHITE, 2.5))
             p.drawLine(QPointF(edge + 16, rect.top()), QPointF(edge - 16, rect.bottom()))
             p.restore()
 
-            p.save()                                                 # bintang penanda berputar
-            p.translate(rect.left() - 4, 0.0)
-            p.rotate(hov * 160.0)
-            sc = 0.2 + 0.8 * hov
-            p.scale(sc, sc)
-            p.setPen(pen(BLACK, 2))
-            p.setBrush(WHITE)
-            p.drawPolygon(star_polygon(0, 0, 13, 6, 5))
-            p.restore()
+        # lingkaran simbol controller di tepi kiri (merah saat hover)
+        p.save()
+        p.translate(rect.left() - 2, 0.0)
+        p.setPen(pen(WHITE, 2.5))
+        p.setBrush(lerp_color(BLACK, RED, hov))
+        p.drawEllipse(QPointF(0, 0), self.ICON_R, self.ICON_R)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(pen(WHITE, 2.4))
+        draw_symbol(p, b.icon, self.ICON_R * 0.55)
+        p.restore()
 
-        nudge = 5.0 * hov
+        nudge = 5.0 * hov + 10.0                                     # teks bergeser ke kanan, memberi ruang simbol
         p.setPen(WHITE)
         p.setFont(self._label_font)
         p.drawText(QRectF(-W / 2 + nudge, -H / 2 + 3, W, 30), Qt.AlignmentFlag.AlignCenter.value, b.label)
         p.setPen(lerp_color(LIGHT_RED, WHITE, hov))
         p.setFont(self._sub_font)
-        p.drawText(QRectF(-W / 2 + nudge, 6, W, 16), Qt.AlignmentFlag.AlignCenter.value, b.sub)
+        p.drawText(QRectF(-W / 2 + nudge, 7, W, 16), Qt.AlignmentFlag.AlignCenter.value, b.sub)
         p.restore()
 
 
