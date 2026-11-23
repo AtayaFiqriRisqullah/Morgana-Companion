@@ -57,7 +57,7 @@ import sprites
 from sprites import EYE_CLOSED, EYE_HALF, EYE_OPEN, MOUTH_BASE, MorganaSprites
 from storage_manager import NoteStore, SettingsStore, TaskStore, parse_dt
 from theme import (BLACK, BLUE, LIGHT_RED, MENU_QSS, RED, WHITE, lerp_color, p5_font, pen,
-                   star_polygon)
+                   spike_border, star_polygon)
 from ui_dialogs import NotesDialog, SettingsDialog, TasksDialog
 
 try:
@@ -715,15 +715,22 @@ def wrap_text(text: str, measure, max_w: int) -> list[str]:
 
 class BubbleWindow(QWidget):
     """Balon dialog: muncul membesar dari kepala karakter (pegas + sedikit putar), teks
-    mengetik per huruf, tutup dengan menyusut. Bentuk: kotak miring hitam, garis putih,
-    bayangan merah, ekor runcing, name tag merah, dan bintang bergerigi."""
+    mengetik per huruf, tutup dengan menyusut. Bingkai memakai Morgana/textbox.png (dipotong 3
+    supaya bisa melebar mengikuti teks) dengan spike merah-hitam di belakangnya, plus name tag
+    merah. Jika textbox.png tidak ada: kotak miring hitam + bayangan merah + ekor runcing."""
 
     dismissed = pyqtSignal()
     typing_finished = pyqtSignal()          # semua huruf sudah tampil (mulut karakter berhenti)
 
-    MAX_TEXT_W = 240
-    M, PADX, PADY = 22, 18, 12
-    TAIL_H, TAG_OVER, SHADOW, SLANT = 16, 12, 7, 10
+    MAX_TEXT_W = 300
+    M, PADX, PADY = 34, 16, 6                 # M = ruang di sekeliling (untuk spike)
+    TAIL_H, TAG_OVER, SHADOW, SLANT = 16, 12, 7, 10   # TAIL_H/SHADOW/SLANT: hanya bingkai cadangan
+    # textbox.png (600x173): area hitam yang bisa ditulisi ada di x 235..465, y 60..137.
+    # Gambar dipotong kiri | tengah | kanan: sisi kiri & kanan (spike putih) hanya diskalakan,
+    # bagian tengah direntangkan sesuai panjang teks.
+    IMG_W, IMG_H = 600, 173
+    IMG_L, IMG_R = 235, 465          # spike putih kanan mulai masuk ke area hitam di x~470
+    IMG_TOP, IMG_BOT = 60, 137
 
     def __init__(self, pet: PetWindow) -> None:
         super().__init__()
@@ -741,6 +748,12 @@ class BubbleWindow(QWidget):
         self._closing = False
         self._font = p5_font(14)
         self._tag_font = p5_font(10)
+        self._box = QPixmap(str(sprites.SPRITE_DIR / "textbox.png"))
+        self._use_img = not self._box.isNull()
+        self._tail_h = 0 if self._use_img else self.TAIL_H      # textbox.png tanpa ekor
+        self._s = 1.0                              # skala gambar bingkai
+        self._cap_l = self._cap_r = 0.0
+        self._text_h = 0
         self._show = Spring(0.0, 300.0, 19.0)      # 0 = hilang, 1 = tampil (overshoot sedikit)
         self._hide_timer = QTimer(self)
         self._hide_timer.setSingleShot(True)
@@ -754,13 +767,23 @@ class BubbleWindow(QWidget):
         self._line_h = fm.height() + 3
         self._ascent = fm.ascent()
         tw = max((fm.horizontalAdvance(ln) for ln in self._lines), default=0) + 4
-        self._bw = max(tw, 60) + 2 * self.PADX
-        self._bh = len(self._lines) * self._line_h + 2 * self.PADY - 2
+        self._text_h = len(self._lines) * self._line_h - 3
+        if self._use_img:
+            # tinggi bingkai mengikuti jumlah baris; sisi kiri/kanan ikut diskalakan seragam
+            self._s = max(0.55, (self._text_h + 2 * self.PADY) / (self.IMG_BOT - self.IMG_TOP))
+            sx = min(self._s, 0.9)               # sisi spike tidak ikut melebar saat teks banyak
+            self._cap_l = self.IMG_L * sx
+            self._cap_r = (self.IMG_W - self.IMG_R) * sx
+            self._bw = int(self._cap_l + max(tw, 60) + 2 * self.PADX + self._cap_r)
+            self._bh = int(self.IMG_H * self._s)
+        else:
+            self._bw = max(tw, 60) + 2 * self.PADX
+            self._bh = len(self._lines) * self._line_h + 2 * self.PADY - 2
         self._total = sum(len(ln) for ln in self._lines)
         self._reveal = 0.0
         self._speed = max(55.0, self._total / 1.15)            # teks panjang tetap selesai ~1 detik
         self.setFixedSize(self._bw + 2 * self.M + self.SHADOW,
-                          self._bh + self.TAG_OVER + self.TAIL_H + 2 * self.M + self.SHADOW)
+                          self._bh + self.TAG_OVER + self._tail_h + 2 * self.M + self.SHADOW)
 
         self._closing = False
         self._show.configure(300.0, 19.0)
@@ -812,7 +835,7 @@ class BubbleWindow(QWidget):
         size = self._pet.sprite_size
 
         head_y = pet.top() + PAD + int(size * 0.10)          # ujung ekor menunjuk kepala
-        tip_local = self.M + self.TAG_OVER + self._bh + self.TAIL_H
+        tip_local = self.M + self.TAG_OVER + self._bh + self._tail_h
         y = head_y - tip_local
         self._below = y < area.top()
         if self._below:                                      # tidak muat di atas -> taruh di bawah
@@ -823,27 +846,33 @@ class BubbleWindow(QWidget):
         self._tail_x = max(self.M + 24, min(pet.center().x() - x, w - self.M - self.SHADOW - 34))
         self.move(x, y)
 
-    def paintEvent(self, _event) -> None:
-        sv = self._show.value
-        if clamp(sv * 1.8) <= 0.01 or not self._lines:
-            return
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
-        p.setOpacity(clamp(sv * 1.8))
-        M, s = self.M, self.SLANT
-        top = M + self.TAG_OVER + (self.TAIL_H if self._below else 0)
-        x0, x1, y0, y1 = M, M + self._bw, top, top + self._bh
-        tx = self._tail_x
-        tip_y = (y0 - self.TAIL_H) if self._below else (y1 + self.TAIL_H)
+    def _paint_box(self, p: QPainter, x0: float, y0: float) -> None:
+        """Spike merah-hitam di belakang, lalu textbox.png (3 potongan) di atasnya."""
+        s_, pm = self._s, self._box
+        h = self.IMG_H * s_
+        inner_w = self._bw - self._cap_l - self._cap_r
+        L, R = self.IMG_L, self.IMG_R
 
-        # pop: membesar dari ujung ekor (kepala karakter), sedikit berputar lalu tegak
-        scale = 0.55 + 0.45 * max(sv, 0.0)
-        p.translate(tx, tip_y)
-        p.rotate((1.0 - clamp(sv, 0.0, 1.5)) * -7.0)
-        p.scale(scale, scale)
-        p.translate(-tx, -tip_y)
+        body = QRectF(x0 + self._cap_l * 0.45, y0 + 40 * s_,
+                      self._bw - self._cap_l * 0.45 - self._cap_r * 0.4, 118 * s_)
+        k = max(0.9, s_)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(RED)
+        p.drawPolygon(spike_border(body.adjusted(-2, -2, 2, 2), length=24 * k, step=30 * k, seed=3))
+        p.setBrush(BLACK)
+        p.drawPolygon(spike_border(body.adjusted(1, 1, -1, -1).translated(3, 2),
+                                   length=15 * k, step=22 * k, seed=11))
 
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        p.drawPixmap(QRectF(x0 + self._cap_l - 0.5, y0, inner_w + 1.0, h), pm,      # tengah (direntang)
+                     QRectF(L, 0, R - L, self.IMG_H))
+        p.drawPixmap(QRectF(x0, y0, self._cap_l, h), pm, QRectF(0, 0, L, self.IMG_H))
+        p.drawPixmap(QRectF(x0 + self._cap_l + inner_w, y0, self._cap_r, h), pm,
+                     QRectF(R, 0, self.IMG_W - R, self.IMG_H))
+
+    def _paint_box_fallback(self, p: QPainter, x0: float, y0: float, tx: float, sv: float) -> None:
+        s = self.SLANT
+        x1, y1 = x0 + self._bw, y0 + self._bh
         body = QPolygonF([QPointF(x0 + s, y0), QPointF(x1, y0), QPointF(x1 - s, y1), QPointF(x0, y1)])
         if self._below:
             tail = QPolygonF([QPointF(tx - 16, y0 + 1), QPointF(tx, y0 - self.TAIL_H), QPointF(tx + 5, y0 + 1)])
@@ -873,20 +902,55 @@ class BubbleWindow(QWidget):
         p.drawPolygon(star_polygon(0, 0, 11, 5, 5))
         p.restore()
 
+    def paintEvent(self, _event) -> None:
+        sv = self._show.value
+        if clamp(sv * 1.8) <= 0.01 or not self._lines:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        p.setOpacity(clamp(sv * 1.8))
+        M = self.M
+        top = M + self.TAG_OVER + (self._tail_h if self._below else 0)
+        x0, y0, y1 = M, top, top + self._bh
+        tx = self._tail_x
+        tip_y = (y0 - self._tail_h) if self._below else (y1 + self._tail_h)
+
+        # pop: membesar dari titik di atas kepala karakter, sedikit berputar lalu tegak
+        scale = 0.55 + 0.45 * max(sv, 0.0)
+        p.translate(tx, tip_y)
+        p.rotate((1.0 - clamp(sv, 0.0, 1.5)) * -7.0)
+        p.scale(scale, scale)
+        p.translate(-tx, -tip_y)
+
+        if self._use_img:
+            self._paint_box(p, x0, y0)
+            text_x = x0 + self._cap_l + self.PADX
+            inner_h = (self.IMG_BOT - self.IMG_TOP) * self._s       # tengah vertikal area hitam
+            text_y = y0 + self.IMG_TOP * self._s + (inner_h - self._text_h) / 2 + self._ascent
+        else:
+            self._paint_box_fallback(p, x0, y0, tx, sv)
+            text_x = x0 + self.PADX
+            text_y = y0 + self.PADY + self._ascent
+
         p.setFont(self._font)                     # teks, muncul per huruf
         p.setPen(WHITE)
         remaining = int(self._reveal)
-        ty = y0 + self.PADY + self._ascent
+        ty = text_y
         for line in self._lines:
             if remaining <= 0:
                 break
-            p.drawText(QPointF(x0 + self.PADX, ty), line[:remaining])
+            p.drawText(QPointF(text_x, ty), line[:remaining])
             remaining -= len(line)
             ty += self._line_h
 
         p.setFont(self._tag_font)                 # name tag merah ala dialog Persona
         tag_w = QFontMetrics(self._tag_font).horizontalAdvance(PET_NAME) + 20
-        tx0, ty0, th = x0 + 4, y0 - self.TAG_OVER, 20
+        th = 20
+        if self._use_img:                         # menempel di tepi atas area hitam
+            tx0, ty0 = x0 + self._cap_l + 2, y0 + 49 * self._s - th / 2 - 3
+        else:
+            tx0, ty0 = x0 + 4, y0 - self.TAG_OVER
         tag = QPolygonF([QPointF(tx0 + 7, ty0), QPointF(tx0 + tag_w, ty0),
                          QPointF(tx0 + tag_w - 7, ty0 + th), QPointF(tx0, ty0 + th)])
         p.setPen(pen(WHITE, 2))
