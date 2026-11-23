@@ -27,6 +27,7 @@ from PyQt6.QtWidgets import (QAbstractItemView, QCheckBox, QDateTimeEdit, QFrame
                              QTextEdit, QTimeEdit, QVBoxLayout, QWidget)
 
 import sprites
+from audio_manager import play_ui
 from calendar_service import CalendarResult, events_by_day, human_delta, morgana_briefing
 from motion import FrameTicker, Spring, clamp
 from storage_manager import (DAILY_BLOCK_TARGET, DEFAULT_STAT_POINTS, QUICK_STAT_POINTS,
@@ -453,6 +454,7 @@ class P5FluidPanel(QWidget):
     def close_animated(self) -> None:
         if not self.isVisible() or self._closing:
             return
+        play_ui("close")
         self.on_closing()
         self._closing = True
         self._open.configure(420.0)
@@ -558,6 +560,7 @@ class P5FluidPanel(QWidget):
         self._closing = False
         self.setWindowOpacity(1.0)
         if not self.isVisible():
+            play_ui("open_window")
             self._open.snap(0.35)
             self.move(self._base_pos.x(), self._base_pos.y() + int(round(0.65 * self.SLIDE)))
             self.show()
@@ -1842,7 +1845,7 @@ class SettingsDialog(P5FluidPanel):
 
     def __init__(self, store: SettingsStore, get_on_top=None, get_autostart=None,
                  on_top: bool = True, ui_scale: float = 1.0) -> None:
-        super().__init__("SETTINGS", QSize(480, 665), on_top=on_top, ui_scale=ui_scale)
+        super().__init__("SETTINGS", QSize(480, 725), on_top=on_top, ui_scale=ui_scale)
         sc = self._ui_scale
         self.store = store
         self._get_on_top = get_on_top
@@ -1850,11 +1853,23 @@ class SettingsDialog(P5FluidPanel):
         self._saving = False
         self._add_close_button()
 
+        # Scrollable cards container (prevents widget squeezing on compact screens or 130-150% UI scale)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll_body = QWidget()
+        cards_lay = QVBoxLayout(scroll_body)
+        cards_lay.setContentsMargins(0, 0, _sc(4, sc, 2), 0)
+        cards_lay.setSpacing(_sc(10, sc, 7))
+        pad_x, pad_y = _sc(14, sc, 10), _sc(11, sc, 8)
+        row_gap = _sc(7, sc, 5)
+
         # Card 1: Bedtime reminder
         c1 = _make_card()
         l1 = QVBoxLayout(c1)
-        l1.setContentsMargins(14, 12, 14, 12)
-        l1.setSpacing(7)
+        l1.setContentsMargins(pad_x, pad_y, pad_x, pad_y)
+        l1.setSpacing(row_gap)
         h1 = QLabel("BEDTIME REMINDER")
         h1.setObjectName("section")
         l1.addWidget(h1)
@@ -1870,13 +1885,13 @@ class SettingsDialog(P5FluidPanel):
         self.curfew_interval.setRange(1, 120)
         self.curfew_interval.setSuffix(" min")
         self._row(l1, "Morgana speaks every", self.curfew_interval)
-        self.body.addWidget(c1)
+        cards_lay.addWidget(c1)
 
         # Card 2: Event & note reminders
         c2 = _make_card()
         l2 = QVBoxLayout(c2)
-        l2.setContentsMargins(14, 12, 14, 12)
-        l2.setSpacing(7)
+        l2.setContentsMargins(pad_x, pad_y, pad_x, pad_y)
+        l2.setSpacing(row_gap)
         h2 = QLabel("EVENT & NOTE REMINDERS")
         h2.setObjectName("section")
         l2.addWidget(h2)
@@ -1888,14 +1903,14 @@ class SettingsDialog(P5FluidPanel):
         self.event_interval.setRange(1, 120)
         self.event_interval.setSuffix(" min")
         self._row(l2, "Repeat every", self.event_interval)
-        self.body.addWidget(c2)
+        cards_lay.addWidget(c2)
 
-        # Card 3: Focus timer & behavior
+        # Card 3: Focus timer, audio & behavior
         c3 = _make_card()
         l3 = QVBoxLayout(c3)
-        l3.setContentsMargins(14, 12, 14, 12)
-        l3.setSpacing(7)
-        h3 = QLabel("FOCUS TIMER & APP")
+        l3.setContentsMargins(pad_x, pad_y, pad_x, pad_y)
+        l3.setSpacing(row_gap)
+        h3 = QLabel("FOCUS, AUDIO & APP")
         h3.setObjectName("section")
         l3.addWidget(h3)
         self.focus_spin = QSpinBox()
@@ -1911,13 +1926,22 @@ class SettingsDialog(P5FluidPanel):
         self.ui_scale_spin.setSingleStep(5)
         self.ui_scale_spin.setSuffix("%")
         self._row(l3, "UI size", self.ui_scale_spin)
+        self.sound_vol_spin = QSpinBox()
+        self.sound_vol_spin.setRange(0, 100)
+        self.sound_vol_spin.setSingleStep(5)
+        self.sound_vol_spin.setSuffix("%")
+        self._row(l3, "Audio volume", self.sound_vol_spin)
+        self.sound_check = P5CheckBox("Enable sound effects & Morgana voice", scale=sc)
         self.on_top_check = P5CheckBox("Keep Morgana always on top", scale=sc)
         self.autostart_check = P5CheckBox("Start Morgana automatically on boot", scale=sc)
+        l3.addWidget(self.sound_check)
         l3.addWidget(self.on_top_check)
         l3.addWidget(self.autostart_check)
-        self.body.addWidget(c3)
+        cards_lay.addWidget(c3)
+        cards_lay.addStretch(1)
 
-        self.body.addStretch(1)
+        scroll.setWidget(scroll_body)
+        self.body.addWidget(scroll, 1)
 
         # Footer
         foot = QHBoxLayout()
@@ -1960,6 +1984,8 @@ class SettingsDialog(P5FluidPanel):
         self.focus_spin.setValue(int(values.get("focus_min", SETTINGS_DEFAULTS["focus_min"])))
         self.rest_spin.setValue(int(values.get("rest_min", SETTINGS_DEFAULTS["rest_min"])))
         self.ui_scale_spin.setValue(int(values.get("ui_scale", SETTINGS_DEFAULTS["ui_scale"])))
+        self.sound_check.setChecked(bool(values.get("sound_enabled", SETTINGS_DEFAULTS["sound_enabled"])))
+        self.sound_vol_spin.setValue(int(values.get("sound_volume", SETTINGS_DEFAULTS["sound_volume"])))
         if self._get_on_top is not None:
             self.on_top_check.setChecked(bool(self._get_on_top()))
         if self._get_autostart is not None:
@@ -1980,7 +2006,7 @@ class SettingsDialog(P5FluidPanel):
         try:
             for w in (self.bed_edit, self.wake_edit, self.curfew_interval,
                       self.event_window, self.event_interval, self.focus_spin,
-                      self.rest_spin, self.ui_scale_spin):
+                      self.rest_spin, self.ui_scale_spin, self.sound_vol_spin):
                 w.interpretText()
             b, w = self.bed_edit.time(), self.wake_edit.time()
             self.store.set(
@@ -1993,6 +2019,8 @@ class SettingsDialog(P5FluidPanel):
                 focus_min=self.focus_spin.value(),
                 rest_min=self.rest_spin.value(),
                 ui_scale=self.ui_scale_spin.value(),
+                sound_enabled=self.sound_check.isChecked(),
+                sound_volume=self.sound_vol_spin.value(),
             )
             self.saved.emit()
             if self._get_on_top is not None and self.on_top_check.isChecked() != bool(self._get_on_top()):
@@ -2429,15 +2457,42 @@ class SocialPentagonWidget(QWidget):
         super().__init__(parent)
         self._scale = scale
         self._totals: dict[str, int] = {k: 0 for k in SOCIAL_STAT_KEYS}
+        self._anim_pts: dict[str, Spring] = {k: Spring(0.0, 120.0, 14.0) for k in SOCIAL_STAT_KEYS}
+        self._pulse = Spring(0.0, 180.0, 11.0)
+        self._rank_flash = Spring(0.0, 140.0, 11.0)
         self._selected = "knowledge"
         self._vertex_pts: dict[str, QPointF] = {}
+        self._ticker = FrameTicker(self._frame, self)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setMinimumHeight(_sc(240, scale, 195))
 
-    def set_data(self, totals: dict[str, int], selected: str) -> None:
+    def set_data(self, totals: dict[str, int], selected: str, animate: bool = False) -> None:
         self._totals = dict(totals)
         self._selected = selected
+        for k in SOCIAL_STAT_KEYS:
+            val = float(max(0, int(totals.get(k, 0))))
+            if animate:
+                self._anim_pts[k].target = val
+            else:
+                self._anim_pts[k].snap(val)
+        if animate:
+            self._pulse.value = 1.0
+            self._pulse.target = 0.0
+            self._ticker.start()
         self.update()
+
+    def trigger_rank_up_flash(self) -> None:
+        self._rank_flash.value = 1.0
+        self._rank_flash.velocity = 0.0
+        self._rank_flash.target = 0.0
+        self._ticker.start()
+
+    def _frame(self, dt: float) -> bool:
+        moving = self._pulse.step(dt) | self._rank_flash.step(dt)
+        for sp in self._anim_pts.values():
+            moving |= sp.step(dt)
+        self.update()
+        return moving
 
     def mousePressEvent(self, e) -> None:
         if e.button() != Qt.MouseButton.LeftButton or not self._vertex_pts:
@@ -2497,20 +2552,34 @@ class SocialPentagonWidget(QWidget):
         for a in angles:
             p.drawLine(QPointF(cx, cy), QPointF(cx + math.cos(a) * radius, cy + math.sin(a) * radius))
 
-        # Filled stat polygon (scales cleanly up to 100 pts = Lv 5, expands if higher)
+        # Filled stat polygon (animates smoothly on point gain!)
         max_pts = max(100, max(self._totals.values(), default=0))
         cap = ((max_pts + 19) // 20) * 20
+        pulse = clamp(self._pulse.value)
+        burst = clamp(self._rank_flash.value)
         data_pts: list[QPointF] = []
         self._vertex_pts.clear()
         for i, key in enumerate(SOCIAL_STAT_KEYS):
             a = angles[i]
-            pts = max(0, int(self._totals.get(key, 0)))
+            pts = max(0.0, self._anim_pts[key].value)
             frac = max(0.14, min(1.0, pts / float(cap)))
+            if key == self._selected and pulse > 0.01:
+                frac = min(1.05, frac + 0.05 * pulse)
             data_pts.append(QPointF(cx + math.cos(a) * radius * frac, cy + math.sin(a) * radius * frac))
             self._vertex_pts[key] = QPointF(cx + math.cos(a) * radius * 1.15, cy + math.sin(a) * radius * 1.15)
 
-        p.setPen(QPen(GOLD, 2.2))
-        p.setBrush(QColor(230, 0, 18, 128))
+        if burst > 0.02:
+            b_rad = radius * (0.45 + 0.72 * (1.0 - burst))
+            b_poly = QPolygonF([
+                QPointF(cx + math.cos(a) * b_rad, cy + math.sin(a) * b_rad)
+                for a in angles
+            ])
+            p.setPen(QPen(QColor(245, 196, 0, int(230 * burst)), 3.2 * sc))
+            p.setBrush(QColor(245, 196, 0, int(55 * burst)))
+            p.drawPolygon(b_poly)
+
+        p.setPen(QPen(WHITE if burst > 0.25 else GOLD, 2.2 + 1.2 * pulse))
+        p.setBrush(QColor(230, 0, 18, int(128 + 65 * pulse)))
         p.drawPolygon(QPolygonF(data_pts))
 
         # Vertex dots & crisp Persona 5 labels around pentagon
@@ -2955,8 +3024,17 @@ class SocialStatsDialog(P5FluidPanel):
         if entry is None:
             return
         self._act_input.clear()
-        self.refresh()
+        self._refresh_log()
         self.stat_logged.emit(entry["stat"], entry["activity"], entry["points"], old_lv, new_lv)
+
+    def animate_point_gain(self) -> None:
+        """Called in sync with `social stats add point animation.wav` to swell the pentagon."""
+        self._refresh_visuals(animate=True)
+
+    def animate_rank_up(self) -> None:
+        """Called in sync with `social stats level up animation.wav` to flash a golden burst."""
+        self._pentagon.trigger_rank_up_flash()
+        self._refresh_visuals(animate=True)
 
     def _delete_selected(self) -> None:
         item = self._log_list.currentItem()
@@ -2981,12 +3059,12 @@ class SocialStatsDialog(P5FluidPanel):
         self.refresh()
 
     def refresh(self) -> None:
-        self._refresh_visuals()
+        self._refresh_visuals(animate=False)
         self._refresh_log()
 
-    def _refresh_visuals(self) -> None:
+    def _refresh_visuals(self, animate: bool = False) -> None:
         totals = self.store.totals()
-        self._pentagon.set_data(totals, self._selected_stat)
+        self._pentagon.set_data(totals, self._selected_stat, animate=animate)
 
         today_n = len(self.store.today_entries())
         self._blocks_hdr.setText(f"TODAY: {today_n} / {DAILY_BLOCK_TARGET} BLOCKS")

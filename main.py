@@ -16,13 +16,14 @@ Berkas proyek (taruh dalam satu folder):
   storage_manager.py   tasks.json dan notes.json
   calendar_service.py  Google Calendar read-only + jadwal dummy (panduan credentials.json ada di sini)
   autostart.py         auto-start saat boot (Windows Registry / Linux XDG)
+  audio_manager.py     efek suara UI, sekuens Social Stats P5R, dan voiceline Morgana (`assets/audio/`)
   lines.py             pembaca kalimat Morgana; isinya dari morgana_list.md (edit file itu, bukan kode)
-  emotions.py          memilih ekspresi Morgana dari isi dialog
+  emotions.py          memilih ekspresi & voiceline Morgana dari isi dialog
   sprites.py           menyusun sprite Morgana (badan + patch mata + patch mulut)
 
-Berkas yang dibuat otomatis: tasks.json, notes.json, settings.json, token.json (login Google), pet.log (galat).
-Sprite    : folder Morgana/ (badan, patch mata e1/e2, patch mulut m1-m3; lihat sprites.py).
-            Tanpa folder itu dipakai placeholder bergaya P5.
+Berkas yang dibuat otomatis: tasks.json, notes.json, social_stats.json, settings.json, token.json, pet.log.
+Aset      : folder assets/ (Morgana/, fonts/, audio/).
+            Tanpa folder assets/Morgana/ dipakai placeholder bergaya P5.
 """
 from __future__ import annotations
 
@@ -51,8 +52,9 @@ from PyQt6.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QWidget
 
 import app_paths
 import autostart
+from audio_manager import init_audio, play_ui
 from calendar_service import CalendarEvent, CalendarResult, CalendarService, format_agenda, human_delta
-from emotions import EXPRESSIONS, STATE_EXPRESSION, emotion_for_text
+from emotions import EXPRESSIONS, STATE_EXPRESSION, emotion_for_text, voice_for_dialogue
 from motion import FrameTicker, Spring, clamp
 from lines import LineBag, greeting_pool, load_lines
 import sprites
@@ -379,6 +381,7 @@ class PetWindow(QWidget):
     clicked = pyqtSignal()                 # klik kiri tanpa drag
     moved = pyqtSignal()                   # posisi berubah (bubble & menu mengikuti)
     context_requested = pyqtSignal(QPoint)  # klik kanan
+    wall_bounced = pyqtSignal()            # memantul kencang di tepi layar
 
     DRAG_THRESHOLD = 5          # px; di bawah ini dianggap klik, bukan drag
     GLIDE_MIN_SPEED = 380.0     # px/detik; lebih lambat dari ini = tidak meluncur
@@ -616,6 +619,8 @@ class PetWindow(QWidget):
         self.move(int(round(nx)), int(round(ny)))
         if hit and speed > 140.0:
             self.bump(min(1.0, speed / 900.0))
+            if speed > 360.0:
+                self.wall_bounced.emit()
         return True
 
     # -- menggambar ----------------------------------------------------------
@@ -1362,6 +1367,7 @@ class RadialMenu(QWidget):
         self._open = False
         self._mask_on = False
         self._pressed = -1
+        self._hovered_idx = -1
 
         self._ticker = FrameTicker(self._frame, self)
         self._auto_close = QTimer(self)                  # menutup sendiri kalau dibiarkan
@@ -1449,9 +1455,11 @@ class RadialMenu(QWidget):
 
     def open_menu(self) -> None:
         self._layout()
+        self._hovered_idx = -1
         if self.isVisible():
             self._t = 10.0                      # sedang menutup lalu dibuka lagi: tanpa jeda stagger
         else:
+            play_ui("open_radial")
             self._t = 0.0
             self._burst.snap(0.0)
             for b in self._buttons:
@@ -1474,13 +1482,16 @@ class RadialMenu(QWidget):
         self._auto_close.start()
         self._ticker.start()
 
-    def close_menu(self) -> None:
+    def close_menu(self, silent: bool = False) -> None:
         if not self.isVisible() or not self._open:
             return
         self._open = False
+        self._hovered_idx = -1
         self._mask_on = False
         self.clearMask()
         self._auto_close.stop()
+        if not silent:
+            play_ui("close")
         self._burst.configure(self.CLOSE_STIFFNESS)
         self._burst.target = 0.0
         for b in self._buttons:
@@ -1606,6 +1617,10 @@ class RadialMenu(QWidget):
     # -- event ---------------------------------------------------------------
     def mouseMoveEvent(self, e) -> None:
         idx = self._hit(e.position())
+        if idx != self._hovered_idx:
+            self._hovered_idx = idx
+            if idx >= 0:
+                play_ui("hover")
         for i, b in enumerate(self._buttons):
             b.hover.target = 1.0 if i == idx else 0.0
         self.setCursor(Qt.CursorShape.PointingHandCursor if idx >= 0 else Qt.CursorShape.ArrowCursor)
@@ -1613,6 +1628,7 @@ class RadialMenu(QWidget):
             self._auto_close.start()
 
     def leaveEvent(self, e) -> None:
+        self._hovered_idx = -1
         for b in self._buttons:
             b.hover.target = 0.0
 
@@ -2021,6 +2037,11 @@ class PetController(QObject):
         self._last_curfew_msg: datetime | None = None
         self.on_top = True
         self.ui_scale = self.settings["ui_scale"] / 100.0
+        self.audio = init_audio(
+            self,
+            enabled=bool(self.settings["sound_enabled"]),
+            volume_pct=int(self.settings["sound_volume"]),
+        )
         self.pet.set_ui_scale(self.ui_scale)
         self.bubble.set_ui_scale(self.ui_scale)
         self.menu.set_ui_scale(self.ui_scale)
@@ -2032,6 +2053,7 @@ class PetController(QObject):
         self.pet.clicked.connect(self._on_pet_clicked)
         self.pet.moved.connect(self._on_pet_moved)
         self.pet.context_requested.connect(self.context_menu.popup)
+        self.pet.wall_bounced.connect(lambda: self.audio.play_voice("uwooh"))
         self.bubble.dismissed.connect(self._restore_state)
         self.bubble.typing_finished.connect(lambda: self.pet.set_speaking(False))
         self.bubble.page_started.connect(lambda: self.pet.set_speaking(True))
@@ -2073,6 +2095,7 @@ class PetController(QObject):
         QTimer.singleShot(3000, self._refresh_calendar)
 
     def quit(self) -> None:
+        self.audio.stop_all()
         if self.tray is not None:
             self.tray.hide()
         QApplication.quit()
@@ -2089,8 +2112,9 @@ class PetController(QObject):
         self.pet.set_speaking(False)
 
     def say(self, text: str, state: str = "talking", ms: int | None = None,
-            emotion: str | None = None) -> None:
-        """Ucapkan `text`. Ekspresi dipilih dari isi kalimat (atau `emotion` bila diberikan);
+            emotion: str | None = None, voice: str | bool | None = None,
+            context: str = "") -> None:
+        """Ucapkan `text`. Ekspresi & voiceline dipilih dari isi kalimat (atau parameter eksplisit);
         mulut bergerak selama balon mengetik."""
         if emotion is None:
             emotion = emotion_for_text(text, default=STATE_EXPRESSION.get(state, "neutral"))
@@ -2100,6 +2124,9 @@ class PetController(QObject):
             self.pet.set_state(state, self.forced_expression or emotion)
         self.pet.set_talking(True)
         self.pet.set_speaking(True)
+        if voice is not False:
+            vkey = voice if isinstance(voice, str) else voice_for_dialogue(text, emotion, context)
+            self.audio.play_voice(vkey)
         self.bubble.show_message(text, ms or max(4000, 2500 + 55 * len(text)))
 
     def _schedule_chatter(self) -> None:
@@ -2118,7 +2145,7 @@ class PetController(QObject):
         pending = self.tasks.pending()
         greeting = random.choice(greeting_pool(self._greetings, datetime.now().hour))
         if not pending:
-            self.say(greeting)
+            self.say(greeting, context="startup")
             return
         shown = pending[:STARTUP_TASK_LIMIT]
         lines = [f"{i}. {clip(t['title'], 44)}" for i, t in enumerate(shown, 1)]
@@ -2126,7 +2153,7 @@ class PetController(QObject):
             lines.append(f"...and {len(pending) - len(shown)} more")
         word = "task" if len(pending) == 1 else "tasks"
         self.say(f"{greeting}\n\nYou have {len(pending)} pending {word} today:\n" + "\n".join(lines),
-                 "talking", ms=13000)
+                 "talking", ms=13000, context="startup")
 
     # -- interaksi pet ---------------------------------------------------------
     def _on_pet_clicked(self) -> None:
@@ -2134,7 +2161,7 @@ class PetController(QObject):
             self.menu.close_menu()
         else:
             self.menu.open_menu()
-            self.say(self._bag_general.next(), ms=4500)
+            self.say(self._bag_general.next(), ms=4500, context="menu_open")
 
     def _on_pet_moved(self) -> None:
         self.bubble.follow()
@@ -2196,7 +2223,7 @@ class PetController(QObject):
         QTimer.singleShot(60, self._open_settings)
 
     def _on_menu_action(self, key: str, anchor: QPoint) -> None:
-        self.menu.close_menu()
+        self.menu.close_menu(silent=True)
         if key in ("events", "agenda", "tasks", "notes", "stats", "timer"):
             self.bubble.dismiss()
         if key in ("events", "agenda"):
@@ -2210,6 +2237,7 @@ class PetController(QObject):
         elif key == "timer":
             self._open_timer()
         elif key == "system":
+            play_ui("open_window")
             self.system_menu.popup(anchor)
 
     # -- EVENTS: 7-day Google Calendar --------------------------------------------
@@ -2258,16 +2286,30 @@ class PetController(QObject):
     # -- SOCIAL STATS -------------------------------------------------------------
     def _on_stat_logged(self, stat: str, activity: str, pts: int, old_lv: int, new_lv: int) -> None:
         label = SOCIAL_STATS.get(stat, {}).get("label", stat.title())
-        if new_lv > old_lv:
+        leveled_up = new_lv > old_lv
+
+        def _on_point_anim() -> None:
+            if self.stats_dialog is not None:
+                self.stats_dialog.animate_point_gain()
+            if not leveled_up:
+                self.pet.bump(0.8)
+                self.say(f"Logged +{pts} {label} ({clip(activity, 36)})! Keep building your momentum!",
+                         "talking", ms=4500, context="stat_log")
+
+        def _on_level_up() -> None:
             rank = stat_rank_title(stat, new_lv)
+            if self.stats_dialog is not None:
+                self.stats_dialog.animate_rank_up()
             self.pet.bump(1.3)
-            play_beep()
             self.say(f"RANK UP! Your {label} leveled up to Lv {new_lv} ({rank})! "
-                     "All that effort is really paying off!", "action", ms=7500)
-        else:
-            self.pet.bump(0.8)
-            self.say(f"Logged +{pts} {label} ({clip(activity, 36)})! Keep building your momentum!",
-                     "talking", ms=4500)
+                     "All that effort is really paying off!", "action", ms=7500, context="rank_up")
+
+        self.audio.play_stats_sequence(
+            points=pts,
+            leveled_up=leveled_up,
+            on_point_anim=_on_point_anim,
+            on_level_up=_on_level_up if leveled_up else None,
+        )
 
     # -- pengingat: acara H-2 jam (jeda 10 menit) & deadline catatan -------------------
     def _check_reminders(self) -> None:
@@ -2315,9 +2357,10 @@ class PetController(QObject):
             messages.append(f"{head} " + " · ".join(countdown) + "\n" + self._bag_agenda.next())
 
         if messages:
-            self.say("\n\n".join(messages), "talking", ms=12000)   # state talking + balon
+            self.say("\n\n".join(messages), "talking", ms=12000, context="reminder")
             self.pet.bump(1.3)                                      # melompat menarik perhatian
-            play_beep()
+            if not self.audio.enabled:
+                play_beep()
 
     # -- SYSTEM: opsi cepat & mode tidur ---------------------------------------
     def _build_system_menu(self) -> None:
@@ -2398,6 +2441,12 @@ class PetController(QObject):
         self.act_curfew.blockSignals(True)
         self.act_curfew.setChecked(self.curfew_enabled)
         self.act_curfew.blockSignals(False)
+        sound_on = bool(self.settings["sound_enabled"])
+        self.audio.set_enabled(sound_on)
+        self.audio.set_volume(int(self.settings["sound_volume"]))
+        self.act_sound.blockSignals(True)
+        self.act_sound.setChecked(sound_on)
+        self.act_sound.blockSignals(False)
         self.pomodoro.focus_s = max(1, int(self.settings["focus_min"] * 60))
         self.pomodoro.rest_s = max(1, int(self.settings["rest_min"] * 60))
         if self.timer_dialog is not None:
@@ -2490,7 +2539,7 @@ class PetController(QObject):
 
     def _on_manual_timer_fired(self, label: str, total_s: int) -> None:
         self.say(f"Time's up! Your timer '{clip(label, 42)}' ({fmt_hms(total_s)}) just finished!",
-                 "action", ms=11000)
+                 "action", ms=11000, context="timer_up")
         self.pet.bump(1.4)
         play_beep()
 
@@ -2548,7 +2597,7 @@ class PetController(QObject):
             if (self._last_curfew_msg is None
                     or (now - self._last_curfew_msg).total_seconds() >= interval_s):
                 self._last_curfew_msg = now
-                self.say(self._bag_bedtime.next(), "sleepy", 12000)
+                self.say(self._bag_bedtime.next(), "sleepy", 12000, context="bedtime")
         elif self.curfew_active:
             self.curfew_active = False
             self._last_curfew_msg = None
@@ -2616,6 +2665,11 @@ class PetController(QObject):
         self.act_top.setCheckable(True)
         self.act_top.setChecked(True)
         self.act_top.toggled.connect(self.set_always_on_top)
+
+        self.act_sound = m.addAction("SOUND EFFECTS")
+        self.act_sound.setCheckable(True)
+        self.act_sound.setChecked(bool(self.settings["sound_enabled"]))
+        self.act_sound.toggled.connect(self.set_sound_enabled)
 
         self.act_curfew = m.addAction("BEDTIME REMINDER")
         self.act_curfew.setCheckable(True)
@@ -2745,6 +2799,14 @@ class PetController(QObject):
         self.curfew_enabled = on
         self.settings.set(curfew_enabled=on)
         self._check_curfew()
+
+    def set_sound_enabled(self, on: bool) -> None:
+        on = bool(on)
+        self.settings.set(sound_enabled=on)
+        self.audio.set_enabled(on)
+        self.act_sound.blockSignals(True)
+        self.act_sound.setChecked(on)
+        self.act_sound.blockSignals(False)
 
     def reset_position(self) -> None:
         screen = QGuiApplication.screenAt(self.pet.geometry().center()) or QGuiApplication.primaryScreen()

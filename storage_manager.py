@@ -410,6 +410,8 @@ SETTINGS_DEFAULTS = {
     "focus_min": 25,               # Pomodoro focus duration (min)
     "rest_min": 5,                 # Pomodoro break duration (min)
     "ui_scale": 100,               # UI size percentage (75-150)
+    "sound_enabled": True,         # UI SFX, Social Stats fanfare, and Morgana voice
+    "sound_volume": 80,            # Master audio volume percentage (0-100)
 }
 _INT_RANGES = {
     "curfew_interval_min": (1, 120),
@@ -418,6 +420,7 @@ _INT_RANGES = {
     "focus_min": (1, 180),
     "rest_min": (1, 60),
     "ui_scale": (75, 150),
+    "sound_volume": (0, 100),
 }
 
 
@@ -459,7 +462,7 @@ class SettingsStore:
             if key in ("bedtime", "wake"):
                 if _valid_hhmm(value):
                     self.data[key] = datetime.strptime(str(value), "%H:%M").strftime("%H:%M")
-            elif key == "curfew_enabled":
+            elif key in ("curfew_enabled", "sound_enabled"):
                 if isinstance(value, bool):
                     self.data[key] = value
             else:
