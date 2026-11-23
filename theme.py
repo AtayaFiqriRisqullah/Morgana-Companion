@@ -2,13 +2,14 @@
 """Tema visual bersama (gaya Persona 5, khusus UI): warna, font, bentuk, dan stylesheet Qt.
 
 Palet : merah Persona (#E60012), hitam pekat, putih. Tanpa gradasi; semua bidang datar.
-Bentuk: jajargenjang miring, bayangan merah bergeser, bintang bergerigi.
+Bentuk: jajargenjang miring, bayangan merah bergeser, bintang bergerigi, spike merah-hitam.
 """
 from __future__ import annotations
 
 import math
+import random
 
-from PyQt6.QtCore import QPointF, Qt
+from PyQt6.QtCore import QPointF, QRectF, Qt
 from PyQt6.QtGui import QColor, QFont, QPen, QPolygonF
 
 RED = QColor("#E60012")
@@ -57,6 +58,31 @@ def star_polygon(cx: float, cy: float, r_out: float, r_in: float, points: int = 
         r = r_out if i % 2 == 0 else r_in
         a = math.pi * i / points - math.pi / 2
         pts.append(QPointF(cx + r * math.cos(a), cy + r * math.sin(a)))
+    return QPolygonF(pts)
+
+
+def spike_border(rect: QRectF, length: float = 22.0, step: float = 26.0, seed: int = 0,
+                 lean: float = 0.45, jitter: float = 0.45) -> QPolygonF:
+    """Serpihan runcing (spike) di sekeliling `rect`, seperti pecahan merah-hitam di menu
+    Persona 5. Tiap spike menjorok keluar sejauh `length` (diacak, deterministik per `seed`)
+    dan sedikit miring (`lean`). Isi polygon dengan RED/BLACK di belakang bentuk utama."""
+    rnd = random.Random(seed)
+    corners = [rect.topLeft(), rect.topRight(), rect.bottomRight(), rect.bottomLeft()]
+    pts = []
+    for k in range(4):
+        a, b = corners[k], corners[(k + 1) % 4]
+        dx, dy = b.x() - a.x(), b.y() - a.y()
+        side = math.hypot(dx, dy)
+        if side < 1e-6:
+            continue
+        nx, ny = dy / side, -dx / side                 # normal keluar (sisi searah jarum jam)
+        n = max(1, round(side / step))
+        for i in range(n):
+            t0, t1 = i / n, (i + 1) / n
+            pts.append(QPointF(a.x() + dx * t0, a.y() + dy * t0))             # pangkal spike
+            tm = (t0 + t1) / 2 + lean * (t1 - t0) * 0.5                       # ujung, agak miring
+            ln = length * (1.0 - jitter + rnd.random() * jitter * 2.0)
+            pts.append(QPointF(a.x() + dx * tm + nx * ln, a.y() + dy * tm + ny * ln))
     return QPolygonF(pts)
 
 
