@@ -110,7 +110,82 @@ def day_label(when: datetime, now: datetime) -> str:
         return "today"
     if diff == 1:
         return "tomorrow"
-    return f"{when:%d %b}"
+    return f"{when:%a, %d %b}"
+
+
+def events_by_day(events: list[CalendarEvent], now: datetime | None = None,
+                  days: int = 7) -> list[tuple[date, list[CalendarEvent]]]:
+    """Group `events` into `days` consecutive day buckets starting from today."""
+    now = now or datetime.now().astimezone()
+    start_day = now.date()
+    day_list = [start_day + timedelta(days=i) for i in range(max(1, days))]
+    buckets: dict[date, list[CalendarEvent]] = {d: [] for d in day_list}
+    for ev in events:
+        if ev.all_day:
+            s_d = ev.start.date()
+            e_d = ev.end.date() if ev.end else s_d + timedelta(days=1)
+            if e_d <= s_d:
+                e_d = s_d + timedelta(days=1)
+            for d in day_list:
+                if s_d <= d < e_d:
+                    buckets[d].append(ev)
+        else:
+            d = ev.start.date()
+            if d in buckets:
+                buckets[d].append(ev)
+    for d in day_list:
+        buckets[d].sort(key=lambda e: (0 if e.all_day else 1, e.start))
+    return [(d, buckets[d]) for d in day_list]
+
+
+def morgana_briefing(result: CalendarResult, now: datetime | None = None) -> tuple[str, str]:
+    """Return `(status_tag, morgana_line)` about the next event for the Events window."""
+    now = now or datetime.now().astimezone()
+    if result.status == "error":
+        return ("SYNC ERROR",
+                f"I couldn't reach your calendar right now ({result.message}). Hit Refresh to try again!")
+    if result.status == "auth_needed":
+        return ("SIGN IN",
+                "Your Google Calendar session expired. Click Sign In and I'll grab your week's schedule!")
+
+    timed = sorted((e for e in result.events if not e.all_day), key=lambda e: e.start)
+    ongoing = [e for e in timed if e.start <= now and (e.end is None or e.end > now)]
+    upcoming = [e for e in timed if e.start > now]
+    today_all_day = [
+        e for e in result.events
+        if e.all_day and e.start.date() <= now.date() < (e.end.date() if e.end else e.start.date() + timedelta(days=1))
+    ]
+    sample_note = ""
+    if result.status == "no_credentials":
+        sample_note = " (Showing a sample week—add credentials.json to sync Google Calendar.)"
+    elif result.status == "no_libs":
+        sample_note = " (Showing a sample week—install the Google Calendar packages to sync.)"
+
+    if ongoing:
+        ev = ongoing[0]
+        until = f" until {ev.end:%H:%M}" if ev.end else ""
+        extra = ""
+        if upcoming:
+            nxt = upcoming[0]
+            extra = f" After that, {nxt.title} starts at {nxt.start:%H:%M} ({day_label(nxt.start, now)})."
+        return ("HAPPENING NOW",
+                f"You've got {ev.title} happening right now{until}! Stay focused—you've got this.{extra}{sample_note}")
+    if upcoming:
+        ev = upcoming[0]
+        tag = "SAMPLE · NEXT UP" if result.is_dummy else "NEXT UP"
+        msg = (f"Next up is {ev.title} in {human_delta(ev.start - now)}! "
+               f"It starts at {ev.start:%H:%M} ({day_label(ev.start, now)}).")
+        if today_all_day:
+            msg += f" Also on today's calendar: {today_all_day[0].title}."
+        return (tag, msg + sample_note)
+    if today_all_day:
+        tag = "SAMPLE · ALL DAY" if result.is_dummy else "ALL DAY"
+        return (tag,
+                f"Today's all-day event is {today_all_day[0].title}. "
+                f"No timed events left this week—enjoy the breathing room!{sample_note}")
+    tag = "SAMPLE · CLEAR" if result.is_dummy else "ALL CLEAR"
+    return (tag,
+            f"Your schedule is completely clear for the next 7 days! Relax, work on your tasks, or level up your stats.{sample_note}")
 
 
 def format_agenda(result: CalendarResult, now: datetime | None = None) -> str:
@@ -141,7 +216,7 @@ def format_agenda(result: CalendarResult, now: datetime | None = None) -> str:
         lines.append(f"Next up: {ev.title} in {human_delta(ev.start - now)}!")
         lines.append(f"Starts at {ev.start:%H:%M} ({day_label(ev.start, now)})")
     elif not ongoing:
-        lines.append("Your schedule is clear until tomorrow! Relax, or chip away at your tasks.")
+        lines.append("Your schedule is clear for the next 7 days! Relax, or chip away at your tasks.")
     if all_day:
         lines.append(f"All day: {all_day[0].title}")
     return prefix + "\n".join(lines)
@@ -164,8 +239,8 @@ class CalendarService:
         return self.token_path.is_file()
 
     # -- publik ----------------------------------------------------------------
-    def get_upcoming(self, interactive: bool = False) -> CalendarResult:
-        """Acara dari sekarang sampai akhir hari besok.
+    def get_upcoming(self, interactive: bool = False, days: int = 7) -> CalendarResult:
+        """Acara selama `days` hari ke depan (bawaan 7 hari / 1 minggu).
 
         interactive=True mengizinkan membuka browser untuk login Google (hanya saat
         pengguna sendiri yang meminta). Fungsi ini TIDAK pernah melempar exception.
@@ -178,10 +253,10 @@ class CalendarService:
             return CalendarResult(self._dummy_events(), "no_libs", is_dummy=True)
         try:
             with self._lock:
-                return CalendarResult(self._fetch(libs, interactive), "ok")
+                return CalendarResult(self._fetch(libs, interactive, days=days), "ok")
         except AuthRequired:
             return CalendarResult([], "auth_needed",
-                                  "Google authorization expired. Click AGENDA to sign in again.")
+                                  "Google authorization expired. Click EVENTS to sign in again.")
         except Exception as exc:                       # jaringan, kuota, login dibatalkan, dll.
             log.warning("Gagal mengambil kalender: %s", exc)
             return CalendarResult([], "error", _short(exc))
@@ -214,34 +289,51 @@ class CalendarService:
     def _save_token(self, creds) -> None:
         self.token_path.write_text(creds.to_json(), encoding="utf-8")
 
-    def _fetch(self, libs, interactive: bool) -> list[CalendarEvent]:
+    def _fetch(self, libs, interactive: bool, days: int = 7) -> list[CalendarEvent]:
         build = libs[3]
         creds = self._credentials(libs, interactive)
         service = build("calendar", "v3", credentials=creds, cache_discovery=False)
         now = datetime.now().astimezone()
-        end = (now + timedelta(days=2)).replace(hour=0, minute=0, second=0, microsecond=0)
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=max(1, days))
         resp = service.events().list(
-            calendarId="primary", timeMin=now.isoformat(), timeMax=end.isoformat(),
-            singleEvents=True, orderBy="startTime", maxResults=25).execute()
+            calendarId="primary", timeMin=start.isoformat(), timeMax=end.isoformat(),
+            singleEvents=True, orderBy="startTime", maxResults=100).execute()
         events = [parse_event(i) for i in resp.get("items", [])]
         return [e for e in events if e is not None]
 
     # -- dummy ----------------------------------------------------------------
     def _dummy_events(self) -> list[CalendarEvent]:
-        """Jadwal contoh, dijangkarkan ke waktu pertama kali diminta (stabil selama app jalan)."""
+        """Jadwal contoh 1 minggu, dijangkarkan ke waktu pertama kali diminta."""
         if self._dummy is None:
             t0 = datetime.now().astimezone().replace(second=0, microsecond=0)
-            tomorrow9 = (t0 + timedelta(days=1)).replace(hour=9, minute=0)
+            day0 = t0.replace(hour=0, minute=0)
+            d1_9 = (day0 + timedelta(days=1)).replace(hour=9, minute=0)
+            d1_16 = (day0 + timedelta(days=1)).replace(hour=16, minute=0)
+            d2_10 = (day0 + timedelta(days=2)).replace(hour=10, minute=30)
+            d3_all = day0 + timedelta(days=3)
+            d4_18 = (day0 + timedelta(days=4)).replace(hour=18, minute=0)
+            d6_14 = (day0 + timedelta(days=6)).replace(hour=14, minute=0)
             self._dummy = [
                 CalendarEvent("dummy-1", "Study Session (sample)", t0 + timedelta(minutes=25),
                               t0 + timedelta(minutes=125), is_dummy=True),
-                CalendarEvent("dummy-2", "Team Sync (sample)", t0 + timedelta(hours=4),
-                              t0 + timedelta(hours=5), is_dummy=True),
-                CalendarEvent("dummy-3", "Project Deadline (sample)", tomorrow9,
-                              tomorrow9 + timedelta(hours=1), is_dummy=True),
+                CalendarEvent("dummy-2", "Gym Workout (sample)", t0 + timedelta(hours=4),
+                              t0 + timedelta(hours=5, minutes=30), is_dummy=True),
+                CalendarEvent("dummy-3", "Project Sync (sample)", d1_9,
+                              d1_9 + timedelta(hours=1), is_dummy=True),
+                CalendarEvent("dummy-4", "Badminton Practice (sample)", d1_16,
+                              d1_16 + timedelta(hours=2), is_dummy=True),
+                CalendarEvent("dummy-5", "Lecture & Notes Review (sample)", d2_10,
+                              d2_10 + timedelta(hours=2), is_dummy=True),
+                CalendarEvent("dummy-6", "Weekly Reset & Laundry (sample)", d3_all,
+                              d3_all + timedelta(days=1), all_day=True, is_dummy=True),
+                CalendarEvent("dummy-7", "GameDev Hobby Block (sample)", d4_18,
+                              d4_18 + timedelta(hours=2), is_dummy=True),
+                CalendarEvent("dummy-8", "Movie Night (sample)", d6_14,
+                              d6_14 + timedelta(hours=2), is_dummy=True),
             ]
-        now = datetime.now().astimezone()
-        return [e for e in self._dummy if (e.end or e.start) > now]
+        today_start = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+        return [e for e in self._dummy if (e.end or e.start) >= today_start]
 
 
 def _import_google():
