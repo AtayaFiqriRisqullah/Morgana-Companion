@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Persona 5 themed popup windows for Tasks, Notes, and Settings.
+"""Persona 5 themed popup windows for Tasks, Notes, Events, Social Stats, Timer, and Settings.
 
 Design principles:
   * Cohesive Persona 5 dark palette: Obsidian Black, Persona Crimson (#E60012),
@@ -7,13 +7,14 @@ Design principles:
   * Strict typography: heavy p5_font() for headers, badges & action buttons;
     clean upright ui_font() for note bodies, task titles, and form controls.
   * Restrained, critically-damped motion (smooth slide, hover tint, checkmark draw).
-  * Hover states never alter text color.
+  * Hover states shift surface/background/border by default (text color changes only with owner approval).
   * Practical desktop UX: instant search, task priority, pinned notes, 1-click
     category chips, debounced autosave, keyboard shortcuts, and 5-second Undo bars.
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+import math
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from PyQt6.QtCore import (QDate, QDateTime, QEvent, QPoint, QPointF, QRect, QRectF, QSize, Qt,
@@ -22,13 +23,17 @@ from PyQt6.QtGui import (QColor, QFontMetrics, QGuiApplication, QKeySequence, QP
                          QPainterPath, QPen, QPixmap, QPolygonF, QShortcut, QTextCursor)
 from PyQt6.QtWidgets import (QAbstractItemView, QCheckBox, QDateTimeEdit, QFrame, QHBoxLayout,
                              QLabel, QLineEdit, QListWidget, QListWidgetItem, QProgressBar,
-                             QPushButton, QSpinBox, QStyle, QStyledItemDelegate, QTextEdit,
-                             QTimeEdit, QVBoxLayout, QWidget)
+                             QPushButton, QScrollArea, QSpinBox, QStyle, QStyledItemDelegate,
+                             QTextEdit, QTimeEdit, QVBoxLayout, QWidget)
 
 import sprites
-from calendar_service import human_delta
+from calendar_service import CalendarResult, events_by_day, human_delta, morgana_briefing
 from motion import FrameTicker, Spring, clamp
-from storage_manager import (SETTINGS_DEFAULTS, NoteStore, SettingsStore, TaskStore, parse_dt)
+from storage_manager import (DAILY_BLOCK_TARGET, DEFAULT_STAT_POINTS, QUICK_STAT_POINTS,
+                             SETTINGS_DEFAULTS, SOCIAL_STAT_KEYS, SOCIAL_STATS, TIME_BLOCKS,
+                             NoteStore, SettingsStore, SocialStatsStore, TaskStore,
+                             default_time_block, parse_dt, stat_level, stat_level_progress,
+                             stat_rank_title)
 from theme import (BLACK, DEEP_RED, GOLD, LIGHT_RED, P5_BG, P5_BORDER, P5_BORDER_HI,
                    P5_CARD, P5_GOLD_BG, P5_GOLD_FG, P5_HOVER, P5_MINT_BG, P5_MINT_FG, P5_MUTED,
                    P5_RED_BG, P5_RED_FG, P5_SELECTED, P5_SURFACE, P5_TEXT, RED, RED_HOVER, WHITE,
@@ -147,7 +152,34 @@ def _draw_icon(p: QPainter, kind: str, rect: QRectF, color: QColor) -> None:
             QPointF(cx + r * 0.05, cy + r * 0.08),
             QPointF(cx - r * 0.18, cy + r * 0.92),
         ]))
+    elif kind == "refresh":
+        arc = QRectF(cx - r * 0.85, cy - r * 0.85, r * 1.7, r * 1.7)
+        p.drawArc(arc, 35 * 16, 275 * 16)
+        p.drawPolyline(QPolygonF([
+            QPointF(cx + r * 0.42, cy - r * 0.82),
+            QPointF(cx + r * 0.82, cy - r * 0.48),
+            QPointF(cx + r * 0.34, cy - r * 0.32),
+        ]))
+    elif kind == "play":
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(color)
+        p.drawPolygon(QPolygonF([
+            QPointF(cx - r * 0.55, cy - r * 0.78),
+            QPointF(cx + r * 0.82, cy),
+            QPointF(cx - r * 0.55, cy + r * 0.78),
+        ]))
+    elif kind == "stop":
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(color)
+        p.drawRoundedRect(QRectF(cx - r * 0.65, cy - r * 0.65, r * 1.3, r * 1.3), 1.8, 1.8)
     p.restore()
+
+
+def _fmt_hms(seconds: int) -> str:
+    s = max(0, int(seconds))
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{sec:02d}" if h > 0 else f"{m:02d}:{sec:02d}"
 
 
 # ---------------------------------------------------------------------------
@@ -1975,3 +2007,1481 @@ class SettingsDialog(P5FluidPanel):
                 self.status.setText("Saved and applied.")
         finally:
             self._saving = False
+
+
+# ---------------------------------------------------------------------------
+# EVENTS DIALOG (7-day Google Calendar schedule + Morgana next-event briefing)
+# ---------------------------------------------------------------------------
+class _MorganaBriefingFrame(QFrame):
+    """Persona 5 slanted obsidian/crimson briefing banner where Morgana announces the next event."""
+
+    def __init__(self, scale: float = 1.0, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._scale = scale
+        self._accent = RED
+
+    def set_accent(self, color: QColor) -> None:
+        if color != self._accent:
+            self._accent = color
+            self.update()
+
+    def paintEvent(self, _event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(self.rect()).adjusted(1.0, 1.0, -1.0, -1.0)
+        sc = self._scale
+        # Obsidian base with subtle crimson glow border
+        p.setPen(QPen(self._accent, 1.6))
+        p.setBrush(P5_CARD)
+        p.drawRoundedRect(r, 10.0, 10.0)
+        # Slanted P5 left slash accent
+        clip = QPainterPath()
+        clip.addRoundedRect(r, 10.0, 10.0)
+        p.setClipPath(clip)
+        slash = QPolygonF([
+            QPointF(r.left(), r.top()),
+            QPointF(r.left() + 26.0 * sc, r.top()),
+            QPointF(r.left() + 14.0 * sc, r.bottom()),
+            QPointF(r.left(), r.bottom()),
+        ])
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(self._accent)
+        p.drawPolygon(slash)
+        p.end()
+
+
+def _clear_layout(layout) -> None:
+    while layout.count():
+        item = layout.takeAt(0)
+        w = item.widget()
+        if w is not None:
+            w.setParent(None)
+            w.deleteLater()
+        elif item.layout() is not None:
+            _clear_layout(item.layout())
+
+
+class EventsDialog(P5FluidPanel):
+    """7-day weekly calendar window with a dedicated Morgana next-event briefing card."""
+
+    refresh_requested = pyqtSignal(bool)     # True = allow interactive OAuth sign-in
+    open_tasks = pyqtSignal()
+    open_settings = pyqtSignal()
+
+    def __init__(self, on_top: bool = True, ui_scale: float = 1.0) -> None:
+        super().__init__("EVENTS", QSize(580, 650), on_top=on_top, ui_scale=ui_scale)
+        sc = self._ui_scale
+        self._result: CalendarResult = CalendarResult([], "ok")
+        self._selected_day: date | None = None    # None = ALL 7 DAYS
+        self._loading = False
+        self._day_btns: dict[date | None, P5FluidButton] = {}
+
+        # Header quick actions
+        self._count_lbl = QLabel("")
+        self._count_lbl.setObjectName("subhead")
+        self.header_bar.addWidget(self._count_lbl)
+
+        self._hdr_refresh = self._btn("", variant="soft", icon="refresh")
+        self._hdr_refresh.setFixedSize(_sc(30, sc, 24), _sc(30, sc, 24))
+        self._hdr_refresh.setToolTip("Refresh calendar (F5)")
+        self._hdr_refresh.clicked.connect(lambda _c=False: self.refresh_requested.emit(True))
+        self.header_bar.addWidget(self._hdr_refresh)
+
+        tasks_btn = self._btn("TASKS", variant="soft", display=True, px=10)
+        tasks_btn.clicked.connect(lambda _c=False: self.open_tasks.emit())
+        self.header_bar.addWidget(tasks_btn)
+
+        set_btn = self._btn("", variant="soft", icon="gear")
+        set_btn.setFixedSize(_sc(30, sc, 24), _sc(30, sc, 24))
+        set_btn.setToolTip("Settings (Ctrl+,)")
+        set_btn.clicked.connect(lambda _c=False: self.open_settings.emit())
+        self.header_bar.addWidget(set_btn)
+        self._add_close_button()
+
+        # Dedicated Morgana next-event briefing card
+        self._brief_card = _MorganaBriefingFrame(scale=sc)
+        bl = QHBoxLayout(self._brief_card)
+        bl.setContentsMargins(_sc(24, sc, 18), _sc(10, sc, 8), _sc(12, sc, 9), _sc(10, sc, 8))
+        bl.setSpacing(_sc(12, sc, 8))
+
+        av_lbl = QLabel()
+        av_lbl.setPixmap(_morgana_avatar(_sc(50, sc, 38)))
+        av_lbl.setFixedSize(_sc(50, sc, 38), _sc(50, sc, 38))
+        bl.addWidget(av_lbl, 0, Qt.AlignmentFlag.AlignTop)
+
+        speech_col = QVBoxLayout()
+        speech_col.setSpacing(_sc(4, sc, 3))
+        top_meta = QHBoxLayout()
+        top_meta.setSpacing(_sc(8, sc, 5))
+
+        name_lbl = QLabel("MORGANA")
+        name_lbl.setStyleSheet(
+            f'background: #0B0B0B; color: #FFFFFF; border: 1.5px solid #FFFFFF; '
+            f'border-radius: 4px; padding: 1px {_sc(7, sc, 5)}px; '
+            f'font-family: "Anton", "Barlow Condensed", sans-serif; font-size: {_sc(12, sc, 10)}px;'
+        )
+        top_meta.addWidget(name_lbl)
+
+        self._brief_tag = QLabel("NEXT UP")
+        self._brief_tag.setStyleSheet(
+            f'background: #360A10; color: #FF5E6B; border: 1px solid #731823; '
+            f'border-radius: 4px; padding: 1px {_sc(7, sc, 5)}px; '
+            f'font-family: "Barlow Condensed", "Arsenal", sans-serif; font-weight: 800; '
+            f'font-size: {_sc(11, sc, 9)}px;'
+        )
+        top_meta.addWidget(self._brief_tag)
+        top_meta.addStretch(1)
+
+        self._signin_btn = self._btn("SIGN IN", variant="primary", display=True, px=10)
+        self._signin_btn.setFixedHeight(_sc(24, sc, 20))
+        self._signin_btn.clicked.connect(lambda _c=False: self.refresh_requested.emit(True))
+        self._signin_btn.hide()
+        top_meta.addWidget(self._signin_btn)
+        speech_col.addLayout(top_meta)
+
+        self._brief_text = QLabel("Checking your schedule for the week...")
+        self._brief_text.setWordWrap(True)
+        self._brief_text.setStyleSheet(
+            f'color: #FFFFFF; background: transparent; '
+            f'font-family: "Arsenal", "Optima", "Segoe UI", sans-serif; '
+            f'font-size: {_sc(14, sc, 11)}px; font-weight: bold;'
+        )
+        speech_col.addWidget(self._brief_text)
+        bl.addLayout(speech_col, 1)
+        self.body.addWidget(self._brief_card)
+
+        # 7-day filter strip
+        self._day_strip = QHBoxLayout()
+        self._day_strip.setSpacing(_sc(4, sc, 3))
+        self.body.addLayout(self._day_strip)
+
+        # Weekly timeline inside dark card
+        list_card = _make_card()
+        lc_lay = QVBoxLayout(list_card)
+        lc_lay.setContentsMargins(_sc(8, sc, 6), _sc(8, sc, 6), _sc(6, sc, 4), _sc(8, sc, 6))
+        lc_lay.setSpacing(0)
+
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._scroll_body = QWidget()
+        self._days_lay = QVBoxLayout(self._scroll_body)
+        self._days_lay.setContentsMargins(2, 2, _sc(6, sc, 4), 4)
+        self._days_lay.setSpacing(_sc(8, sc, 5))
+        self._scroll.setWidget(self._scroll_body)
+        lc_lay.addWidget(self._scroll)
+        self.body.addWidget(list_card, 1)
+
+        # Footer
+        foot = QHBoxLayout()
+        foot.setSpacing(8)
+        self._foot_tip = QLabel("7-day calendar view")
+        self._foot_tip.setObjectName("tip")
+        self._foot_tip.setWordWrap(True)
+        foot.addWidget(self._foot_tip, 1)
+
+        self._foot_refresh = self._btn("REFRESH", variant="soft", icon="refresh", display=True, px=10)
+        self._foot_refresh.setFixedHeight(_sc(28, sc, 24))
+        self._foot_refresh.clicked.connect(lambda _c=False: self.refresh_requested.emit(True))
+        foot.addWidget(self._foot_refresh)
+        self.body.addLayout(foot)
+
+        QShortcut(QKeySequence("F5"), self).activated.connect(lambda: self.refresh_requested.emit(True))
+        QShortcut(QKeySequence("Ctrl+R"), self).activated.connect(lambda: self.refresh_requested.emit(True))
+        QShortcut(QKeySequence("Ctrl+,"), self).activated.connect(lambda: self.open_settings.emit())
+
+    def set_loading(self, loading: bool) -> None:
+        self._loading = bool(loading)
+        if loading:
+            self._count_lbl.setText("SYNCING...")
+            self._brief_tag.setText("SYNCING")
+            self._brief_text.setText("Hang on, I'm checking your schedule for the next 7 days...")
+            self._signin_btn.hide()
+
+    def set_result(self, result: CalendarResult) -> None:
+        self._loading = False
+        self._result = result
+        self.refresh()
+
+    def _select_day(self, day: date | None) -> None:
+        self._selected_day = day
+        self._rebuild_view()
+
+    def refresh(self) -> None:
+        if self._loading:
+            return
+        self._rebuild_view()
+
+    def _rebuild_view(self) -> None:
+        sc = self._ui_scale
+        now = datetime.now().astimezone()
+        res = self._result
+        grouped = events_by_day(res.events, now=now, days=7)
+        valid_days = {d for d, _ in grouped}
+        if self._selected_day is not None and self._selected_day not in valid_days:
+            self._selected_day = None
+
+        # Header count & footer note
+        total = sum(len(evs) for _, evs in grouped)
+        if res.status == "error":
+            self._count_lbl.setText("OFFLINE")
+            self._foot_tip.setText(f"Calendar sync failed: {res.message}")
+        elif res.status == "auth_needed":
+            self._count_lbl.setText("SIGN IN")
+            self._foot_tip.setText("Google Calendar token expired. Click SIGN IN to reconnect.")
+        elif res.is_dummy:
+            self._count_lbl.setText(f"SAMPLE · {total} EVENTS")
+            self._foot_tip.setText("Sample 7-day schedule · place credentials.json next to the app to sync Google Calendar.")
+        else:
+            word = "EVENT" if total == 1 else "EVENTS"
+            self._count_lbl.setText(f"{total} {word} THIS WEEK")
+            self._foot_tip.setText("Google Calendar · 7-day schedule · F5 to refresh")
+
+        # Morgana briefing banner
+        tag, speech = morgana_briefing(res, now=now)
+        self._brief_tag.setText(tag)
+        self._brief_text.setText(speech)
+        self._signin_btn.setVisible(res.status == "auth_needed")
+        self._foot_refresh.set_variant("primary" if res.status in ("error", "auth_needed") else "soft")
+        if "HAPPENING NOW" in tag:
+            self._brief_card.set_accent(RED)
+            self._brief_tag.setStyleSheet(
+                f'background: #E60012; color: #FFFFFF; border: 1px solid #FFFFFF; '
+                f'border-radius: 4px; padding: 1px {_sc(7, sc, 5)}px; '
+                f'font-family: "Barlow Condensed", "Arsenal", sans-serif; font-weight: 800; '
+                f'font-size: {_sc(11, sc, 9)}px;'
+            )
+        elif "CLEAR" in tag:
+            self._brief_card.set_accent(P5_MINT_FG)
+            self._brief_tag.setStyleSheet(
+                f'background: #10281E; color: #5CE09A; border: 1px solid #245943; '
+                f'border-radius: 4px; padding: 1px {_sc(7, sc, 5)}px; '
+                f'font-family: "Barlow Condensed", "Arsenal", sans-serif; font-weight: 800; '
+                f'font-size: {_sc(11, sc, 9)}px;'
+            )
+        else:
+            self._brief_card.set_accent(GOLD if "SAMPLE" in tag else RED)
+            self._brief_tag.setStyleSheet(
+                f'background: #360A10; color: #FF5E6B; border: 1px solid #731823; '
+                f'border-radius: 4px; padding: 1px {_sc(7, sc, 5)}px; '
+                f'font-family: "Barlow Condensed", "Arsenal", sans-serif; font-weight: 800; '
+                f'font-size: {_sc(11, sc, 9)}px;'
+            )
+
+        # Rebuild 7-day filter strip
+        _clear_layout(self._day_strip)
+        self._day_btns.clear()
+        all_btn = self._btn("ALL 7D", variant="soft", display=True, px=9)
+        all_btn.setFixedHeight(_sc(26, sc, 22))
+        all_btn.set_active(self._selected_day is None)
+        all_btn.clicked.connect(lambda _c=False: self._select_day(None))
+        self._day_strip.addWidget(all_btn)
+        self._day_btns[None] = all_btn
+
+        for d, evs in grouped:
+            short = f"{d:%a} {d.day}"
+            base_var = "gold" if evs else "soft"
+            btn = self._btn(short.upper(), variant=base_var, display=True, px=9)
+            btn.setFixedHeight(_sc(26, sc, 22))
+            btn.set_active(self._selected_day == d)
+            n_ev = len(evs)
+            btn.setToolTip(f"{d:%A, %d %b} — {n_ev} event" + ("" if n_ev == 1 else "s"))
+            btn.clicked.connect(lambda _c=False, day=d: self._select_day(day))
+            self._day_strip.addWidget(btn, 1)
+            self._day_btns[d] = btn
+
+        # Find ongoing & next upcoming event for card highlighting
+        timed = sorted((e for e in res.events if not e.all_day), key=lambda e: e.start)
+        next_ev = next((e for e in timed if e.start > now), None)
+
+        # Rebuild weekly day sections
+        _clear_layout(self._days_lay)
+        shown_days = grouped if self._selected_day is None else [
+            (d, evs) for d, evs in grouped if d == self._selected_day
+        ]
+        today = now.date()
+        for d, evs in shown_days:
+            diff = (d - today).days
+            if diff == 0:
+                title = f"TODAY · {d:%a %d %b}".upper()
+                title_col = "#FF4B55"
+            elif diff == 1:
+                title = f"TOMORROW · {d:%a %d %b}".upper()
+                title_col = "#FAD02C"
+            else:
+                title = f"{d:%A · %d %b}".upper()
+                title_col = "#F4F4F8"
+
+            hdr = QHBoxLayout()
+            hdr.setContentsMargins(2, _sc(4, sc, 2), 2, 0)
+            dlbl = QLabel(title)
+            dlbl.setStyleSheet(
+                f'color: {title_col}; font-family: "Barlow Condensed", "Anton", sans-serif; '
+                f'font-size: {_sc(14, sc, 11)}px; font-weight: 800;'
+            )
+            hdr.addWidget(dlbl)
+            hdr.addStretch(1)
+            cnt_txt = f"{len(evs)} EVENT" + ("" if len(evs) == 1 else "S") if evs else "CLEAR"
+            clbl = QLabel(cnt_txt)
+            clbl.setStyleSheet(
+                f'color: {"#FAD02C" if evs else "#66667A"}; '
+                f'font-family: "Barlow Condensed", sans-serif; '
+                f'font-size: {_sc(11, sc, 9)}px; font-weight: 800;'
+            )
+            hdr.addWidget(clbl)
+            self._days_lay.addLayout(hdr)
+
+            if not evs:
+                empty = QLabel("No events scheduled." if self._selected_day is None
+                               else "Your schedule is clear on this day!")
+                empty.setStyleSheet(
+                    f'color: #6B6B7F; padding: {_sc(4, sc, 2)}px {_sc(8, sc, 6)}px; '
+                    f'font-size: {_sc(12, sc, 10)}px; font-style: italic;'
+                )
+                self._days_lay.addWidget(empty)
+                continue
+
+            for ev in evs:
+                is_now = (not ev.all_day and ev.start <= now and (ev.end is None or ev.end > now))
+                is_next = (next_ev is not None and ev is next_ev)
+                is_past = (not ev.all_day and (ev.end or ev.start) <= now and not is_now)
+
+                row_card = _make_card("subcard")
+                if is_now:
+                    row_card.setStyleSheet(
+                        "QFrame#subcard { background-color: #2A0C11; border: 1.5px solid #E60012; border-radius: 8px; }"
+                    )
+                elif is_next:
+                    row_card.setStyleSheet(
+                        "QFrame#subcard { background-color: #221B0A; border: 1.5px solid #6C5514; border-radius: 8px; }"
+                    )
+                rl = QHBoxLayout(row_card)
+                rl.setContentsMargins(_sc(10, sc, 7), _sc(7, sc, 5), _sc(10, sc, 7), _sc(7, sc, 5))
+                rl.setSpacing(_sc(10, sc, 7))
+
+                # Time column
+                if ev.all_day:
+                    time_txt = "ALL DAY"
+                    time_style = (
+                        f'background: #2B2208; color: #FAD02C; border: 1px solid #6C5514; '
+                        f'border-radius: 4px; padding: 2px 6px; '
+                        f'font-family: "Barlow Condensed", sans-serif; font-weight: 800; '
+                        f'font-size: {_sc(12, sc, 10)}px;'
+                    )
+                else:
+                    end_s = f"–{ev.end:%H:%M}" if ev.end else ""
+                    time_txt = f"{ev.start:%H:%M}{end_s}"
+                    time_style = (
+                        f'color: {"#FF5E6B" if is_now else ("#FAD02C" if is_next else ("#6E6E80" if is_past else "#D2D2E0"))}; '
+                        f'font-family: "Barlow Condensed", "Arsenal", sans-serif; font-weight: 800; '
+                        f'font-size: {_sc(14, sc, 11)}px;'
+                    )
+                tlbl = QLabel(time_txt)
+                tlbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                tlbl.setFixedWidth(_sc(94, sc, 76))
+                tlbl.setStyleSheet(time_style)
+                rl.addWidget(tlbl)
+
+                # Title
+                elbl = QLabel(ev.title)
+                elbl.setWordWrap(True)
+                elbl.setStyleSheet(
+                    f'color: {"#828294" if is_past else "#FFFFFF"}; '
+                    f'font-family: "Arsenal", "Optima", "Segoe UI", sans-serif; '
+                    f'font-size: {_sc(14, sc, 11)}px; font-weight: bold;'
+                )
+                rl.addWidget(elbl, 1)
+
+                # Status chip
+                badge_txt, badge_css = "", ""
+                if is_now:
+                    badge_txt = "NOW"
+                    badge_css = "background: #E60012; color: #FFFFFF; border: none;"
+                elif is_next:
+                    badge_txt = f"IN {human_delta(ev.start - now).upper()}"
+                    badge_css = "background: #2B2208; color: #FAD02C; border: 1px solid #6C5514;"
+                elif is_past:
+                    badge_txt = "DONE"
+                    badge_css = "background: #1B1B24; color: #7C7C90; border: 1px solid #2E2E3B;"
+                if badge_txt:
+                    blbl = QLabel(badge_txt)
+                    blbl.setStyleSheet(
+                        f'{badge_css} border-radius: 4px; padding: 2px {_sc(7, sc, 5)}px; '
+                        f'font-family: "Barlow Condensed", sans-serif; font-weight: 800; '
+                        f'font-size: {_sc(11, sc, 9)}px;'
+                    )
+                    rl.addWidget(blbl)
+                self._days_lay.addWidget(row_card)
+
+        self._days_lay.addStretch(1)
+
+
+# ---------------------------------------------------------------------------
+# SOCIAL STATS DIALOG (Persona 5 Royal 5-stat pentagon + daily time blocks)
+# ---------------------------------------------------------------------------
+class SocialPentagonWidget(QWidget):
+    """Persona 5 Royal style 5-point radar star chart for Knowledge/Charm/Kindness/Proficiency/Guts."""
+
+    stat_clicked = pyqtSignal(str)
+
+    def __init__(self, scale: float = 1.0, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._scale = scale
+        self._totals: dict[str, int] = {k: 0 for k in SOCIAL_STAT_KEYS}
+        self._selected = "knowledge"
+        self._vertex_pts: dict[str, QPointF] = {}
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMinimumHeight(_sc(240, scale, 195))
+
+    def set_data(self, totals: dict[str, int], selected: str) -> None:
+        self._totals = dict(totals)
+        self._selected = selected
+        self.update()
+
+    def mousePressEvent(self, e) -> None:
+        if e.button() != Qt.MouseButton.LeftButton or not self._vertex_pts:
+            return
+        pos = e.position()
+        best_k, best_d = "", 1e9
+        for k, pt in self._vertex_pts.items():
+            d = math.hypot(pos.x() - pt.x(), pos.y() - pt.y())
+            if d < best_d:
+                best_k, best_d = k, d
+        if best_k and best_d <= 78.0 * self._scale:
+            self.stat_clicked.emit(best_k)
+
+    def paintEvent(self, _event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        sc = self._scale
+        rect = QRectF(self.rect()).adjusted(1.0, 1.0, -1.0, -1.0)
+
+        # Obsidian P5 card background + subtle slanted crimson motif
+        p.setPen(QPen(P5_BORDER, 1.2))
+        p.setBrush(P5_CARD)
+        p.drawRoundedRect(rect, 10.0, 10.0)
+
+        clip = QPainterPath()
+        clip.addRoundedRect(rect, 10.0, 10.0)
+        p.setClipPath(clip)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(230, 0, 18, 22))
+        p.drawPolygon(QPolygonF([
+            QPointF(rect.left() + rect.width() * 0.62, rect.top()),
+            QPointF(rect.right(), rect.top()),
+            QPointF(rect.right(), rect.bottom()),
+            QPointF(rect.left() + rect.width() * 0.34, rect.bottom()),
+        ]))
+        p.setClipping(False)
+
+        cx = rect.center().x()
+        cy = rect.center().y() + 6.0 * sc
+        radius = min(rect.width() * 0.255, rect.height() * 0.31)
+        angles = [-math.pi / 2.0 + i * (2.0 * math.pi / 5.0) for i in range(5)]
+
+        # 5 concentric pentagon guide rings (representing Lv 1..5 scale)
+        for ring in range(1, 6):
+            frac = ring / 5.0
+            poly = QPolygonF([
+                QPointF(cx + math.cos(a) * radius * frac, cy + math.sin(a) * radius * frac)
+                for a in angles
+            ])
+            p.setPen(QPen(P5_BORDER_HI if ring == 5 else P5_BORDER, 1.4 if ring == 5 else 1.0))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawPolygon(poly)
+
+        # Spokes
+        p.setPen(QPen(P5_BORDER, 1.0))
+        for a in angles:
+            p.drawLine(QPointF(cx, cy), QPointF(cx + math.cos(a) * radius, cy + math.sin(a) * radius))
+
+        # Filled stat polygon (scales cleanly up to 100 pts = Lv 5, expands if higher)
+        max_pts = max(100, max(self._totals.values(), default=0))
+        cap = ((max_pts + 19) // 20) * 20
+        data_pts: list[QPointF] = []
+        self._vertex_pts.clear()
+        for i, key in enumerate(SOCIAL_STAT_KEYS):
+            a = angles[i]
+            pts = max(0, int(self._totals.get(key, 0)))
+            frac = max(0.14, min(1.0, pts / float(cap)))
+            data_pts.append(QPointF(cx + math.cos(a) * radius * frac, cy + math.sin(a) * radius * frac))
+            self._vertex_pts[key] = QPointF(cx + math.cos(a) * radius * 1.15, cy + math.sin(a) * radius * 1.15)
+
+        p.setPen(QPen(GOLD, 2.2))
+        p.setBrush(QColor(230, 0, 18, 128))
+        p.drawPolygon(QPolygonF(data_pts))
+
+        # Vertex dots & crisp Persona 5 labels around pentagon
+        lbl_font = p5_font(_sc(13, sc, 10), italic=False)
+        lv_font = p5_font(_sc(11, sc, 9), italic=False)
+        fm_l = QFontMetrics(lbl_font)
+        fm_v = QFontMetrics(lv_font)
+
+        for i, key in enumerate(SOCIAL_STAT_KEYS):
+            a = angles[i]
+            dpt = data_pts[i]
+            is_sel = key == self._selected
+            p.setPen(QPen(WHITE if is_sel else GOLD, 2.0 if is_sel else 1.4))
+            p.setBrush(RED if is_sel else BLACK)
+            dot_r = (5.0 if is_sel else 3.8) * sc
+            p.drawEllipse(dpt, dot_r, dot_r)
+
+            # Label placement around vertex
+            meta = SOCIAL_STATS[key]
+            name = meta["label"].upper()
+            lv = stat_level(self._totals.get(key, 0))
+            lv_txt = f"LV {lv}"
+            nw = fm_l.horizontalAdvance(name)
+            vw = fm_v.horizontalAdvance(lv_txt) + int(10 * sc)
+            lh = fm_l.height()
+
+            vx = cx + math.cos(a) * (radius + 14.0 * sc)
+            vy = cy + math.sin(a) * (radius + 14.0 * sc)
+
+            if i == 0:                      # Top (Knowledge)
+                bx = cx - (nw + vw + 6 * sc) / 2.0
+                by = max(rect.top() + 6 * sc, vy - lh - 2 * sc)
+            elif i in (1, 2):               # Right side (Charm, Kindness)
+                bx = min(rect.right() - max(nw, vw) - 8 * sc, vx + 4 * sc)
+                by = vy - lh * 0.75
+            else:                           # Left side (Proficiency, Guts)
+                bx = max(rect.left() + 8 * sc, vx - max(nw, vw) - 4 * sc)
+                by = vy - lh * 0.75
+
+            if i == 0:
+                p.setFont(lbl_font)
+                p.setPen(WHITE if is_sel else P5_TEXT)
+                p.drawText(QRectF(bx, by, nw + 4, lh), Qt.AlignmentFlag.AlignLeft.value | Qt.AlignmentFlag.AlignVCenter.value, name)
+                pill = QRectF(bx + nw + 5 * sc, by + 1, vw, lh - 1)
+                p.setPen(QPen(WHITE, 1.1) if is_sel else Qt.PenStyle.NoPen)
+                p.setBrush(RED if is_sel else P5_GOLD_BG)
+                p.drawRoundedRect(pill, 4.0, 4.0)
+                p.setFont(lv_font)
+                p.setPen(WHITE if is_sel else P5_GOLD_FG)
+                p.drawText(pill, Qt.AlignmentFlag.AlignCenter.value, lv_txt)
+            else:
+                align = Qt.AlignmentFlag.AlignLeft.value if i in (1, 2) else Qt.AlignmentFlag.AlignRight.value
+                box_w = max(nw, vw) + 4
+                p.setFont(lbl_font)
+                p.setPen(WHITE if is_sel else P5_TEXT)
+                p.drawText(QRectF(bx, by, box_w, lh), align | Qt.AlignmentFlag.AlignVCenter.value, name)
+                px_lv = bx if i in (1, 2) else (bx + box_w - vw)
+                pill = QRectF(px_lv, by + lh + 1 * sc, vw, fm_v.height() + 2)
+                p.setPen(QPen(WHITE, 1.1) if is_sel else Qt.PenStyle.NoPen)
+                p.setBrush(RED if is_sel else P5_GOLD_BG)
+                p.drawRoundedRect(pill, 4.0, 4.0)
+                p.setFont(lv_font)
+                p.setPen(WHITE if is_sel else P5_GOLD_FG)
+                p.drawText(pill, Qt.AlignmentFlag.AlignCenter.value, lv_txt)
+        p.end()
+
+
+class StatLogDelegate(QStyledItemDelegate):
+    """Paints Persona 5 social-stat log rows with stat chip, activity text, block/date, and +pts badge."""
+
+    def __init__(self, parent: QWidget | None = None, scale: float = 1.0) -> None:
+        super().__init__(parent)
+        self._scale = scale
+
+    def sizeHint(self, option, index) -> QSize:
+        if index.data(ROLE_ID) is None:
+            return QSize(0, _sc(68, self._scale, 52))
+        return QSize(0, _sc(52, self._scale, 42))
+
+    def paint(self, p: QPainter, option, index) -> None:
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        r = QRectF(option.rect).adjusted(2, 2, -2, -2)
+        sc = self._scale
+
+        if index.data(ROLE_ID) is None:
+            p.setPen(P5_MUTED)
+            p.setFont(ui_font(_sc(13, sc, 10), bold=False))
+            p.drawText(r.adjusted(10, 0, -10, 0),
+                       Qt.AlignmentFlag.AlignCenter.value | Qt.TextFlag.TextWordWrap.value,
+                       index.data(Qt.ItemDataRole.DisplayRole) or "")
+            p.restore()
+            return
+
+        sel = bool(option.state & QStyle.StateFlag.State_Selected)
+        hov = bool(option.state & QStyle.StateFlag.State_MouseOver)
+        bg = P5_SELECTED if sel else (P5_HOVER if hov else P5_SURFACE)
+        bd = RED if sel else (P5_BORDER_HI if hov else P5_BORDER)
+        p.setPen(QPen(bd, 1.3 if sel else 1.0))
+        p.setBrush(bg)
+        p.drawRoundedRect(r, 7.0, 7.0)
+
+        stat_short = index.data(ROLE_CAT) or "STAT"
+        pts_txt = index.data(ROLE_BADGE) or "+3"
+        meta_txt = index.data(ROLE_DATE) or ""
+        title = index.data(Qt.ItemDataRole.DisplayRole) or ""
+
+        # Left stat pill
+        pill_w = _sc(42, sc, 34)
+        pill_h = _sc(22, sc, 18)
+        pill = QRectF(r.left() + _sc(8, sc, 6), r.center().y() - pill_h / 2.0, pill_w, pill_h)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(P5_RED_BG)
+        p.drawRoundedRect(pill, 4.0, 4.0)
+        p.setFont(p5_font(_sc(11, sc, 9), italic=False))
+        p.setPen(P5_RED_FG)
+        p.drawText(pill, Qt.AlignmentFlag.AlignCenter.value, stat_short)
+
+        # Right +PTS gold badge
+        pts_w = _sc(44, sc, 36)
+        pts_rect = QRectF(r.right() - pts_w - _sc(8, sc, 6), r.center().y() - pill_h / 2.0, pts_w, pill_h)
+        p.setBrush(P5_GOLD_BG)
+        p.drawRoundedRect(pts_rect, 4.0, 4.0)
+        p.setPen(P5_GOLD_FG)
+        p.drawText(pts_rect, Qt.AlignmentFlag.AlignCenter.value, pts_txt)
+
+        # Middle text (activity + block/date)
+        tx = pill.right() + _sc(9, sc, 6)
+        tw = max(40.0, pts_rect.left() - tx - _sc(8, sc, 6))
+        tf = ui_font(_sc(13, sc, 10), bold=True)
+        p.setFont(tf)
+        p.setPen(WHITE)
+        elided = QFontMetrics(tf).elidedText(title, Qt.TextElideMode.ElideRight, int(tw))
+        p.drawText(QRectF(tx, r.top() + _sc(5, sc, 3), tw, _sc(20, sc, 16)),
+                   Qt.AlignmentFlag.AlignVCenter.value | Qt.AlignmentFlag.AlignLeft.value, elided)
+
+        mf = ui_font(_sc(11, sc, 9), bold=False)
+        p.setFont(mf)
+        p.setPen(P5_MUTED)
+        p.drawText(QRectF(tx, r.top() + _sc(24, sc, 19), tw, _sc(18, sc, 14)),
+                   Qt.AlignmentFlag.AlignVCenter.value | Qt.AlignmentFlag.AlignLeft.value, meta_txt)
+        p.restore()
+
+
+class SocialStatsDialog(P5FluidPanel):
+    """Persona 5 Royal inspired Social Stats tracker (5 stats, 20 pts/level, daily 2h time blocks)."""
+
+    stat_logged = pyqtSignal(str, str, int, int, int)    # stat, activity, pts, old_lv, new_lv
+    open_settings = pyqtSignal()
+
+    def __init__(self, store: SocialStatsStore, on_top: bool = True, ui_scale: float = 1.0) -> None:
+        super().__init__("SOCIAL STATS", QSize(790, 650), on_top=on_top, ui_scale=ui_scale)
+        sc = self._ui_scale
+        self.store = store
+        self._selected_stat = "knowledge"
+        self._selected_block = default_time_block()
+        self._log_filter = "all"
+        self._undo_entry: dict | None = None
+
+        # Header bar
+        self._blocks_hdr = QLabel("")
+        self._blocks_hdr.setObjectName("subhead")
+        self.header_bar.addWidget(self._blocks_hdr)
+
+        set_btn = self._btn("", variant="soft", icon="gear")
+        set_btn.setFixedSize(_sc(30, sc, 24), _sc(30, sc, 24))
+        set_btn.setToolTip("Settings (Ctrl+,)")
+        set_btn.clicked.connect(lambda _c=False: self.open_settings.emit())
+        self.header_bar.addWidget(set_btn)
+        self._add_close_button()
+
+        # Two-column layout
+        cols = QHBoxLayout()
+        cols.setSpacing(_sc(12, sc, 8))
+
+        # -- LEFT COLUMN: Pentagon radar + 5 stat bars --------------------------
+        left = QVBoxLayout()
+        left.setSpacing(_sc(8, sc, 6))
+
+        self._pentagon = SocialPentagonWidget(scale=sc)
+        self._pentagon.stat_clicked.connect(self._select_stat)
+        left.addWidget(self._pentagon)
+
+        stats_card = _make_card()
+        sl = QVBoxLayout(stats_card)
+        sl.setContentsMargins(_sc(10, sc, 8), _sc(8, sc, 6), _sc(10, sc, 8), _sc(8, sc, 6))
+        sl.setSpacing(_sc(6, sc, 4))
+
+        self._stat_rows: dict[str, tuple[QFrame, QLabel, QLabel, QProgressBar]] = {}
+        for key in ("knowledge", "guts", "proficiency", "charm", "kindness"):
+            row_f = _make_card("subcard")
+            row_f.setCursor(Qt.CursorShape.PointingHandCursor)
+            row_f.mousePressEvent = lambda _e, k=key: self._select_stat(k)
+            rl = QVBoxLayout(row_f)
+            rl.setContentsMargins(_sc(8, sc, 6), _sc(5, sc, 4), _sc(8, sc, 6), _sc(5, sc, 4))
+            rl.setSpacing(_sc(3, sc, 2))
+
+            top_r = QHBoxLayout()
+            top_r.setSpacing(_sc(5, sc, 4))
+            title_lbl = QLabel(SOCIAL_STATS[key]["label"].upper())
+            title_lbl.setStyleSheet(
+                f'color: #FFFFFF; font-family: "Barlow Condensed", "Anton", sans-serif; '
+                f'font-size: {_sc(13, sc, 10)}px; font-weight: 800;'
+            )
+            top_r.addWidget(title_lbl)
+
+            rank_lbl = QLabel("")
+            rank_lbl.setStyleSheet(
+                f'color: #FAD02C; font-family: "Barlow Condensed", sans-serif; '
+                f'font-size: {_sc(11, sc, 9)}px; font-weight: 800;'
+            )
+            top_r.addWidget(rank_lbl)
+            top_r.addStretch(1)
+
+            pts_lbl = QLabel("")
+            pts_lbl.setStyleSheet(f'color: #9292A4; font-size: {_sc(10, sc, 8)}px; font-weight: bold;')
+            top_r.addWidget(pts_lbl)
+            rl.addLayout(top_r)
+
+            bar = QProgressBar()
+            bar.setTextVisible(False)
+            bar.setFixedHeight(_sc(5, sc, 4))
+            rl.addWidget(bar)
+
+            sl.addWidget(row_f)
+            self._stat_rows[key] = (row_f, rank_lbl, pts_lbl, bar)
+
+        left.addWidget(stats_card, 1)
+        cols.addLayout(left, 46)
+
+        # -- RIGHT COLUMN: Log Time Block form + Recent Activity Log ------------
+        right = QVBoxLayout()
+        right.setSpacing(_sc(8, sc, 6))
+
+        # Log form card
+        log_card = _make_card()
+        fl = QVBoxLayout(log_card)
+        fl.setContentsMargins(_sc(12, sc, 9), _sc(10, sc, 7), _sc(12, sc, 9), _sc(10, sc, 7))
+        fl.setSpacing(_sc(7, sc, 5))
+
+        f_hdr = QHBoxLayout()
+        h_lbl = QLabel("LOG TIME BLOCK (~2H)")
+        h_lbl.setObjectName("section")
+        f_hdr.addWidget(h_lbl)
+        f_hdr.addStretch(1)
+        self._pips_lbl = QLabel("")
+        self._pips_lbl.setStyleSheet(
+            f'color: #FAD02C; font-family: "Barlow Condensed", sans-serif; '
+            f'font-size: {_sc(12, sc, 10)}px; font-weight: 800;'
+        )
+        f_hdr.addWidget(self._pips_lbl)
+        fl.addLayout(f_hdr)
+
+        # Stat selector chips (2 clean rows: 3 + 2)
+        self._stat_btns: dict[str, P5FluidButton] = {}
+        r1 = QHBoxLayout()
+        r1.setSpacing(_sc(5, sc, 4))
+        for k in ("knowledge", "guts", "proficiency"):
+            b = self._btn(SOCIAL_STATS[k]["label"].upper(), variant="soft", display=True, px=10)
+            b.setFixedHeight(_sc(26, sc, 22))
+            b.clicked.connect(lambda _c=False, key=k: self._select_stat(key))
+            self._stat_btns[k] = b
+            r1.addWidget(b, 1)
+        fl.addLayout(r1)
+
+        r2 = QHBoxLayout()
+        r2.setSpacing(_sc(5, sc, 4))
+        for k in ("charm", "kindness"):
+            b = self._btn(SOCIAL_STATS[k]["label"].upper(), variant="soft", display=True, px=10)
+            b.setFixedHeight(_sc(26, sc, 22))
+            b.clicked.connect(lambda _c=False, key=k: self._select_stat(key))
+            self._stat_btns[k] = b
+            r2.addWidget(b, 1)
+        fl.addLayout(r2)
+
+        self._rule_hint = QLabel("")
+        self._rule_hint.setObjectName("tip")
+        self._rule_hint.setWordWrap(True)
+        fl.addWidget(self._rule_hint)
+
+        # Activity input + primary LOG button
+        act_row = QHBoxLayout()
+        act_row.setSpacing(_sc(6, sc, 4))
+        self._act_input = QLineEdit()
+        self._act_input.returnPressed.connect(self._log_activity)
+        act_row.addWidget(self._act_input, 1)
+
+        self._log_btn = self._btn(f"LOG +{DEFAULT_STAT_POINTS}", variant="primary", icon="plus", display=True, px=10)
+        self._log_btn.setFixedHeight(_sc(30, sc, 25))
+        self._log_btn.clicked.connect(self._log_activity)
+        act_row.addWidget(self._log_btn)
+        fl.addLayout(act_row)
+
+        # Time block selector
+        blk_row = QHBoxLayout()
+        blk_row.setSpacing(_sc(5, sc, 4))
+        blk_lbl = QLabel("Block")
+        blk_lbl.setStyleSheet(f'color: #9292A4; font-size: {_sc(12, sc, 10)}px; font-weight: bold;')
+        blk_row.addWidget(blk_lbl)
+        self._block_btns: dict[str, P5FluidButton] = {}
+        for blk in TIME_BLOCKS:
+            b = self._btn(blk.upper(), variant="soft", display=True, px=9)
+            b.setFixedHeight(_sc(25, sc, 21))
+            b.clicked.connect(lambda _c=False, name=blk: self._select_block(name))
+            self._block_btns[blk] = b
+            blk_row.addWidget(b, 1)
+        fl.addLayout(blk_row)
+
+        # Points selector (+1 / +2 / +3 / +5 + editable spinbox)
+        pts_row = QHBoxLayout()
+        pts_row.setSpacing(_sc(5, sc, 4))
+        pts_tag = QLabel("Points")
+        pts_tag.setStyleSheet(f'color: #9292A4; font-size: {_sc(12, sc, 10)}px; font-weight: bold;')
+        pts_row.addWidget(pts_tag)
+        self._quick_pts_btns: dict[int, P5FluidButton] = {}
+        for val in QUICK_STAT_POINTS:
+            b = self._btn(f"+{val}", variant="soft", display=True, px=10)
+            b.setFixedHeight(_sc(26, sc, 22))
+            b.clicked.connect(lambda _c=False, v=val: self._set_points(v))
+            self._quick_pts_btns[val] = b
+            pts_row.addWidget(b, 1)
+
+        self._pts_spin = QSpinBox()
+        self._pts_spin.setRange(1, 500)
+        self._pts_spin.setValue(DEFAULT_STAT_POINTS)
+        self._pts_spin.setSuffix(" pts")
+        self._pts_spin.setMinimumWidth(_sc(84, sc, 68))
+        self._pts_spin.setFixedHeight(_sc(26, sc, 22))
+        self._pts_spin.valueChanged.connect(self._on_points_changed)
+        pts_row.addWidget(self._pts_spin)
+        fl.addLayout(pts_row)
+        right.addWidget(log_card)
+
+        # Recent log card
+        hist_card = _make_card()
+        hl = QVBoxLayout(hist_card)
+        hl.setContentsMargins(_sc(10, sc, 8), _sc(8, sc, 6), _sc(10, sc, 8), _sc(8, sc, 6))
+        hl.setSpacing(_sc(5, sc, 4))
+
+        h_top = QHBoxLayout()
+        rec_lbl = QLabel("RECENT LOG")
+        rec_lbl.setObjectName("section")
+        h_top.addWidget(rec_lbl)
+        h_top.addStretch(1)
+        self._log_cnt_lbl = QLabel("")
+        self._log_cnt_lbl.setObjectName("tip")
+        h_top.addWidget(self._log_cnt_lbl)
+        hl.addLayout(h_top)
+
+        f_row = QHBoxLayout()
+        f_row.setSpacing(_sc(4, sc, 3))
+        self._filter_btns: dict[str, P5FluidButton] = {}
+        for fkey, flabel in (("all", "ALL"), ("knowledge", "KNO"), ("guts", "GUT"),
+                             ("proficiency", "PRO"), ("charm", "CHA"), ("kindness", "KIN")):
+            fb = self._btn(flabel, variant="soft", display=True, px=9)
+            fb.setFixedHeight(_sc(22, sc, 19))
+            fb.clicked.connect(lambda _c=False, k=fkey: self._set_log_filter(k))
+            self._filter_btns[fkey] = fb
+            f_row.addWidget(fb, 1)
+        self._filter_btns["all"].set_active(True)
+        hl.addLayout(f_row)
+
+        self._log_list = _KeyAwareList()
+        self._log_list.setMouseTracking(True)
+        self._log_list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self._log_list.setItemDelegate(StatLogDelegate(self._log_list, scale=sc))
+        self._log_list.delete_pressed.connect(self._delete_selected)
+        hl.addWidget(self._log_list, 1)
+
+        h_foot = QHBoxLayout()
+        h_foot.setSpacing(6)
+        tip = QLabel("20 pts/level · Del to remove")
+        tip.setObjectName("tip")
+        h_foot.addWidget(tip, 1)
+
+        del_btn = self._btn("DELETE", variant="danger", display=True, px=10)
+        del_btn.setFixedHeight(_sc(26, sc, 22))
+        del_btn.clicked.connect(self._delete_selected)
+        h_foot.addWidget(del_btn)
+        hl.addLayout(h_foot)
+
+        right.addWidget(hist_card, 1)
+
+        self._undo = UndoBar(scale=sc)
+        self._undo.undo_clicked.connect(self._undo_delete)
+        right.addWidget(self._undo)
+
+        cols.addLayout(right, 54)
+        self.body.addLayout(cols, 1)
+
+        QShortcut(QKeySequence("Ctrl+,"), self).activated.connect(lambda: self.open_settings.emit())
+        self._select_stat("knowledge")
+        self._select_block(self._selected_block)
+        self._on_points_changed(DEFAULT_STAT_POINTS)
+
+    def on_shown(self) -> None:
+        self._select_block(default_time_block())
+        QTimer.singleShot(20, self._act_input.setFocus)
+
+    def _select_stat(self, key: str) -> None:
+        if key not in SOCIAL_STATS:
+            return
+        self._selected_stat = key
+        for k, b in self._stat_btns.items():
+            b.set_active(k == key)
+        meta = SOCIAL_STATS[key]
+        self._rule_hint.setText(f"{meta['label']} — {meta['examples']}")
+        self._act_input.setPlaceholderText(meta["placeholder"])
+        self._refresh_visuals()
+
+    def _select_block(self, blk: str) -> None:
+        if blk not in TIME_BLOCKS:
+            return
+        self._selected_block = blk
+        for name, b in self._block_btns.items():
+            b.set_active(name == blk, active_variant="gold")
+
+    def _set_points(self, value: int) -> None:
+        self._pts_spin.setValue(value)
+
+    def _on_points_changed(self, value: int) -> None:
+        for v, b in self._quick_pts_btns.items():
+            b.set_active(v == value, active_variant="gold")
+        self._log_btn.setText(f"LOG +{value}")
+
+    def _set_log_filter(self, key: str) -> None:
+        self._log_filter = key
+        for k, b in self._filter_btns.items():
+            b.set_active(k == key)
+        self._refresh_log()
+
+    def _log_activity(self) -> None:
+        self._pts_spin.interpretText()
+        pts = self._pts_spin.value()
+        entry, old_lv, new_lv = self.store.add(
+            self._selected_stat,
+            self._act_input.text(),
+            points=pts,
+            block=self._selected_block,
+        )
+        if entry is None:
+            return
+        self._act_input.clear()
+        self.refresh()
+        self.stat_logged.emit(entry["stat"], entry["activity"], entry["points"], old_lv, new_lv)
+
+    def _delete_selected(self) -> None:
+        item = self._log_list.currentItem()
+        if item is None:
+            return
+        entry_id = item.data(ROLE_ID)
+        if not entry_id:
+            return
+        entry = self.store.get(entry_id)
+        if entry is None:
+            return
+        self._undo_entry = dict(entry)
+        self.store.delete(entry_id)
+        self.refresh()
+        self._undo.trigger(f"Removed '{entry.get('activity', '')[:28]}' (+{entry.get('points', 0)} pts).")
+
+    def _undo_delete(self) -> None:
+        if self._undo_entry is None:
+            return
+        self.store.restore(self._undo_entry)
+        self._undo_entry = None
+        self.refresh()
+
+    def refresh(self) -> None:
+        self._refresh_visuals()
+        self._refresh_log()
+
+    def _refresh_visuals(self) -> None:
+        totals = self.store.totals()
+        self._pentagon.set_data(totals, self._selected_stat)
+
+        today_n = len(self.store.today_entries())
+        self._blocks_hdr.setText(f"TODAY: {today_n} / {DAILY_BLOCK_TARGET} BLOCKS")
+        filled = min(today_n, DAILY_BLOCK_TARGET)
+        pips = "● " * filled + "○ " * (DAILY_BLOCK_TARGET - filled)
+        extra = f" (+{today_n - DAILY_BLOCK_TARGET})" if today_n > DAILY_BLOCK_TARGET else ""
+        self._pips_lbl.setText(f"TODAY {pips.strip()}{extra}")
+
+        for key, (row_f, rank_lbl, pts_lbl, bar) in self._stat_rows.items():
+            pts = totals.get(key, 0)
+            lv, into, span, to_next = stat_level_progress(pts)
+            title = stat_rank_title(key, lv)
+            is_sel = key == self._selected_stat
+            row_f.setStyleSheet(
+                "QFrame#subcard { background-color: #2A0C11; border: 1.5px solid #E60012; border-radius: 8px; }"
+                if is_sel else ""
+            )
+            rank_lbl.setText(f"LV {lv} · {title.upper()}")
+            pts_lbl.setText(f"{pts} PTS (-{to_next})")
+            bar.setRange(0, max(1, span))
+            bar.setValue(into)
+
+    def _refresh_log(self) -> None:
+        entries = self.store.recent(limit=60, stat_filter=self._log_filter)
+        n = len(entries)
+        self._log_cnt_lbl.setText(f"{n} " + ("entry" if n == 1 else "entries"))
+        self._log_list.clear()
+        if not entries:
+            msg = ("No activities logged yet.\nPick a stat above, enter your ~2h activity, and click LOG!"
+                   if self._log_filter == "all"
+                   else f"No {SOCIAL_STATS[self._log_filter]['label']} entries yet.")
+            self._log_list.addItem(_hint_item(msg))
+            return
+        for e in entries:
+            stat = e.get("stat", "knowledge")
+            meta = SOCIAL_STATS.get(stat, {})
+            item = QListWidgetItem(e.get("activity", ""))
+            item.setData(ROLE_ID, e["id"])
+            item.setData(ROLE_CAT, meta.get("short", stat[:3].upper()))
+            item.setData(ROLE_BADGE, f"+{e.get('points', 0)}")
+            d_str = e.get("date", "")
+            try:
+                d_fmt = datetime.strptime(d_str, "%Y-%m-%d").strftime("%d %b")
+            except ValueError:
+                d_fmt = d_str
+            item.setData(ROLE_DATE, f"{e.get('block', 'Daytime')} · {d_fmt}")
+            self._log_list.addItem(item)
+
+
+# ---------------------------------------------------------------------------
+# TIMER DIALOG (Persona 5 redesigned Focus Mode + Manual Timers)
+# ---------------------------------------------------------------------------
+class _FocusClockDisplay(QWidget):
+    """Persona 5 slanted obsidian & crimson countdown scoreboard for Focus Mode."""
+
+    def __init__(self, scale: float = 1.0, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._scale = scale
+        self._running = False
+        self._phase = "focus"
+        self._clock = "25:00"
+        self._progress = 0.0
+        self._sessions = 0
+        self.setFixedHeight(_sc(112, scale, 90))
+
+    def set_state(self, running: bool, phase: str, clock: str, progress: float, sessions: int) -> None:
+        self._running = running
+        self._phase = phase
+        self._clock = clock
+        self._progress = clamp(progress, 0.0, 1.0)
+        self._sessions = sessions
+        self.update()
+
+    def paintEvent(self, _event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        sc = self._scale
+        r = QRectF(self.rect()).adjusted(2.0, 2.0, -7.0, -7.0)
+        is_rest = self._running and self._phase == "rest"
+        accent = P5_MINT_FG if is_rest else RED
+
+        # Signature P5 hard offset shadow
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(accent)
+        p.drawRect(r.translated(4.0, 4.0))
+
+        # Obsidian body
+        p.setBrush(BLACK)
+        p.drawRect(r)
+
+        # Diagonal left slash panel for phase tag
+        slash_w = min(r.width() * 0.34, 156.0 * sc)
+        slash = QPolygonF([
+            QPointF(r.left(), r.top()),
+            QPointF(r.left() + slash_w, r.top()),
+            QPointF(r.left() + slash_w - 22.0 * sc, r.bottom()),
+            QPointF(r.left(), r.bottom()),
+        ])
+        p.setBrush(accent if self._running else P5_RED_BG)
+        p.drawPolygon(slash)
+
+        # Phase label inside left slash
+        tag_top = "BREAK TIME" if is_rest else ("FOCUS MODE" if self._running else "READY")
+        tag_sub = "RECHARGE" if is_rest else ("LOCKED IN" if self._running else "POMODORO")
+        tag_col = BLACK if is_rest else WHITE
+        p.setFont(p5_font(_sc(19, sc, 14), italic=False))
+        p.setPen(tag_col)
+        p.drawText(QRectF(r.left() + 12 * sc, r.top() + 14 * sc, slash_w - 20 * sc, 34 * sc),
+                   Qt.AlignmentFlag.AlignLeft.value | Qt.AlignmentFlag.AlignVCenter.value, tag_top)
+        p.setFont(p5_font(_sc(12, sc, 9), italic=True))
+        p.setPen(tag_col if is_rest else P5_GOLD_FG)
+        p.drawText(QRectF(r.left() + 12 * sc, r.top() + 48 * sc, slash_w - 24 * sc, 20 * sc),
+                   Qt.AlignmentFlag.AlignLeft.value | Qt.AlignmentFlag.AlignVCenter.value, tag_sub)
+
+        # Sessions pill at bottom-left
+        sess_txt = f"{self._sessions} DONE"
+        p.setFont(p5_font(_sc(11, sc, 9), italic=False))
+        p.setPen(BLACK if is_rest else P5_TEXT)
+        p.drawText(QRectF(r.left() + 12 * sc, r.bottom() - 28 * sc, slash_w - 28 * sc, 18 * sc),
+                   Qt.AlignmentFlag.AlignLeft.value | Qt.AlignmentFlag.AlignVCenter.value, sess_txt)
+
+        # Giant Persona 5 Anton countdown digits on right
+        digits_rect = QRectF(r.left() + slash_w - 6 * sc, r.top() + 6 * sc,
+                             r.width() - slash_w - 8 * sc, r.height() - 22 * sc)
+        p.setFont(p5_font(_sc(50, sc, 36), italic=False))
+        p.setPen(WHITE)
+        p.drawText(digits_rect, Qt.AlignmentFlag.AlignCenter.value, self._clock)
+
+        # Bottom progress track inside scoreboard
+        bar_h = max(4.0, 6.0 * sc)
+        bar_rect = QRectF(r.left() + 2.0, r.bottom() - bar_h - 1.0, r.width() - 4.0, bar_h)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(P5_SURFACE)
+        p.drawRect(bar_rect)
+        if self._progress > 0.005:
+            p.setBrush(accent)
+            p.drawRect(QRectF(bar_rect.left(), bar_rect.top(),
+                              bar_rect.width() * self._progress, bar_rect.height()))
+
+        # Crisp white P5 outer border
+        p.setPen(pen(WHITE, 2.2))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRect(r)
+        p.end()
+
+
+class TimerDialog(P5FluidPanel):
+    """Unified Persona 5 Timer window: redesigned Focus Mode (Pomodoro) + Manual Timers."""
+
+    focus_start_requested = pyqtSignal(int, int)      # focus_min, rest_min
+    focus_stop_requested = pyqtSignal()
+    manual_add_requested = pyqtSignal(int, str)       # total_seconds, label
+    manual_cancel_requested = pyqtSignal(str)         # timer_id
+    open_settings = pyqtSignal()
+
+    PRESETS = ((5, "5M"), (10, "10M"), (15, "15M"), (30, "30M"), (60, "1H"))
+
+    def __init__(self, settings: SettingsStore, on_top: bool = True, ui_scale: float = 1.0) -> None:
+        super().__init__("TIMER", QSize(560, 650), on_top=on_top, ui_scale=ui_scale)
+        sc = self._ui_scale
+        self.settings = settings
+        self._focus_running = False
+        self._focus_phase = "focus"
+        self._focus_left = 0
+        self._focus_total = 1
+        self._focus_completed = 0
+        self._manual_items: list[dict] = []
+        self._timer_rows: dict[str, tuple[QFrame, QLabel, QProgressBar]] = {}
+
+        # Header
+        self._hdr_status = QLabel("READY")
+        self._hdr_status.setObjectName("subhead")
+        self.header_bar.addWidget(self._hdr_status)
+
+        set_btn = self._btn("", variant="soft", icon="gear")
+        set_btn.setFixedSize(_sc(30, sc, 24), _sc(30, sc, 24))
+        set_btn.setToolTip("Settings (Ctrl+,)")
+        set_btn.clicked.connect(lambda _c=False: self.open_settings.emit())
+        self.header_bar.addWidget(set_btn)
+        self._add_close_button()
+
+        # -- CARD 1: FOCUS MODE (Pomodoro) --------------------------------------
+        fc = _make_card()
+        fl = QVBoxLayout(fc)
+        fl.setContentsMargins(_sc(12, sc, 9), _sc(10, sc, 8), _sc(12, sc, 9), _sc(10, sc, 8))
+        fl.setSpacing(_sc(8, sc, 6))
+
+        f_top = QHBoxLayout()
+        fh = QLabel("FOCUS MODE")
+        fh.setObjectName("section")
+        f_top.addWidget(fh)
+        f_top.addStretch(1)
+        self._focus_note = QLabel("Stay steady at your own pace—I'll watch the clock!")
+        self._focus_note.setObjectName("tip")
+        f_top.addWidget(self._focus_note)
+        fl.addLayout(f_top)
+
+        self._clock_display = _FocusClockDisplay(scale=sc)
+        fl.addWidget(self._clock_display)
+
+        ctrl = QHBoxLayout()
+        ctrl.setSpacing(_sc(8, sc, 5))
+
+        f_lbl = QLabel("Focus")
+        f_lbl.setStyleSheet(f'color: #C8C8D8; font-size: {_sc(13, sc, 10)}px; font-weight: bold;')
+        ctrl.addWidget(f_lbl)
+        self._focus_spin = QSpinBox()
+        self._focus_spin.setRange(1, 180)
+        self._focus_spin.setSuffix(" m")
+        self._focus_spin.setMinimumWidth(_sc(76, sc, 62))
+        self._focus_spin.setFixedHeight(_sc(30, sc, 25))
+        self._focus_spin.valueChanged.connect(self._on_focus_spin_changed)
+        ctrl.addWidget(self._focus_spin)
+
+        r_lbl = QLabel("Break")
+        r_lbl.setStyleSheet(f'color: #C8C8D8; font-size: {_sc(13, sc, 10)}px; font-weight: bold;')
+        ctrl.addWidget(r_lbl)
+        self._rest_spin = QSpinBox()
+        self._rest_spin.setRange(1, 60)
+        self._rest_spin.setSuffix(" m")
+        self._rest_spin.setMinimumWidth(_sc(72, sc, 58))
+        self._rest_spin.setFixedHeight(_sc(30, sc, 25))
+        ctrl.addWidget(self._rest_spin)
+
+        ctrl.addStretch(1)
+
+        self._focus_btn = self._btn("START FOCUS", variant="primary", icon="play", display=True, px=11)
+        self._focus_btn.setFixedHeight(_sc(32, sc, 26))
+        self._focus_btn.setMinimumWidth(_sc(132, sc, 106))
+        self._focus_btn.clicked.connect(self._toggle_focus)
+        ctrl.addWidget(self._focus_btn)
+        fl.addLayout(ctrl)
+        self.body.addWidget(fc)
+
+        # -- CARD 2: MANUAL TIMERS ----------------------------------------------
+        mc = _make_card()
+        ml = QVBoxLayout(mc)
+        ml.setContentsMargins(_sc(12, sc, 9), _sc(10, sc, 8), _sc(12, sc, 9), _sc(10, sc, 8))
+        ml.setSpacing(_sc(8, sc, 6))
+
+        m_top = QHBoxLayout()
+        mh = QLabel("MANUAL TIMERS")
+        mh.setObjectName("section")
+        m_top.addWidget(mh)
+        m_top.addStretch(1)
+        self._manual_cnt_lbl = QLabel("0 ACTIVE")
+        self._manual_cnt_lbl.setStyleSheet(
+            f'color: #FAD02C; font-family: "Barlow Condensed", sans-serif; '
+            f'font-size: {_sc(12, sc, 10)}px; font-weight: 800;'
+        )
+        m_top.addWidget(self._manual_cnt_lbl)
+        ml.addLayout(m_top)
+
+        # Quick presets + H/M/S inputs
+        prow = QHBoxLayout()
+        prow.setSpacing(_sc(5, sc, 4))
+        plbl = QLabel("Quick")
+        plbl.setStyleSheet(f'color: #9292A4; font-size: {_sc(12, sc, 10)}px; font-weight: bold;')
+        prow.addWidget(plbl)
+        for mins, text in self.PRESETS:
+            pb = self._btn(text, variant="soft", display=True, px=10)
+            pb.setFixedHeight(_sc(26, sc, 22))
+            pb.clicked.connect(lambda _c=False, m=mins: self._apply_preset(m))
+            prow.addWidget(pb, 1)
+        ml.addLayout(prow)
+
+        hms_row = QHBoxLayout()
+        hms_row.setSpacing(_sc(6, sc, 4))
+        dur_lbl = QLabel("Duration")
+        dur_lbl.setStyleSheet(f'color: #9292A4; font-size: {_sc(12, sc, 10)}px; font-weight: bold;')
+        hms_row.addWidget(dur_lbl)
+        self._h_spin = QSpinBox()
+        self._h_spin.setRange(0, 23)
+        self._h_spin.setSuffix(" h")
+        self._h_spin.setFixedHeight(_sc(30, sc, 25))
+        self._m_spin = QSpinBox()
+        self._m_spin.setRange(0, 59)
+        self._m_spin.setValue(10)
+        self._m_spin.setSuffix(" m")
+        self._m_spin.setFixedHeight(_sc(30, sc, 25))
+        self._s_spin = QSpinBox()
+        self._s_spin.setRange(0, 59)
+        self._s_spin.setSuffix(" s")
+        self._s_spin.setFixedHeight(_sc(30, sc, 25))
+
+        for w in (self._h_spin, self._m_spin, self._s_spin):
+            w.setMinimumWidth(_sc(76, sc, 60))
+            hms_row.addWidget(w, 1)
+        ml.addLayout(hms_row)
+
+        lbl_row = QHBoxLayout()
+        lbl_row.setSpacing(_sc(6, sc, 4))
+        self._label_edit = QLineEdit()
+        self._label_edit.setPlaceholderText("Reminder label (e.g. Laundry, Stretch, Tea)...")
+        self._label_edit.setFixedHeight(_sc(30, sc, 25))
+        self._label_edit.returnPressed.connect(self._add_manual_timer)
+        lbl_row.addWidget(self._label_edit, 1)
+
+        add_btn = self._btn("START TIMER", variant="primary", icon="plus", display=True, px=10)
+        add_btn.setFixedHeight(_sc(30, sc, 25))
+        add_btn.clicked.connect(self._add_manual_timer)
+        lbl_row.addWidget(add_btn)
+        ml.addLayout(lbl_row)
+
+        self._manual_err = QLabel("")
+        self._manual_err.setStyleSheet(f'color: #FF5E6B; font-size: {_sc(12, sc, 10)}px; font-weight: bold;')
+        self._manual_err.hide()
+        ml.addWidget(self._manual_err)
+
+        # Active manual timers scroll area
+        self._m_scroll = QScrollArea()
+        self._m_scroll.setWidgetResizable(True)
+        self._m_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._m_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._m_body = QWidget()
+        self._m_list_lay = QVBoxLayout(self._m_body)
+        self._m_list_lay.setContentsMargins(0, 2, _sc(4, sc, 2), 2)
+        self._m_list_lay.setSpacing(_sc(6, sc, 4))
+        self._m_scroll.setWidget(self._m_body)
+        ml.addWidget(self._m_scroll, 1)
+
+        self.body.addWidget(mc, 1)
+
+        QShortcut(QKeySequence("Ctrl+,"), self).activated.connect(lambda: self.open_settings.emit())
+        self._sync_spinners_from_settings()
+        self._rebuild_manual_list()
+
+    def _sync_spinners_from_settings(self) -> None:
+        if self._focus_running:
+            return
+        self._focus_spin.blockSignals(True)
+        self._rest_spin.blockSignals(True)
+        self._focus_spin.setValue(int(self.settings["focus_min"]))
+        self._rest_spin.setValue(int(self.settings["rest_min"]))
+        self._focus_spin.blockSignals(False)
+        self._rest_spin.blockSignals(False)
+        self._update_focus_display()
+
+    def refresh(self) -> None:
+        self._sync_spinners_from_settings()
+        self._manual_err.hide()
+
+    def _on_focus_spin_changed(self, _val: int) -> None:
+        if not self._focus_running:
+            self._update_focus_display()
+
+    def _toggle_focus(self) -> None:
+        if self._focus_running:
+            self.focus_stop_requested.emit()
+        else:
+            self._focus_spin.interpretText()
+            self._rest_spin.interpretText()
+            self.focus_start_requested.emit(self._focus_spin.value(), self._rest_spin.value())
+
+    def _apply_preset(self, minutes: int) -> None:
+        h, m = divmod(minutes, 60)
+        self._h_spin.setValue(h)
+        self._m_spin.setValue(m)
+        self._s_spin.setValue(0)
+        self._manual_err.hide()
+        self._label_edit.setFocus()
+
+    def _add_manual_timer(self) -> None:
+        for sp in (self._h_spin, self._m_spin, self._s_spin):
+            sp.interpretText()
+        total = self._h_spin.value() * 3600 + self._m_spin.value() * 60 + self._s_spin.value()
+        if total <= 0:
+            self._manual_err.setText("Set at least 1 second before starting a timer.")
+            self._manual_err.show()
+            return
+        self._manual_err.hide()
+        label = self._label_edit.text().strip()
+        self._label_edit.clear()
+        self.manual_add_requested.emit(total, label)
+
+    def update_focus(self, running: bool, phase: str, remaining_s: int,
+                     total_s: int, completed: int) -> None:
+        self._focus_running = bool(running)
+        self._focus_phase = phase
+        self._focus_left = max(0, int(remaining_s))
+        self._focus_total = max(1, int(total_s))
+        self._focus_completed = max(0, int(completed))
+        self._focus_spin.setEnabled(not running)
+        self._rest_spin.setEnabled(not running)
+        if running:
+            self._focus_btn.setText("STOP FOCUS")
+            self._focus_btn._icon = "stop"
+            self._focus_btn.set_variant("danger")
+            self._focus_note.setText(
+                "Take a breather—drink some water and stretch!"
+                if phase == "rest" else "Locked in! Keep that momentum going."
+            )
+        else:
+            self._focus_btn.setText("START FOCUS")
+            self._focus_btn._icon = "play"
+            self._focus_btn.set_variant("primary")
+            self._focus_note.setText("Stay steady at your own pace—I'll watch the clock!")
+        self._update_focus_display()
+        self._update_header_status()
+
+    def _update_focus_display(self) -> None:
+        if self._focus_running:
+            clock = _fmt_hms(self._focus_left)
+            prog = self._focus_left / float(max(1, self._focus_total))
+        else:
+            clock = _fmt_hms(self._focus_spin.value() * 60)
+            prog = 0.0
+        self._clock_display.set_state(
+            self._focus_running, self._focus_phase, clock, prog, self._focus_completed
+        )
+
+    def update_manual_timers(self, items: list[dict]) -> None:
+        self._manual_items = list(items)
+        new_ids = [i["id"] for i in items]
+        if new_ids == list(self._timer_rows.keys()) and new_ids:
+            for item in items:
+                _card, clock_lbl, bar = self._timer_rows[item["id"]]
+                clock_lbl.setText(_fmt_hms(item["remaining_s"]))
+                bar.setRange(0, max(1, int(item["total_s"])))
+                bar.setValue(max(0, int(item["remaining_s"])))
+        else:
+            self._rebuild_manual_list()
+        self._update_header_status()
+
+    def _update_header_status(self) -> None:
+        parts = []
+        if self._focus_running:
+            tag = "REST" if self._focus_phase == "rest" else "FOCUS"
+            parts.append(f"{tag} {_fmt_hms(self._focus_left)}")
+        n = len(self._manual_items)
+        if n:
+            parts.append(f"{n} TIMER" + ("" if n == 1 else "S"))
+        self._hdr_status.setText(" · ".join(parts) if parts else "READY")
+        self._manual_cnt_lbl.setText(f"{n} ACTIVE")
+
+    def _rebuild_manual_list(self) -> None:
+        sc = self._ui_scale
+        _clear_layout(self._m_list_lay)
+        self._timer_rows.clear()
+
+        if not self._manual_items:
+            empty = QLabel("No manual timers running.\nPick a quick preset or set H / M / S above—Morgana will alert you when time's up!")
+            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            empty.setWordWrap(True)
+            empty.setStyleSheet(
+                f'color: #7A7A90; padding: {_sc(22, sc, 14)}px {_sc(14, sc, 10)}px; '
+                f'font-size: {_sc(13, sc, 10)}px;'
+            )
+            self._m_list_lay.addWidget(empty)
+            self._m_list_lay.addStretch(1)
+            return
+
+        for item in self._manual_items:
+            tid = item["id"]
+            row_f = _make_card("subcard")
+            rl = QVBoxLayout(row_f)
+            rl.setContentsMargins(_sc(10, sc, 8), _sc(7, sc, 5), _sc(10, sc, 8), _sc(7, sc, 5))
+            rl.setSpacing(_sc(5, sc, 3))
+
+            top = QHBoxLayout()
+            top.setSpacing(_sc(8, sc, 6))
+
+            lbl = QLabel(item.get("label") or "Manual Timer")
+            lbl.setStyleSheet(
+                f'color: #FFFFFF; font-family: "Arsenal", "Optima", "Segoe UI", sans-serif; '
+                f'font-size: {_sc(14, sc, 11)}px; font-weight: bold;'
+            )
+            top.addWidget(lbl, 1)
+
+            clk = QLabel(_fmt_hms(item["remaining_s"]))
+            clk.setStyleSheet(
+                f'color: #FAD02C; font-family: "Anton", "Barlow Condensed", sans-serif; '
+                f'font-size: {_sc(20, sc, 15)}px;'
+            )
+            top.addWidget(clk)
+
+            cancel = self._btn("CANCEL", variant="danger", display=True, px=9)
+            cancel.setFixedHeight(_sc(24, sc, 20))
+            cancel.clicked.connect(lambda _c=False, i=tid: self.manual_cancel_requested.emit(i))
+            top.addWidget(cancel)
+            rl.addLayout(top)
+
+            bar = QProgressBar()
+            bar.setTextVisible(False)
+            bar.setFixedHeight(_sc(4, sc, 3))
+            bar.setStyleSheet(
+                "QProgressBar { background-color: #1E1E27; border: none; border-radius: 2px; }"
+                "QProgressBar::chunk { background-color: #F5C400; border-radius: 2px; }"
+            )
+            bar.setRange(0, max(1, int(item["total_s"])))
+            bar.setValue(max(0, int(item["remaining_s"])))
+            rl.addWidget(bar)
+
+            self._m_list_lay.addWidget(row_f)
+            self._timer_rows[tid] = (row_f, clk, bar)
+
+        self._m_list_lay.addStretch(1)

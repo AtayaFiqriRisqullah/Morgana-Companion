@@ -7,7 +7,7 @@ Fonts   : Bundled SIL OFL fonts loaded from `fonts/` via QFontDatabase:
             * Anton              — heavy condensed Persona 5 display titles & nameplate
             * Barlow Condensed   — crisp tall Persona 5 buttons, badges & popup menus
             * Arsenal            — Optima-inspired flared humanist sans for dialogue & UI text
-Rule    : Hover states shift surface/background/border only—never text color.
+Rule    : Hover states shift surface/background/border by default; text color changes only with owner approval.
 """
 from __future__ import annotations
 
@@ -360,6 +360,13 @@ QListWidget {{
     background-color: transparent;
     border: none;
     outline: none;
+}}
+QScrollArea {{
+    background-color: transparent;
+    border: none;
+}}
+QScrollArea > QWidget > QWidget {{
+    background-color: transparent;
 }}
 QScrollBar:vertical {{
     background: transparent;

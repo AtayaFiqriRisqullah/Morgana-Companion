@@ -29,14 +29,14 @@ STATE_EXPRESSION = {
 
 # Order matters: first matching rule wins. All keywords are lowercase.
 _RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("shout", ("hurry", "leave without us", "due now:", "starting now:", "go to bed!", "almost morning")),
+    ("shout", ("hurry", "leave without us", "due now:", "starting now:", "go to bed!", "almost morning", "time's up")),
     ("angry", ("shouldn't be staying up", "shouldn't skip meals", "usage is high", "closing apps")),
     ("uneasy", ("are you sure", "cats can't", "couldn't find", "couldn't load", "couldn't update",
                 "isn't installed", "expired", "failed", "error")),
     ("excited", ("ooh", "whoa", "paying off", "awesome work", "great effort", "you made it",
                  "you're doing great", "you're doing awesome", "you've got this",
-                 "rooting for you", "get some good work")),
-    ("smug", ("focus session", "focused work", "lock in", "momentum", "steady progress")),
+                 "rooting for you", "get some good work", "rank up", "leveled up", "level up")),
+    ("smug", ("focus session", "focused work", "lock in", "momentum", "steady progress", "timer set", "logged +")),
     ("wink", ("good morning", "movie", "is open", "i'm awake", "disabled", "paused", "weather",
               "plenty of time", "schedule ahead", "clear until tomorrow", "take it easy",
               "enjoy your rest", "start on boot is enabled")),
