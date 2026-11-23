@@ -57,8 +57,8 @@ import sprites
 from sprites import EYE_CLOSED, EYE_HALF, EYE_OPEN, MOUTH_BASE, MorganaSprites
 from storage_manager import NoteStore, SettingsStore, TaskStore, parse_dt
 from theme import (BLACK, BLACK_BURST_SHARDS, BLUE, LIGHT_RED, MENU_QSS, RED,
-                   RED_BURST_SHARDS, WHITE, lerp_color, p5_font, pen, scale_polygon,
-                   star_polygon, tapered_wedge)
+                   RED_BURST_SHARDS, WHITE, lerp_color, p5_dialogue_font, p5_font, pen,
+                   scale_polygon, star_polygon, tapered_wedge)
 from ui_dialogs import NotesDialog, SettingsDialog, TasksDialog
 
 try:
@@ -748,7 +748,7 @@ class BubbleWindow(QWidget):
         self._below = False
         self._tail_x = 0
         self._closing = False
-        self._font = p5_font(14)
+        self._font = p5_dialogue_font(14)
         self._tag_font = p5_font(10)
         self._box = QPixmap(str(sprites.SPRITE_DIR / "textbox.png"))
         self._use_img = not self._box.isNull()
@@ -767,10 +767,10 @@ class BubbleWindow(QWidget):
     def show_message(self, text: str, ms: int) -> None:
         fm = QFontMetrics(self._font)
         self._lines = wrap_text(text, fm.horizontalAdvance, self.MAX_TEXT_W)
-        self._line_h = fm.height() + 3
+        self._line_h = fm.height() + 5
         self._ascent = fm.ascent()
         tw = max((fm.horizontalAdvance(ln) for ln in self._lines), default=0) + 6
-        self._text_h = len(self._lines) * self._line_h - 3
+        self._text_h = len(self._lines) * self._line_h - 5
         if self._use_img:
             self._sy = max(0.76, (self._text_h + 18) / (self.IMG_BOT - self.IMG_TOP))
             self._sx = min(self._sy, 0.96)         # sisi spike & kotak nama tetap proporsional
@@ -1576,17 +1576,17 @@ class PetController(QObject):
         self.pet = PetWindow(self.sprites, args.size)
         self.bubble = BubbleWindow(self.pet)
         self.menu = RadialMenu(self.pet)
-        self.pomodoro = PomodoroTimer(args.focus, args.rest, self)
-        self.monitor = SystemMonitor(self)
-
-        # data & integrasi Tahap 2
         self.tasks = TaskStore(APP_DIR / "tasks.json")
         self.notes = NoteStore(APP_DIR / "notes.json")
         self.settings = SettingsStore(APP_DIR / "settings.json")
-        if args.curfew is not None:               # --curfew/--wake menimpa pengaturan untuk sesi ini saja
+        if args.curfew is not None:               # CLI flags override for this session only
             self.settings.set(save=False, bedtime=args.curfew.strftime("%H:%M"))
         if args.wake is not None:
             self.settings.set(save=False, wake=args.wake.strftime("%H:%M"))
+        focus_m = args.focus if args.focus is not None else self.settings["focus_min"]
+        rest_m = args.rest if args.rest is not None else self.settings["rest_min"]
+        self.pomodoro = PomodoroTimer(focus_m, rest_m, self)
+        self.monitor = SystemMonitor(self)
         lines = load_lines(LINES_FILE)            # kalimat Morgana dari morgana_list.md
         self._greetings = lines["greeting"]
         self._bag_bedtime = LineBag(lines["bedtime"])
@@ -1723,25 +1723,22 @@ class PetController(QObject):
     def _open_tasks(self) -> None:
         if self.tasks_dialog is None:
             self.tasks_dialog = TasksDialog(self.tasks)
-            self.tasks_dialog.open_settings.connect(self._open_settings)
-            self.tasks_dialog.tasks_changed.connect(self._sync_notes_tasks)
+            self.tasks_dialog.set_on_top(self.on_top)
+            self.tasks_dialog.open_settings.connect(self._open_settings_deferred)
+            self.tasks_dialog.open_notes.connect(self._open_notes)
         self.tasks_dialog.show_near(self.pet.geometry())
 
     def _open_notes(self) -> None:
         if self.notes_dialog is None:
             self.notes_dialog = NotesDialog(self.notes, self.tasks)
-            self.notes_dialog.open_settings.connect(self._open_settings)
+            self.notes_dialog.set_on_top(self.on_top)
+            self.notes_dialog.open_settings.connect(self._open_settings_deferred)
             self.notes_dialog.open_tasks.connect(self._open_tasks)
-            self.notes_dialog.tasks_changed.connect(self._sync_tasks_dialog)
         self.notes_dialog.show_near(self.pet.geometry())
 
-    def _sync_notes_tasks(self) -> None:
-        if self.notes_dialog is not None and self.notes_dialog.isVisible():
-            self.notes_dialog.refresh_tasks()
-
-    def _sync_tasks_dialog(self) -> None:
-        if self.tasks_dialog is not None and self.tasks_dialog.isVisible():
-            self.tasks_dialog.refresh()
+    def _open_settings_deferred(self) -> None:
+        """Open Settings after any menu/button release finishes (prevents Windows focus burial)."""
+        QTimer.singleShot(0, self._open_settings)
 
     def _on_menu_action(self, key: str, anchor: QPoint) -> None:
         self.menu.close_menu()
@@ -1850,50 +1847,65 @@ class PetController(QObject):
         m = QMenu()
         m.setStyleSheet(MENU_QSS)
         self.system_menu = m
-        self.act_sys_status = m.addAction("System Status (CPU / RAM)", self._act_item)
-        self.act_sys_pomo = m.addAction("Focus Timer", self._act_heal)
-        self.act_sys_sleep = m.addAction("Sleep Mode", self._toggle_sleep_mode)
-        self.act_sys_bed = m.addAction("Bedtime")
+        self.act_sys_status = m.addAction("SYSTEM STATUS (CPU / RAM)", self._act_item)
+        self.act_sys_pomo = m.addAction("FOCUS TIMER", self._act_heal)
+        self.act_sys_sleep = m.addAction("SLEEP MODE", self._toggle_sleep_mode)
+        self.act_sys_bed = m.addAction("BEDTIME")
         self.act_sys_bed.setEnabled(False)
-        m.addAction("Settings...", self._open_settings)
+        m.addAction("SETTINGS...", self._open_settings_deferred)
         m.addSeparator()
-        m.addAction("Open VS Code", self._launch_vscode)
-        m.addAction("Open Terminal", self._launch_terminal)
+        m.addAction("OPEN VS CODE", self._launch_vscode)
+        m.addAction("OPEN TERMINAL", self._launch_terminal)
         m.aboutToShow.connect(self._refresh_system_menu)
 
     def _refresh_system_menu(self) -> None:
         if self.pomodoro.running:
-            self.act_sys_pomo.setText(f"Focus Timer: {fmt_mmss(self.pomodoro.remaining())} left")
+            self.act_sys_pomo.setText(f"FOCUS TIMER  ({fmt_mmss(self.pomodoro.remaining())} left)")
         else:
-            self.act_sys_pomo.setText(f"Start Focus Session ({self.args.focus:g} min)")
-        self.act_sys_sleep.setText("Wake Up (disable Sleep Mode)" if self.sleep_mode
-                                   else "Sleep Mode (take a break)")
+            mins = max(1, round(self.pomodoro.focus_s / 60))
+            self.act_sys_pomo.setText(f"START FOCUS  ({mins} min)")
+        self.act_sys_sleep.setText("WAKE UP  (Disable Sleep Mode)" if self.sleep_mode
+                                   else "SLEEP MODE  (Take a Break)")
         self.act_sys_bed.setText(self._bedtime_text())
 
     def _bedtime_text(self) -> str:
         if not self.curfew_enabled:
-            return "Bedtime reminder: off"
+            return "BEDTIME: Off"
         bed = self.settings.bedtime
         if self.curfew_active:
-            return f"Past bedtime ({bed:%H:%M})"
+            return f"BEDTIME: Past {bed:%H:%M}"
         now = datetime.now()
         target = datetime.combine(now.date(), bed)
         if target <= now:
             target += timedelta(days=1)
-        return f"Bedtime at {bed:%H:%M} (in {human_delta(target - now)})"
+        return f"BEDTIME: {bed:%H:%M}  (in {human_delta(target - now)})"
 
     def _open_settings(self) -> None:
         if self.settings_dialog is None:
-            self.settings_dialog = SettingsDialog(self.settings)
+            self.settings_dialog = SettingsDialog(
+                self.settings,
+                get_on_top=lambda: self.on_top,
+                get_autostart=autostart.is_enabled,
+            )
+            self.settings_dialog.set_on_top(self.on_top)
             self.settings_dialog.saved.connect(self.apply_settings)
+            self.settings_dialog.always_on_top_changed.connect(self.set_always_on_top)
+            self.settings_dialog.autostart_changed.connect(self._toggle_autostart)
+        # If Notes or Tasks is currently open, center Settings directly over it so it's never buried
+        for dlg in (self.notes_dialog, self.tasks_dialog):
+            if dlg is not None and dlg.isVisible():
+                self.settings_dialog.show_near(dlg.geometry(), prefer_center=True)
+                return
         self.settings_dialog.show_near(self.pet.geometry())
 
     def apply_settings(self) -> None:
-        """Dipanggil setelah pengaturan disimpan: langsung berlaku tanpa restart."""
+        """Apply saved settings immediately without restarting."""
         self.curfew_enabled = bool(self.settings["curfew_enabled"])
         self.act_curfew.blockSignals(True)
         self.act_curfew.setChecked(self.curfew_enabled)
         self.act_curfew.blockSignals(False)
+        self.pomodoro.focus_s = max(1, int(self.settings["focus_min"] * 60))
+        self.pomodoro.rest_s = max(1, int(self.settings["rest_min"] * 60))
         self._last_curfew_msg = None
         self._check_curfew()
 
@@ -1989,11 +2001,11 @@ class PetController(QObject):
         m.setStyleSheet(MENU_QSS)
         self.context_menu = m
 
-        state_menu = m.addMenu("Change State")
+        state_menu = m.addMenu("STATE")
         state_group = QActionGroup(m)
         state_group.setExclusive(True)
-        for label, key in (("Auto", "auto"), ("Idle", "idle"), ("Talking", "talking"),
-                           ("Sleepy", "sleepy"), ("Action", "action")):
+        for label, key in (("AUTO", "auto"), ("IDLE", "idle"), ("TALKING", "talking"),
+                           ("SLEEPY", "sleepy"), ("ACTION", "action")):
             act = QAction(label, m)
             act.setCheckable(True)
             act.setData(key)
@@ -2002,11 +2014,11 @@ class PetController(QObject):
             state_menu.addAction(act)
         state_group.triggered.connect(lambda a: self.set_forced_state(a.data()))
 
-        expr_menu = m.addMenu("Change Expression")
+        expr_menu = m.addMenu("EXPRESSION")
         expr_group = QActionGroup(m)
         expr_group.setExclusive(True)
         for key in ("auto",) + tuple(EXPRESSIONS):
-            act = QAction(key.title(), m)
+            act = QAction(key.upper(), m)
             act.setCheckable(True)
             act.setData(key)
             act.setChecked(key == "auto")
@@ -2014,11 +2026,11 @@ class PetController(QObject):
             expr_menu.addAction(act)
         expr_group.triggered.connect(lambda a: self.set_forced_expression(a.data()))
 
-        size_menu = m.addMenu("Sprite Size")
+        size_menu = m.addMenu("SPRITE SIZE")
         size_group = QActionGroup(m)
         size_group.setExclusive(True)
         for px in SPRITE_SIZES:
-            act = QAction(f"{px} px", m)
+            act = QAction(f"{px} PX", m)
             act.setCheckable(True)
             act.setData(px)
             act.setChecked(px == self.args.size)
@@ -2027,26 +2039,26 @@ class PetController(QObject):
         size_group.triggered.connect(lambda a: self.set_size(int(a.data())))
 
         m.addSeparator()
-        top = m.addAction("Always on Top")
-        top.setCheckable(True)
-        top.setChecked(True)
-        top.toggled.connect(self.set_always_on_top)
+        self.act_top = m.addAction("ALWAYS ON TOP")
+        self.act_top.setCheckable(True)
+        self.act_top.setChecked(True)
+        self.act_top.toggled.connect(self.set_always_on_top)
 
-        self.act_curfew = m.addAction("Bedtime Reminder")
+        self.act_curfew = m.addAction("BEDTIME REMINDER")
         self.act_curfew.setCheckable(True)
         self.act_curfew.setChecked(self.curfew_enabled)
         self.act_curfew.toggled.connect(self.set_curfew_enabled)
-        m.addAction("Settings...", self._open_settings)
+        m.addAction("SETTINGS...", self._open_settings_deferred)
 
-        self.act_autostart = m.addAction("Start on Boot")
+        self.act_autostart = m.addAction("START ON BOOT")
         self.act_autostart.setCheckable(True)
         self.act_autostart.setChecked(autostart.is_enabled())
         self.act_autostart.triggered.connect(self._toggle_autostart)
 
-        self.act_stop_pomo = m.addAction("Stop Focus Timer", self._stop_pomodoro)
-        m.addAction("Reset Position to Corner", self.reset_position)
+        self.act_stop_pomo = m.addAction("STOP FOCUS TIMER", self._stop_pomodoro)
+        m.addAction("RESET POSITION", self.reset_position)
         m.addSeparator()
-        m.addAction("Quit", self.quit)
+        m.addAction("QUIT", self.quit)
         m.aboutToShow.connect(self._refresh_context_menu)
 
     def _refresh_context_menu(self) -> None:
@@ -2097,10 +2109,16 @@ class PetController(QObject):
 
     def set_always_on_top(self, on: bool) -> None:
         self.on_top = on
+        self.act_top.blockSignals(True)
+        self.act_top.setChecked(on)
+        self.act_top.blockSignals(False)
         was_visible = self.pet.isVisible()
         for w in (self.pet, self.bubble):
-            w.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, on)   # ini menyembunyikan window
+            w.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, on)
         self.menu.set_on_top(on)
+        for dlg in (self.tasks_dialog, self.notes_dialog, self.settings_dialog):
+            if dlg is not None:
+                dlg.set_on_top(on)
         if was_visible:
             self.pet.show()
 
@@ -2128,8 +2146,8 @@ def hhmm(value: str) -> dtime:
 def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     ap = argparse.ArgumentParser(description="Morgana Companion - Persona 5 desktop pet")
     ap.add_argument("--size", type=int, default=DEFAULT_SPRITE, help="sprite size in px (default 180)")
-    ap.add_argument("--focus", type=float, default=25, help="Pomodoro focus duration in minutes (default 25)")
-    ap.add_argument("--rest", type=float, default=5, help="Pomodoro break duration in minutes (default 5)")
+    ap.add_argument("--focus", type=float, default=None, help="Pomodoro focus duration in minutes for this session (default: Settings)")
+    ap.add_argument("--rest", type=float, default=None, help="Pomodoro break duration in minutes for this session (default: Settings)")
     ap.add_argument("--curfew", type=hhmm, default=None, help="bedtime start HH:MM for this session (normally set in Settings)")
     ap.add_argument("--wake", type=hhmm, default=None, help="bedtime reminder stop HH:MM for this session")
     ap.add_argument("--chatter", type=float, default=4.0, help="average minutes between idle remarks (default 4)")
