@@ -1,0 +1,6 @@
+Bundled open-source fonts (all licensed under the SIL Open Font License 1.1):
+- Anton (Vernon Adams) — ofl/anton
+- Barlow Condensed (Jeremy Tribby) — ofl/barlowcondensed
+- Arsenal (Andrij Shevchenko) — ofl/arsenal
+
+Source: https://github.com/google/fonts
