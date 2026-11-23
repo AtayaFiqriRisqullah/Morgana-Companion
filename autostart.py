@@ -53,7 +53,7 @@ def build_desktop_entry(python_exe: str, script: Path) -> str:
         "Type=Application\n"
         "Version=1.0\n"
         "Name=Desktop Coding Pet\n"
-        "Comment=Teman coding bergaya Persona 5\n"
+        "Comment=Persona 5 style desktop companion\n"
         f"Exec={exec_line}\n"
         f"Path={script.parent}\n"
         "Terminal=false\n"
@@ -91,7 +91,7 @@ def set_enabled(on: bool, script: Path) -> tuple[bool, str]:
             return _set_linux(on, script)
     except OSError as exc:
         return False, str(exc)
-    return False, "OS ini belum didukung untuk auto-start"
+    return False, "Auto-start is not supported on this OS yet"
 
 
 def _set_windows(on: bool, script: Path) -> tuple[bool, str]:
@@ -106,7 +106,7 @@ def _set_windows(on: bool, script: Path) -> tuple[bool, str]:
             winreg.DeleteValue(key, APP_ID)
     except FileNotFoundError:
         pass                                           # memang belum terpasang
-    return True, "dihapus"
+    return True, "removed"
 
 
 def _set_linux(on: bool, script: Path) -> tuple[bool, str]:
@@ -119,4 +119,4 @@ def _set_linux(on: bool, script: Path) -> tuple[bool, str]:
         path.unlink()
     except FileNotFoundError:
         pass
-    return True, "dihapus"
+    return True, "removed"

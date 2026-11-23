@@ -87,44 +87,44 @@ def parse_event(item: dict) -> CalendarEvent | None:
             return None
     except (ValueError, KeyError):
         return None
-    return CalendarEvent(id=item.get("id", ""), title=item.get("summary") or "(tanpa judul)",
+    return CalendarEvent(id=item.get("id", ""), title=item.get("summary") or "(untitled)",
                          start=start, end=end, all_day=all_day)
 
 
 def human_delta(td: timedelta) -> str:
     mins = int(td.total_seconds() // 60)
     if mins < 1:
-        return "kurang dari 1 menit"
+        return "less than 1 min"
     if mins < 60:
-        return f"{mins} menit"
+        return f"{mins} min"
     hours, m = divmod(mins, 60)
     if hours < 24:
-        return f"{hours} jam {m} menit" if m else f"{hours} jam"
+        return f"{hours}h {m}m" if m else f"{hours}h"
     days, h = divmod(hours, 24)
-    return f"{days} hari {h} jam" if h else f"{days} hari"
+    return f"{days}d {h}h" if h else f"{days}d"
 
 
 def day_label(when: datetime, now: datetime) -> str:
     diff = (when.date() - now.date()).days
     if diff == 0:
-        return "hari ini"
+        return "today"
     if diff == 1:
-        return "besok"
+        return "tomorrow"
     return f"{when:%d %b}"
 
 
 def format_agenda(result: CalendarResult, now: datetime | None = None) -> str:
-    """Teks untuk balon dialog: acara terdekat + waktu mulai + sisa waktu."""
+    """Dialog bubble text: nearest event + start time + remaining time."""
     now = now or datetime.now().astimezone()
     if result.status == "error":
-        return f"Gagal mengambil jadwal: {result.message}"
+        return f"Couldn't load your schedule: {result.message}"
 
     prefix = ""
     if result.status == "no_credentials":
-        prefix = ("credentials.json belum ada, jadi ini jadwal contoh. "
-                  "Panduan langkah demi langkah ada di bagian atas calendar_service.py.\n")
+        prefix = ("credentials.json isn't set up yet, so here's a sample schedule. "
+                  "See the setup guide at the top of calendar_service.py.\n")
     elif result.status == "no_libs":
-        prefix = f"Library Google belum terpasang, jadi ini jadwal contoh. Jalankan: {PIP_HINT}\n"
+        prefix = f"Google Calendar packages aren't installed yet, so here's a sample schedule. Run: {PIP_HINT}\n"
 
     timed = sorted((e for e in result.events if not e.all_day), key=lambda e: e.start)
     ongoing = [e for e in timed if e.start <= now and (e.end is None or e.end > now)]
@@ -134,16 +134,16 @@ def format_agenda(result: CalendarResult, now: datetime | None = None) -> str:
     lines: list[str] = []
     if ongoing:
         ev = ongoing[0]
-        until = f" (sampai {ev.end:%H:%M})" if ev.end else ""
-        lines.append(f"Sedang berlangsung: {ev.title}{until}")
+        until = f" (until {ev.end:%H:%M})" if ev.end else ""
+        lines.append(f"Happening now: {ev.title}{until}")
     if upcoming:
         ev = upcoming[0]
-        lines.append(f"Acara berikutnya: {ev.title} dalam {human_delta(ev.start - now)}!")
-        lines.append(f"Mulai {ev.start:%H:%M} ({day_label(ev.start, now)})")
+        lines.append(f"Next up: {ev.title} in {human_delta(ev.start - now)}!")
+        lines.append(f"Starts at {ev.start:%H:%M} ({day_label(ev.start, now)})")
     elif not ongoing:
-        lines.append("Tidak ada acara tersisa sampai besok. Santai, atau cicil tugasmu!")
+        lines.append("Your schedule is clear until tomorrow! Relax, or chip away at your tasks.")
     if all_day:
-        lines.append(f"Seharian: {all_day[0].title}")
+        lines.append(f"All day: {all_day[0].title}")
     return prefix + "\n".join(lines)
 
 
@@ -181,7 +181,7 @@ class CalendarService:
                 return CalendarResult(self._fetch(libs, interactive), "ok")
         except AuthRequired:
             return CalendarResult([], "auth_needed",
-                                  "Izin Google kedaluwarsa. Klik AGENDA untuk login ulang.")
+                                  "Google authorization expired. Click AGENDA to sign in again.")
         except Exception as exc:                       # jaringan, kuota, login dibatalkan, dll.
             log.warning("Gagal mengambil kalender: %s", exc)
             return CalendarResult([], "error", _short(exc))
@@ -233,11 +233,11 @@ class CalendarService:
             t0 = datetime.now().astimezone().replace(second=0, microsecond=0)
             tomorrow9 = (t0 + timedelta(days=1)).replace(hour=9, minute=0)
             self._dummy = [
-                CalendarEvent("dummy-1", "Kuliah Jarkom (contoh)", t0 + timedelta(minutes=25),
+                CalendarEvent("dummy-1", "Study Session (sample)", t0 + timedelta(minutes=25),
                               t0 + timedelta(minutes=125), is_dummy=True),
-                CalendarEvent("dummy-2", "Diskusi tim (contoh)", t0 + timedelta(hours=4),
+                CalendarEvent("dummy-2", "Team Sync (sample)", t0 + timedelta(hours=4),
                               t0 + timedelta(hours=5), is_dummy=True),
-                CalendarEvent("dummy-3", "Kumpul tugas (contoh)", tomorrow9,
+                CalendarEvent("dummy-3", "Project Deadline (sample)", tomorrow9,
                               tomorrow9 + timedelta(hours=1), is_dummy=True),
             ]
         now = datetime.now().astimezone()

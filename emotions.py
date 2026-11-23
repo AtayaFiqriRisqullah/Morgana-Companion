@@ -1,28 +1,25 @@
 # -*- coding: utf-8 -*-
-"""Pemilihan ekspresi Morgana dari isi dialog. Tanpa dependensi Qt.
+"""Select Morgana's expression from dialog text. No Qt dependency.
 
-Ekspresi (kunci) -> sprite di folder `Morgana/` (lihat sprites.py):
+Expression keys -> sprites in `Morgana/` (see sprites.py):
 
-    neutral   b003_000   senyum biasa (default)
-    wink      b003_001   mata memicing/kedip senang
-    serious   b003_002   alis turun, serius
-    worried   b003_003   ragu / cemas
-    angry     b003_004   menoleh, geram (gigi terkatup)
-    sad       b003_005   lesu, berkeringat
-    uneasy    b003_007   tidak nyaman / bingung
-    excited   b003_008   mata bintang
-    shout     b003_010   berteriak / panik
-    smug      b003_011   menyeringai percaya diri
-
-`emotion_for_text` membaca kalimat (kalimat Morgana berbahasa Inggris dan pesan
-program berbahasa Indonesia) lalu memilih ekspresi yang paling cocok.
+    neutral   b003_000   default smile
+    wink      b003_001   happy closed/winking eyes
+    serious   b003_002   furrowed brows, focused
+    worried   b003_003   concerned / hesitant
+    angry     b003_004   turned, annoyed (clenched teeth)
+    sad       b003_005   tired / sweating
+    uneasy    b003_007   awkward / unsure
+    excited   b003_008   starry eyes
+    shout     b003_010   shouting / urgent
+    smug      b003_011   confident grin
 """
 from __future__ import annotations
 
 EXPRESSIONS = ("neutral", "wink", "serious", "worried", "angry", "sad",
                "uneasy", "excited", "shout", "smug")
 
-# Ekspresi dasar tiap state gerak (idle / talking / sleepy / action).
+# Base expression for each motion state (idle / talking / sleepy / action).
 STATE_EXPRESSION = {
     "idle": "neutral",
     "talking": "neutral",
@@ -30,27 +27,29 @@ STATE_EXPRESSION = {
     "action": "smug",
 }
 
-# Urutan penting: aturan pertama yang cocok menang. Kata kunci ditulis huruf kecil.
+# Order matters: first matching rule wins. All keywords are lowercase.
 _RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("shout", ("hurry", "leave without us", "sekarang:", "go to bed!", "almost morning")),
-    ("angry", ("shouldn't be staying up", "shouldn't skip meals", "tutup aplikasi",
-               "cpu/ram tinggi")),
-    ("uneasy", ("are you sure", "cats can't", "tidak ditemukan", "belum terpasang",
-                "gagal", "galat", "error")),
-    ("smug", ("ngoding", "fokus")),
-    ("excited", ("ooh", "whoa", "paying off", "kerja bagus", "ayo mulai")),
-    ("wink", ("good morning", "movie", "dibuka.", "dimatikan", "dihentikan", "weather",
-              "plenty of time", "schedule ahead")),
+    ("shout", ("hurry", "leave without us", "due now:", "starting now:", "go to bed!", "almost morning")),
+    ("angry", ("shouldn't be staying up", "shouldn't skip meals", "usage is high", "closing apps")),
+    ("uneasy", ("are you sure", "cats can't", "couldn't find", "couldn't load", "couldn't update",
+                "isn't installed", "expired", "failed", "error")),
+    ("excited", ("ooh", "whoa", "paying off", "awesome work", "great effort", "you made it",
+                 "you're doing great", "you're doing awesome", "you've got this",
+                 "rooting for you", "get some good work")),
+    ("smug", ("focus session", "focused work", "lock in", "momentum", "steady progress")),
+    ("wink", ("good morning", "movie", "is open", "i'm awake", "disabled", "paused", "weather",
+              "plenty of time", "schedule ahead", "clear until tomorrow", "take it easy",
+              "enjoy your rest", "start on boot is enabled")),
     ("worried", ("test tomorrow", "don't forget", "deadline", "part-time", "raining",
-                 "time flies", "acara berikutnya", "acara mendekat")),
-    ("sad", ("tired", "worn out", "sleep", "rest up", "well-rested", "bath", "mode tidur")),
+                 "time flies", "upcoming event", "next up:", "pending task")),
+    ("sad", ("tired", "worn out", "sleep", "rest up", "well-rested", "bath", "sleep mode is on")),
     ("serious", ("shouldn't you", "study", "read a book", "guard down",
-                 "money", "gym", "water your plant", "tugas")),
+                 "money", "gym", "water your plant")),
 )
 
 
 def emotion_for_text(text: str, default: str = "neutral") -> str:
-    """Kembalikan kunci ekspresi untuk `text`; `default` jika tak ada yang cocok."""
+    """Return an expression key for `text`, or `default` if nothing matches."""
     low = text.lower()
     for emotion, keywords in _RULES:
         if any(k in low for k in keywords):
