@@ -3,7 +3,7 @@
 Desktop companion bot themed after Morgana from Persona 5. Built with PyQt6.
 
 ## Features
-- Floating pet overlay with a Persona 5 style text box (`Morgana/textbox.png`) and a battle-menu style radial menu, both with red and black spikes
+- Floating pet overlay with `Morgana/textbox.png` (tilted nameplate + 3-slice dialogue box) and a Persona 5 battle-menu style radial menu with radiating red-black spikes behind Morgana and a spinning star on hover
 - Persona 5 Morgana sprites: 10 expressions, blinking eyes, and a mouth that moves while text is typed. The expression follows the dialogue (e.g. shouting for "Go to bed!", excited for "Ooh, we can do this!")
 - Tasks, notes (with deadlines) and settings dialogs in Persona 5 style
 - Bedtime reminders and Morgana quotes (edit `morgana_list.md`)
