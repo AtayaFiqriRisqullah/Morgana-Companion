@@ -4,6 +4,7 @@ Desktop companion bot themed after Morgana from Persona 5. Built with PyQt6.
 
 ## Features
 - Floating pet overlay with speech bubble and radial menu
+- Persona 5 Morgana sprites: 10 expressions, blinking eyes, and a mouth that moves while text is typed. The expression follows the dialogue (e.g. smug for "Looking cool, Joker!", shouting for "Go to bed!")
 - Tasks, notes (with deadlines) and settings dialogs in Persona 5 style
 - Bedtime reminders and Morgana quotes (edit `morgana_list.md`)
 - Read-only Google Calendar agenda (sample events when not configured)
@@ -32,5 +33,7 @@ python main.py        # see: python main.py --help
 | `storage_manager.py` | JSON storage |
 | `calendar_service.py` | Google Calendar |
 | `lines.py` / `morgana_list.md` | dialogue |
+| `emotions.py` | picks an expression from the dialogue text |
+| `sprites.py` | composes base sprite + eye/mouth patches at their pixel offsets |
 | `autostart.py` | start on boot |
-| `Morgana/` | sprite images |
+| `Morgana/` | sprite images (`_e1` closed eyes, `_e2` half-closed, `_m1`-`_m3` mouth) |
