@@ -56,8 +56,9 @@ from lines import LineBag, greeting_pool, load_lines
 import sprites
 from sprites import EYE_CLOSED, EYE_HALF, EYE_OPEN, MOUTH_BASE, MorganaSprites
 from storage_manager import NoteStore, SettingsStore, TaskStore, parse_dt
-from theme import (BLACK, BLUE, LIGHT_RED, MENU_QSS, RED, WHITE, lerp_color, p5_font, pen,
-                   spike_border, star_polygon)
+from theme import (BLACK, BLACK_BURST_SHARDS, BLUE, LIGHT_RED, MENU_QSS, RED,
+                   RED_BURST_SHARDS, WHITE, lerp_color, p5_font, pen, scale_polygon,
+                   star_polygon, tapered_wedge)
 from ui_dialogs import NotesDialog, SettingsDialog, TasksDialog
 
 try:
@@ -716,21 +717,22 @@ def wrap_text(text: str, measure, max_w: int) -> list[str]:
 class BubbleWindow(QWidget):
     """Balon dialog: muncul membesar dari kepala karakter (pegas + sedikit putar), teks
     mengetik per huruf, tutup dengan menyusut. Bingkai memakai Morgana/textbox.png (dipotong 3
-    supaya bisa melebar mengikuti teks) dengan spike merah-hitam di belakangnya, plus name tag
-    merah. Jika textbox.png tidak ada: kotak miring hitam + bayangan merah + ekor runcing."""
+    supaya melebar mengikuti teks, nama MORGANA ditulis miring di dalam kotak nama putihnya).
+    Jika textbox.png tidak ada: kotak miring hitam + bayangan merah + ekor runcing."""
 
     dismissed = pyqtSignal()
     typing_finished = pyqtSignal()          # semua huruf sudah tampil (mulut karakter berhenti)
 
-    MAX_TEXT_W = 300
-    M, PADX, PADY = 34, 16, 6                 # M = ruang di sekeliling (untuk spike)
-    TAIL_H, TAG_OVER, SHADOW, SLANT = 16, 12, 7, 10   # TAIL_H/SHADOW/SLANT: hanya bingkai cadangan
-    # textbox.png (600x173): area hitam yang bisa ditulisi ada di x 235..465, y 60..137.
-    # Gambar dipotong kiri | tengah | kanan: sisi kiri & kanan (spike putih) hanya diskalakan,
-    # bagian tengah direntangkan sesuai panjang teks.
+    MAX_TEXT_W = 320
+    M, PADX, PADY = 22, 16, 8
+    TAIL_H, TAG_OVER, SHADOW, SLANT = 16, 12, 7, 10   # hanya untuk bingkai cadangan
+    # textbox.png (600x173): kotak nama putih miring di kiri atas; area hitam teks mulai x=114
+    # sampai x=460 (spike putih kanan mulai masuk di ~470). Dipotong di IMG_L & IMG_R supaya
+    # bagian tengah direntangkan tanpa merusak sudut kiri/kanan.
     IMG_W, IMG_H = 600, 173
-    IMG_L, IMG_R = 235, 465          # spike putih kanan mulai masuk ke area hitam di x~470
-    IMG_TOP, IMG_BOT = 60, 137
+    IMG_L, IMG_R = 225, 460
+    TEXT_L = 114
+    IMG_TOP, IMG_BOT = 62, 124
 
     def __init__(self, pet: PetWindow) -> None:
         super().__init__()
@@ -750,9 +752,10 @@ class BubbleWindow(QWidget):
         self._tag_font = p5_font(10)
         self._box = QPixmap(str(sprites.SPRITE_DIR / "textbox.png"))
         self._use_img = not self._box.isNull()
-        self._tail_h = 0 if self._use_img else self.TAIL_H      # textbox.png tanpa ekor
-        self._s = 1.0                              # skala gambar bingkai
+        self._tail_h = 0 if self._use_img else self.TAIL_H
+        self._sx = self._sy = 1.0                  # skala horizontal sisi & skala vertikal bingkai
         self._cap_l = self._cap_r = 0.0
+        self._mid_w = 0.0
         self._text_h = 0
         self._show = Spring(0.0, 300.0, 19.0)      # 0 = hilang, 1 = tampil (overshoot sedikit)
         self._hide_timer = QTimer(self)
@@ -766,24 +769,27 @@ class BubbleWindow(QWidget):
         self._lines = wrap_text(text, fm.horizontalAdvance, self.MAX_TEXT_W)
         self._line_h = fm.height() + 3
         self._ascent = fm.ascent()
-        tw = max((fm.horizontalAdvance(ln) for ln in self._lines), default=0) + 4
+        tw = max((fm.horizontalAdvance(ln) for ln in self._lines), default=0) + 6
         self._text_h = len(self._lines) * self._line_h - 3
         if self._use_img:
-            # tinggi bingkai mengikuti jumlah baris; sisi kiri/kanan ikut diskalakan seragam
-            self._s = max(0.55, (self._text_h + 2 * self.PADY) / (self.IMG_BOT - self.IMG_TOP))
-            sx = min(self._s, 0.9)               # sisi spike tidak ikut melebar saat teks banyak
-            self._cap_l = self.IMG_L * sx
-            self._cap_r = (self.IMG_W - self.IMG_R) * sx
-            self._bw = int(self._cap_l + max(tw, 60) + 2 * self.PADX + self._cap_r)
-            self._bh = int(self.IMG_H * self._s)
+            self._sy = max(0.76, (self._text_h + 18) / (self.IMG_BOT - self.IMG_TOP))
+            self._sx = min(self._sy, 0.96)         # sisi spike & kotak nama tetap proporsional
+            self._cap_l = self.IMG_L * self._sx
+            self._cap_r = (self.IMG_W - self.IMG_R) * self._sx
+            left_usable = (self.IMG_L - self.TEXT_L) * self._sx
+            self._mid_w = max(36.0, tw + self.PADX - left_usable)
+            self._bw = int(self._cap_l + self._mid_w + self._cap_r)
+            self._bh = int(self.IMG_H * self._sy)
         else:
             self._bw = max(tw, 60) + 2 * self.PADX
             self._bh = len(self._lines) * self._line_h + 2 * self.PADY - 2
         self._total = sum(len(ln) for ln in self._lines)
         self._reveal = 0.0
         self._speed = max(55.0, self._total / 1.15)            # teks panjang tetap selesai ~1 detik
-        self.setFixedSize(self._bw + 2 * self.M + self.SHADOW,
-                          self._bh + self.TAG_OVER + self._tail_h + 2 * self.M + self.SHADOW)
+        tag_over = 0 if self._use_img else self.TAG_OVER
+        shadow = 0 if self._use_img else self.SHADOW
+        self.setFixedSize(self._bw + 2 * self.M + shadow,
+                          self._bh + tag_over + self._tail_h + 2 * self.M + shadow)
 
         self._closing = False
         self._show.configure(300.0, 19.0)
@@ -833,42 +839,43 @@ class BubbleWindow(QWidget):
         area = screen.availableGeometry()
         w = self.width()
         size = self._pet.sprite_size
+        tag_over = 0 if self._use_img else self.TAG_OVER
 
-        head_y = pet.top() + PAD + int(size * 0.10)          # ujung ekor menunjuk kepala
-        tip_local = self.M + self.TAG_OVER + self._bh + self._tail_h
+        head_y = pet.top() + PAD + int(size * 0.10)          # titik acuan di atas kepala
+        tip_local = self.M + tag_over + self._bh + self._tail_h
         y = head_y - tip_local
         self._below = y < area.top()
         if self._below:                                      # tidak muat di atas -> taruh di bawah
             foot_y = pet.bottom() - PAD - int(size * 0.04)
-            y = foot_y - (self.M + self.TAG_OVER)
+            y = foot_y - (self.M + tag_over)
         x = pet.center().x() - w // 2
         x = max(area.left(), min(x, area.right() - w))
         self._tail_x = max(self.M + 24, min(pet.center().x() - x, w - self.M - self.SHADOW - 34))
         self.move(x, y)
 
     def _paint_box(self, p: QPainter, x0: float, y0: float) -> None:
-        """Spike merah-hitam di belakang, lalu textbox.png (3 potongan) di atasnya."""
-        s_, pm = self._s, self._box
-        h = self.IMG_H * s_
-        inner_w = self._bw - self._cap_l - self._cap_r
+        """Gambar textbox.png (3 potongan) lalu tulis PET_NAME di dalam kotak nama putih miring."""
+        pm = self._box
+        h = self.IMG_H * self._sy
         L, R = self.IMG_L, self.IMG_R
-
-        body = QRectF(x0 + self._cap_l * 0.45, y0 + 40 * s_,
-                      self._bw - self._cap_l * 0.45 - self._cap_r * 0.4, 118 * s_)
-        k = max(0.9, s_)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(RED)
-        p.drawPolygon(spike_border(body.adjusted(-2, -2, 2, 2), length=24 * k, step=30 * k, seed=3))
-        p.setBrush(BLACK)
-        p.drawPolygon(spike_border(body.adjusted(1, 1, -1, -1).translated(3, 2),
-                                   length=15 * k, step=22 * k, seed=11))
-
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        p.drawPixmap(QRectF(x0 + self._cap_l - 0.5, y0, inner_w + 1.0, h), pm,      # tengah (direntang)
+        p.drawPixmap(QRectF(x0 + self._cap_l - 0.6, y0, self._mid_w + 1.2, h), pm,
                      QRectF(L, 0, R - L, self.IMG_H))
         p.drawPixmap(QRectF(x0, y0, self._cap_l, h), pm, QRectF(0, 0, L, self.IMG_H))
-        p.drawPixmap(QRectF(x0 + self._cap_l + inner_w, y0, self._cap_r, h), pm,
+        p.drawPixmap(QRectF(x0 + self._cap_l + self._mid_w, y0, self._cap_r, h), pm,
                      QRectF(R, 0, self.IMG_W - R, self.IMG_H))
+
+        # Kotak nama putih miring bawaan textbox.png: tepi atas (60,44)->(185,11), pusat (129,38)
+        p.save()
+        p.translate(x0 + 129.0 * self._sx, y0 + 38.0 * self._sy)
+        angle = math.degrees(math.atan2((11.0 - 44.0) * self._sy, (185.0 - 60.0) * self._sx))
+        p.rotate(angle)
+        tag_f = p5_font(max(11, int(17 * min(self._sx, self._sy))), italic=False)
+        p.setFont(tag_f)
+        p.setPen(BLACK)
+        p.drawText(QRectF(-65.0 * self._sx, -14.0 * self._sy, 130.0 * self._sx, 28.0 * self._sy),
+                   Qt.AlignmentFlag.AlignCenter.value, PET_NAME)
+        p.restore()
 
     def _paint_box_fallback(self, p: QPainter, x0: float, y0: float, tx: float, sv: float) -> None:
         s = self.SLANT
@@ -902,6 +909,17 @@ class BubbleWindow(QWidget):
         p.drawPolygon(star_polygon(0, 0, 11, 5, 5))
         p.restore()
 
+        p.setFont(self._tag_font)                 # name tag merah cadangan
+        tag_w = QFontMetrics(self._tag_font).horizontalAdvance(PET_NAME) + 20
+        tx0, ty0, th = x0 + 4, y0 - self.TAG_OVER, 20
+        tag = QPolygonF([QPointF(tx0 + 7, ty0), QPointF(tx0 + tag_w, ty0),
+                         QPointF(tx0 + tag_w - 7, ty0 + th), QPointF(tx0, ty0 + th)])
+        p.setPen(pen(WHITE, 2))
+        p.setBrush(RED)
+        p.drawPolygon(tag)
+        p.setPen(WHITE)
+        p.drawText(QRectF(tx0, ty0, tag_w, th), Qt.AlignmentFlag.AlignCenter.value, PET_NAME)
+
     def paintEvent(self, _event) -> None:
         sv = self._show.value
         if clamp(sv * 1.8) <= 0.01 or not self._lines:
@@ -911,7 +929,8 @@ class BubbleWindow(QWidget):
         p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
         p.setOpacity(clamp(sv * 1.8))
         M = self.M
-        top = M + self.TAG_OVER + (self._tail_h if self._below else 0)
+        tag_over = 0 if self._use_img else self.TAG_OVER
+        top = M + tag_over + (self._tail_h if self._below else 0)
         x0, y0, y1 = M, top, top + self._bh
         tx = self._tail_x
         tip_y = (y0 - self._tail_h) if self._below else (y1 + self._tail_h)
@@ -925,9 +944,9 @@ class BubbleWindow(QWidget):
 
         if self._use_img:
             self._paint_box(p, x0, y0)
-            text_x = x0 + self._cap_l + self.PADX
-            inner_h = (self.IMG_BOT - self.IMG_TOP) * self._s       # tengah vertikal area hitam
-            text_y = y0 + self.IMG_TOP * self._s + (inner_h - self._text_h) / 2 + self._ascent
+            text_x = x0 + self.TEXT_L * self._sx
+            inner_h = (self.IMG_BOT - self.IMG_TOP) * self._sy      # tengah vertikal area hitam
+            text_y = y0 + self.IMG_TOP * self._sy + (inner_h - self._text_h) / 2 + self._ascent
         else:
             self._paint_box_fallback(p, x0, y0, tx, sv)
             text_x = x0 + self.PADX
@@ -944,74 +963,94 @@ class BubbleWindow(QWidget):
             remaining -= len(line)
             ty += self._line_h
 
-        p.setFont(self._tag_font)                 # name tag merah ala dialog Persona
-        tag_w = QFontMetrics(self._tag_font).horizontalAdvance(PET_NAME) + 20
-        th = 20
-        if self._use_img:                         # menempel di tepi atas area hitam
-            tx0, ty0 = x0 + self._cap_l + 2, y0 + 49 * self._s - th / 2 - 3
-        else:
-            tx0, ty0 = x0 + 4, y0 - self.TAG_OVER
-        tag = QPolygonF([QPointF(tx0 + 7, ty0), QPointF(tx0 + tag_w, ty0),
-                         QPointF(tx0 + tag_w - 7, ty0 + th), QPointF(tx0, ty0 + th)])
-        p.setPen(pen(WHITE, 2))
-        p.setBrush(RED)
-        p.drawPolygon(tag)
-        p.setPen(WHITE)
-        p.drawText(QRectF(tx0, ty0, tag_w, th), Qt.AlignmentFlag.AlignCenter.value, PET_NAME)
-
     def mousePressEvent(self, e) -> None:
         self.dismiss()
 
 
 # ---------------------------------------------------------------------------
-# 5. MENU RADIAL
+# 5. MENU RADIAL (gaya menu battle Persona 5)
 # ---------------------------------------------------------------------------
 @dataclass
 class MenuButton:
     key: str
     label: str
     sub: str
-    sx: int            # arah kuadran: -1 kiri / +1 kanan
-    sy: int            # -1 atas / +1 bawah
-    rot: float         # kemiringan dasar (derajat)
+    side: int          # -1 kiri / +1 kanan karakter
+    ox: float          # posisi pangkal (relatif terhadap pusat ledakan, skala dasar 180 px)
+    oy: float
+    rot: float         # sudut kipas (derajat)
+    length: float      # panjang bilah trapesium (skala dasar 180 px)
+    h_in: float        # tinggi di sisi karakter (sempit)
+    h_out: float       # tinggi di sisi luar (melebar)
+    hi: int            # indeks huruf yang dibalik hitam-putih (gaya cutout Persona 5)
     phase: float       # fase gerak melayang
     pop: Spring = field(default_factory=lambda: Spring(0.0, 230.0, 15.0))     # muncul (memantul)
-    hover: Spring = field(default_factory=lambda: Spring(0.0, 380.0, 26.0))   # sapuan merah
+    hover: Spring = field(default_factory=lambda: Spring(0.0, 380.0, 26.0))   # sapuan merah + bintang
     press: Spring = field(default_factory=lambda: Spring(0.0, 700.0, 36.0))   # mengempis saat ditekan
-    px: float = 0.0    # posisi relatif (kali rx / ry); tersebar berselang-seling seperti menu battle P5
-    py: float = 0.0
-    icon: str = ""     # simbol tombol controller: triangle / square / circle / cross
-    red: QPolygonF = field(default_factory=QPolygonF)     # spike merah di belakang tombol
-    black: QPolygonF = field(default_factory=QPolygonF)   # spike hitam di atas spike merah
 
 
-def draw_symbol(p: QPainter, kind: str, r: float) -> None:
-    """Simbol tombol controller (garis saja) di titik (0, 0)."""
-    if kind == "triangle":
-        p.drawPolygon(QPolygonF([QPointF(0, -r), QPointF(r * 0.95, r * 0.7), QPointF(-r * 0.95, r * 0.7)]))
-    elif kind == "square":
-        p.drawRect(QRectF(-r * 0.78, -r * 0.78, r * 1.56, r * 1.56))
-    elif kind == "circle":
-        p.drawEllipse(QPointF(0, 0), r * 0.88, r * 0.88)
-    elif kind == "cross":
-        k = r * 0.78
-        p.drawLine(QPointF(-k, -k), QPointF(k, k))
-        p.drawLine(QPointF(k, -k), QPointF(-k, k))
+class MenuBackdrop(QWidget):
+    """Lapisan serpihan spike merah-hitam yang memancar dari BELAKANG karakter.
+    Tembus klik (WindowTransparentForInput) dan selalu berada di bawah PetWindow."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        setup_overlay(self)
+        self.setWindowFlag(Qt.WindowType.WindowTransparentForInput, True)
+        self._u = 1.0
+        self._burst = 0.0
+        self._t = 0.0
+        self._red: list[QPolygonF] = []
+        self._black: list[QPolygonF] = []
+
+    def configure(self, w: int, h: int, u: float) -> None:
+        self.setFixedSize(w, h)
+        self._u = u
+        cx, cy = w / 2.0, h / 2.0 + 18.0 * u
+        self._red = [scale_polygon(pts, cx, cy, u) for pts in RED_BURST_SHARDS]
+        self._black = [scale_polygon(pts, cx, cy, u) for pts in BLACK_BURST_SHARDS]
+
+    def set_anim(self, burst: float, t: float) -> None:
+        self._burst = burst
+        self._t = t
+        self.update()
+
+    def paintEvent(self, _event) -> None:
+        opacity = clamp(self._burst * 1.8)
+        if opacity <= 0.01:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setOpacity(opacity)
+        cx = self.width() / 2.0
+        cy = self.height() / 2.0 + 18.0 * self._u
+        live = clamp(self._burst)
+        pulse = 1.0 + 0.016 * math.sin(self._t * 2.4) * live
+        sc = (0.18 + 0.82 * max(self._burst, 0.0)) * pulse
+        p.translate(cx, cy)
+        p.rotate((1.0 - live) * -14.0)
+        p.scale(sc, sc)
+        p.translate(-cx, -cy)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(RED)
+        for poly in self._red:
+            p.drawPolygon(poly)
+        p.setBrush(BLACK)
+        for poly in self._black:
+            p.drawPolygon(poly)
 
 
 class RadialMenu(QWidget):
-    """Menu radial ala menu battle Persona 5: tombol hitam miring bergaris putih dengan spike
-    merah-hitam di belakangnya, tersebar berselang-seling di kiri & kanan karakter, tiap tombol
-    punya simbol controller. Muncul bergantian dari karakter (pegas, berputar sambil mengembang),
-    melayang pelan, hover = sapuan merah diagonal + spike membesar, klik = mengempis.
-    Menutup dengan redaman kritis (tanpa pantulan)."""
+    """Menu radial bergaya menu battle Persona 5:
+      * Lapisan belakang (MenuBackdrop): ledakan serpihan spike merah-hitam di belakang karakter.
+      * Lapisan depan (jendela ini): 4 tombol trapesium meruncing yang mengipas dari kiri & kanan
+        karakter, huruf besar bergaya cutout dengan subjudul bergaris hitam di tepi bawah.
+      * Hover: bilah bergeser keluar, sapuan merah diagonal + bayangan putih + bintang berputar.
+      * Tutup dengan redaman kritis (tanpa pantulan)."""
 
     triggered = pyqtSignal(str, QPoint)   # key tombol, titik global di dekat tombol
     closed = pyqtSignal()
 
-    BTN_W, BTN_H = 150, 54
-    ICON_R = 15                           # jari-jari lingkaran simbol di tepi kiri tombol
-    SHEAR = -0.28
     STAGGER = 0.05                        # jeda antar tombol saat membuka (detik)
     OPEN_STIFFNESS, OPEN_DAMPING = 230.0, 15.0
     CLOSE_STIFFNESS = 340.0
@@ -1021,50 +1060,96 @@ class RadialMenu(QWidget):
         setup_overlay(self)
         self.setMouseTracking(True)
         self._pet = pet
-        # semua miring naik ke kanan seperti teks di menu battle; posisi berselang-seling
+        self._backdrop = MenuBackdrop()
+        # Susunan mengipas seperti menu battle P5 (kiri: ORDER/GUN, kanan: PERSONA/GUARD)
         self._buttons = [
-            MenuButton("agenda", "AGENDA", "NEXT EVENT", -1, -1, -9, 0.0, px=-1.0, py=-1.0, icon="triangle"),
-            MenuButton("tasks", "TASKS", "TO-DO LIST", +1, -1, -8, 1.7, px=+0.92, py=-0.95, icon="square"),
-            MenuButton("notes", "NOTES", "QUICK NOTES", +1, +1, -6, 3.4, px=+1.1, py=+0.95, icon="circle"),
-            MenuButton("system", "SYSTEM", "OPTIONS / SLEEP", -1, +1, -7, 5.1, px=-1.12, py=+0.95, icon="cross"),
+            MenuButton("agenda", "AGENDA", "Next Event",      -1, -64, -14, +25.0, 184, 28, 54, 3, 0.0),
+            MenuButton("tasks",  "TASKS",  "To-Do List",      +1, +64,  -8, -21.0, 180, 27, 54, 3, 1.7),
+            MenuButton("notes",  "NOTES",  "Quick Notes",     +1, +66, +38, +19.0, 178, 27, 52, 2, 3.4),
+            MenuButton("system", "SYSTEM", "Options & Sleep", -1, -68, +34,  -7.5, 184, 26, 52, 2, 5.1),
         ]
-        W, H = self.BTN_W, self.BTN_H
-        rect = QRectF(-W / 2, -H / 2, W, H)
-        # badan tombol: jajargenjang tidak simetris (seperti serpihan), bukan persegi panjang
-        self._base = QPolygonF([QPointF(-W / 2 + 10, -H / 2), QPointF(W / 2 + 4, -H / 2 + 3),
-                                QPointF(W / 2 - 8, H / 2), QPointF(-W / 2 - 2, H / 2 - 3)])
-        self._shape = QPainterPath()
-        self._shape.addPolygon(self._base)
-        self._shape.closeSubpath()
-        for i, b in enumerate(self._buttons):
-            b.red = spike_border(rect.adjusted(-3, -3, 3, 3), length=19, step=25, seed=21 + i * 7)
-            b.black = spike_border(rect.adjusted(2, 3, -2, -3).translated(4, 2), length=11, step=19,
-                                   seed=5 + i * 13)
-        self._label_font = p5_font(22)
-        self._sub_font = p5_font(9)
-        self._rx = self._ry = 0.0
+        self._u = 1.0                                    # faktor skala terhadap ukuran dasar 180 px
+        self._burst = Spring(0.0, 260.0, 17.0)           # animasi ledakan spike di belakang
+        self._geom: dict[str, tuple] = {}                # cache poligon, huruf, dan path subjudul
         self._t = 0.0
         self._open = False
         self._mask_on = False
         self._pressed = -1
 
         self._ticker = FrameTicker(self._frame, self)
-        self._auto_close = QTimer(self)       # menutup sendiri kalau dibiarkan
+        self._auto_close = QTimer(self)                  # menutup sendiri kalau dibiarkan
         self._auto_close.setSingleShot(True)
         self._auto_close.setInterval(15000)
         self._auto_close.timeout.connect(self.close_menu)
 
-    # -- buka / tutup --------------------------------------------------------
+    # -- buka / tutup & z-order ----------------------------------------------
     @property
     def is_open(self) -> bool:
         return self._open and self.isVisible()
 
+    def set_on_top(self, on: bool) -> None:
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, on)
+        self._backdrop.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, on)
+
+    def _build_button_cache(self, b: MenuButton, u: float) -> tuple:
+        """Hitung sekali poligon bilah, tata letak huruf cutout, dan path subjudul untuk skala `u`."""
+        L, h_in, h_out = b.length * u, b.h_in * u, b.h_out * u
+        poly = tapered_wedge(b.side, L, h_in, h_out)
+        shape = QPainterPath()
+        shape.addPolygon(poly)
+        shape.closeSubpath()
+
+        # Susun huruf satu per satu: membesar mengikuti pelebaran trapesium (kecil di dekat karakter)
+        pad_out, pad_in = 14.0 * u, 14.0 * u
+        x_start, x_end = (-L + pad_out, -pad_in) if b.side < 0 else (pad_in, L - pad_out)
+        n = len(b.label)
+        raw = []
+        total_w = 0.0
+        for i, ch in enumerate(b.label):
+            t = i / max(1, n - 1)
+            frac_outer = (1.0 - t) if b.side < 0 else t
+            h_here = h_in + (h_out - h_in) * frac_outer
+            f = p5_font(max(13, int(h_here * 0.78)), italic=False)
+            f.setStretch(92)
+            fm = QFontMetrics(f)
+            adv = fm.horizontalAdvance(ch)
+            tb = fm.tightBoundingRect(ch)
+            extra = (5.0 * u) if i == b.hi else 0.0      # ruang ekstra agar kotak cutout tidak menyentuh tetangga
+            step = adv * 0.92 + extra
+            raw.append((ch, f, tb, step))
+            total_w += step
+
+        avail = abs(x_end - x_start)
+        xscale = min(1.0, avail / max(1.0, total_w))
+        x = x_start + (avail - total_w * xscale) * (0.35 if b.side < 0 else 0.55)
+        glyphs = []
+        for i, (ch, f, tb, step) in enumerate(raw):
+            w_step = step * xscale
+            cx_ch = x + w_step * 0.5
+            jy = (-1.6 if i % 2 == 0 else 1.4) * u - 3.0 * u
+            tilt = -4.0 if i % 2 == 0 else 3.5
+            pad = 3.0 * u
+            box = QRectF(-tb.width() / 2 - pad, -tb.height() / 2 - pad,
+                         tb.width() + 2 * pad, tb.height() + 2 * pad)
+            glyphs.append((ch, f, cx_ch, jy, tilt, xscale, -tb.center().x(), -tb.center().y(), box, i == b.hi))
+            x += w_step
+
+        # Subjudul di tepi bawah (path di-cache supaya 60 FPS ringan)
+        sub_f = p5_font(max(9, int(12 * u)), italic=True)
+        tw = QFontMetrics(sub_f).horizontalAdvance(b.sub)
+        tx = (-L * 0.54 if b.side < 0 else L * 0.54) - tw * 0.5
+        ty = (h_in + h_out) * 0.24 + 5.0 * u
+        sub_path = QPainterPath()
+        sub_path.addText(QPointF(tx, ty), sub_f, b.sub)
+        return L, h_in, h_out, poly, shape, glyphs, sub_path
+
     def _layout(self) -> None:
-        size = self._pet.sprite_size
-        self._rx = size / 2 + 90
-        self._ry = max(30.0, 0.4 * size - 21)
-        self.setFixedSize(int(2 * (self._rx * 1.15 + self.BTN_W / 2 + 60)),
-                          int(2 * (self._ry * 1.0 + self.BTN_H / 2 + 56)))
+        u = max(0.72, self._pet.sprite_size / 180.0)
+        self._u = u
+        w, h = int(700 * u), int(380 * u)
+        self.setFixedSize(w, h)
+        self._backdrop.configure(w, h, u)
+        self._geom = {b.key: self._build_button_cache(b, u) for b in self._buttons}
 
     def open_menu(self) -> None:
         self._layout()
@@ -1072,6 +1157,7 @@ class RadialMenu(QWidget):
             self._t = 10.0                      # sedang menutup lalu dibuka lagi: tanpa jeda stagger
         else:
             self._t = 0.0
+            self._burst.snap(0.0)
             for b in self._buttons:
                 b.pop.snap(0.0)
                 b.hover.snap(0.0)
@@ -1079,9 +1165,14 @@ class RadialMenu(QWidget):
         self._open = True
         self._mask_on = False
         self.clearMask()
+        self._burst.configure(260.0, 17.0)
+        self._burst.target = 1.0
         for b in self._buttons:
             b.pop.configure(self.OPEN_STIFFNESS, self.OPEN_DAMPING)
         self.follow(force=True)
+        # Urutan tumpukan: spike belakang -> karakter Morgana -> 4 tombol di depan
+        self._backdrop.show()
+        self._pet.raise_()
         self.show()
         self.raise_()
         self._auto_close.start()
@@ -1094,22 +1185,32 @@ class RadialMenu(QWidget):
         self._mask_on = False
         self.clearMask()
         self._auto_close.stop()
+        self._burst.configure(self.CLOSE_STIFFNESS)
+        self._burst.target = 0.0
         for b in self._buttons:
             b.pop.configure(self.CLOSE_STIFFNESS)       # kritis: menutup tanpa memantul
             b.hover.target = 0.0
         self._ticker.start()
 
+    def hideEvent(self, e) -> None:
+        super().hideEvent(e)
+        self._backdrop.hide()
+
     def follow(self, force: bool = False) -> None:
         if self.isVisible() or force:
             c = self._pet.geometry().center()
-            self.move(c.x() - self.width() // 2, c.y() - self.height() // 2)
+            pos = QPoint(c.x() - self.width() // 2, c.y() - self.height() // 2)
+            self.move(pos)
+            self._backdrop.move(pos)
 
     # -- loop animasi ---------------------------------------------------------
     def _frame(self, dt: float) -> bool:
         if not self.isVisible():                       # disembunyikan dari luar -> berhenti
             self._open = False
+            self._backdrop.hide()
             return False
         self._t += dt
+        self._burst.step(dt)
         for i, b in enumerate(self._buttons):
             if self._open:
                 b.pop.target = 1.0 if self._t >= i * self.STAGGER else 0.0
@@ -1118,16 +1219,18 @@ class RadialMenu(QWidget):
             b.pop.step(dt)
             b.hover.step(dt)
             b.press.step(dt)
+        self._backdrop.set_anim(self._burst.value, self._t)
         self.update()
         if self._open:
             if not self._mask_on and all(b.pop.at_rest and b.pop.target == 1.0 for b in self._buttons):
                 self.setMask(self._build_mask())       # setelah menetap: hanya tombol yang menangkap klik
                 self._mask_on = True
             return True                                # gerak melayang berjalan selama menu terbuka
-        if all(b.pop.value < 0.04 for b in self._buttons):
+        if self._burst.value < 0.04 and all(b.pop.value < 0.04 for b in self._buttons):
+            self._burst.snap(0.0)
             for b in self._buttons:
                 b.pop.snap(0.0)
-            self.hide()
+            self.hide()                                # hideEvent ikut menyembunyikan _backdrop
             self.closed.emit()
             return False
         return True
@@ -1139,43 +1242,43 @@ class RadialMenu(QWidget):
         hov = clamp(b.hover.value, 0.0, 1.3) if hover is None else hover
         prs = b.press.value
         live = clamp(pop)
-        fx = math.sin(self._t * 1.6 + b.phase) * 2.2 * live if wobble else 0.0
-        fy = math.cos(self._t * 1.25 + b.phase * 1.3) * 2.6 * live if wobble else 0.0
+        u = self._u
+        fx = math.sin(self._t * 1.6 + b.phase) * 2.0 * u * live if wobble else 0.0
+        fy = math.cos(self._t * 1.25 + b.phase * 1.3) * 2.4 * u * live if wobble else 0.0
         sway = math.sin(self._t * 1.1 + b.phase) * 0.7 * live if wobble else 0.0
+        cx = self.width() / 2.0
+        cy = self.height() / 2.0 + 18.0 * u
         t = QTransform()
-        t.translate(self.width() / 2.0 + b.px * self._rx * pop + fx,
-                    self.height() / 2.0 + b.py * self._ry * pop + fy)
-        t.translate(b.sx * 8.0 * hov, b.sy * 5.0 * hov)            # bergeser ke luar saat hover
-        t.rotate(b.rot + (1.0 - live) * 28.0 * -b.sx + sway)       # berputar masuk saat muncul
-        s = (0.4 + 0.6 * max(pop, 0.0)) * (1.0 + 0.09 * hov) * (1.0 - 0.07 * prs)
+        t.translate(cx + b.ox * u * pop + fx, cy + b.oy * u * pop + fy)
+        t.rotate(b.rot + (1.0 - live) * 20.0 * -b.side + sway)      # mengipas masuk saat muncul
+        t.translate(b.side * 10.0 * u * hov, 0.0)                   # meluncur ke luar searah bilah saat hover
+        s = (0.35 + 0.65 * max(pop, 0.0)) * (1.0 + 0.08 * hov) * (1.0 - 0.07 * prs)
         t.scale(s, s)
-        t.shear(self.SHEAR, 0.0)
         return t
 
     def _hit(self, pos: QPointF) -> int:
         for i in reversed(range(len(self._buttons))):
             b = self._buttons[i]
-            if b.pop.value < 0.5:
+            if b.pop.value < 0.5 or b.key not in self._geom:
                 continue
-            xf = self._xf(b)
-            if xf.map(self._base).containsPoint(pos, Qt.FillRule.OddEvenFill):
-                return i
-            icon = xf.map(QPointF(-self.BTN_W / 2 - 2, 0.0))            # lingkaran simbol juga bisa diklik
-            if math.hypot(pos.x() - icon.x(), pos.y() - icon.y()) <= self.ICON_R:
+            poly = self._geom[b.key][3]
+            if self._xf(b).map(poly).containsPoint(pos, Qt.FillRule.OddEvenFill):
                 return i
         return -1
 
     def _build_mask(self) -> QRegion:
         region = QRegion()
-        W, H = self.BTN_W, self.BTN_H
-        bulge = QTransform().scale(1.14, 1.14)                      # spike membesar saat hover
+        u = self._u
         for b in self._buttons:
-            xf = self._xf(b, pop=1.0, hover=1.0, wobble=False)
-            region = region.united(QRegion(xf.map(bulge.map(b.red)).toPolygon()))
-            icon = xf.map(QPointF(-W / 2 - 2, 0.0))
-            r = self.ICON_R + 4
-            region = region.united(QRegion(int(icon.x() - r), int(icon.y() - r), 2 * r, 2 * r,
-                                           QRegion.RegionType.Ellipse))
+            L, _, h_out = self._geom[b.key][:3]
+            # kotak longgar mencakup bilah, bayangan hover, subjudul bawah, dan bintang di ujung dalam
+            if b.side < 0:
+                box = QPolygonF(QRectF(-L - 22 * u, -h_out * 0.72, L + 46 * u, h_out * 1.55))
+            else:
+                box = QPolygonF(QRectF(-24 * u, -h_out * 0.72, L + 46 * u, h_out * 1.55))
+            for hv in (0.0, 1.0):
+                poly = self._xf(b, pop=1.0, hover=hv, wobble=False).map(box)
+                region = region.united(QRegion(poly.toPolygon()))
         return region
 
     # -- event ---------------------------------------------------------------
@@ -1209,7 +1312,9 @@ class RadialMenu(QWidget):
         b = self._buttons[idx]
         b.press.target = 0.0
         if self._hit(e.position()) == idx:
-            anchor = self._xf(b, pop=1.0, hover=0.0, wobble=False).map(QPointF(-self.BTN_W / 2, self.BTN_H / 2))
+            L, _, h_out = self._geom[b.key][:3]
+            anchor = self._xf(b, pop=1.0, hover=0.0, wobble=False).map(
+                QPointF(b.side * L * 0.45, h_out * 0.5))
             self.triggered.emit(b.key, self.mapToGlobal(anchor.toPoint()))
 
     # -- menggambar ------------------------------------------------------------
@@ -1222,60 +1327,92 @@ class RadialMenu(QWidget):
 
     def _paint_button(self, p: QPainter, b: MenuButton) -> None:
         opacity = clamp(b.pop.value * 1.7)
-        if opacity <= 0.01:
+        if opacity <= 0.01 or b.key not in self._geom:
             return
-        W, H = self.BTN_W, self.BTN_H
+        L, _, h_out, poly, shape, glyphs, sub_path = self._geom[b.key]
+        u = self._u
         hv = b.hover.value
         hov = clamp(hv)
-        rect = QRectF(-W / 2, -H / 2, W, H)
+
         p.save()
         p.setOpacity(opacity)
         p.setTransform(self._xf(b))
 
-        p.save()                                                     # spike merah + hitam di belakang
-        grow = 1.0 + 0.12 * hov
-        p.scale(grow, grow)
+        # Bilah bayangan miring: merah saat diam, putih mencolok saat hover
+        p.save()
+        p.translate(b.side * (4.0 + 5.0 * hov) * u, (5.0 + 2.0 * hov) * u)
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(RED)
-        p.drawPolygon(b.red)
-        p.setBrush(BLACK)
-        p.drawPolygon(b.black)
+        p.setBrush(lerp_color(RED, WHITE, hov))
+        p.drawPolygon(poly)
         p.restore()
 
-        p.setPen(pen(WHITE, 3))                                      # badan hitam + garis putih
+        # Badan tombol: trapesium hitam pekat (tanpa garis tepi, sesuai menu battle P5)
+        p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(BLACK)
-        p.drawPath(self._shape)
+        p.drawPath(shape)
 
         if hov > 0.01:
-            p.save()                                                 # sapuan merah diagonal
-            p.setClipPath(self._shape)
-            edge = rect.left() + hv * (W + 40) - 20
-            p.setPen(Qt.PenStyle.NoPen)
+            p.save()                                                 # sapuan merah diagonal keluar dari karakter
+            p.setClipPath(shape)
             p.setBrush(RED)
-            p.drawPolygon(QPolygonF([QPointF(rect.left() - 12, rect.top()), QPointF(edge + 16, rect.top()),
-                                     QPointF(edge - 16, rect.bottom()), QPointF(rect.left() - 12, rect.bottom())]))
-            p.setPen(pen(WHITE, 2.5))
-            p.drawLine(QPointF(edge + 16, rect.top()), QPointF(edge - 16, rect.bottom()))
+            if b.side > 0:
+                edge = -10.0 * u + hv * (L + 44.0 * u)
+                p.drawPolygon(QPolygonF([
+                    QPointF(-18.0 * u, -h_out), QPointF(edge + 18.0 * u, -h_out),
+                    QPointF(edge - 18.0 * u, h_out), QPointF(-18.0 * u, h_out),
+                ]))
+                p.setPen(pen(WHITE, 2.8 * u))
+                p.drawLine(QPointF(edge + 18.0 * u, -h_out), QPointF(edge - 18.0 * u, h_out))
+            else:
+                edge = 10.0 * u - hv * (L + 44.0 * u)
+                p.drawPolygon(QPolygonF([
+                    QPointF(18.0 * u, -h_out), QPointF(edge - 18.0 * u, -h_out),
+                    QPointF(edge + 18.0 * u, h_out), QPointF(18.0 * u, h_out),
+                ]))
+                p.setPen(pen(WHITE, 2.8 * u))
+                p.drawLine(QPointF(edge - 18.0 * u, -h_out), QPointF(edge + 18.0 * u, h_out))
             p.restore()
 
-        # lingkaran simbol controller di tepi kiri (merah saat hover)
+        # Huruf utama bergaya cutout Persona 5 (membesar ke arah ujung luar trapesium)
+        for ch, f, cx_ch, jy, tilt, xscale, gx, gy, box, is_hi in glyphs:
+            p.save()
+            p.translate(cx_ch, jy)
+            p.rotate(tilt)
+            p.scale(xscale, 1.0)
+            p.setFont(f)
+            if is_hi:
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(BLACK if hov > 0.5 else WHITE)
+                p.drawRect(box)
+                p.setPen(WHITE if hov > 0.5 else BLACK)
+            else:
+                p.setPen(WHITE)
+            p.drawText(QPointF(gx, gy), ch)
+            p.restore()
+
+        # Subjudul putih dengan garis tepi hitam tebal menempel di tepi bawah bilah
         p.save()
-        p.translate(rect.left() - 2, 0.0)
-        p.setPen(pen(WHITE, 2.5))
-        p.setBrush(lerp_color(BLACK, RED, hov))
-        p.drawEllipse(QPointF(0, 0), self.ICON_R, self.ICON_R)
+        p.setPen(QPen(BLACK, 4.5 * u, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
+                      Qt.PenJoinStyle.RoundJoin))
         p.setBrush(Qt.BrushStyle.NoBrush)
-        p.setPen(pen(WHITE, 2.4))
-        draw_symbol(p, b.icon, self.ICON_R * 0.55)
+        p.drawPath(sub_path)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(WHITE)
+        p.drawPath(sub_path)
         p.restore()
 
-        nudge = 5.0 * hov + 10.0                                     # teks bergeser ke kanan, memberi ruang simbol
-        p.setPen(WHITE)
-        p.setFont(self._label_font)
-        p.drawText(QRectF(-W / 2 + nudge, -H / 2 + 3, W, 30), Qt.AlignmentFlag.AlignCenter.value, b.label)
-        p.setPen(lerp_color(LIGHT_RED, WHITE, hov))
-        p.setFont(self._sub_font)
-        p.drawText(QRectF(-W / 2 + nudge, 7, W, 16), Qt.AlignmentFlag.AlignCenter.value, b.sub)
+        # Bintang penanda berputar saat hover (di ujung dalam bilah)
+        if hov > 0.01:
+            p.save()
+            p.translate(b.side * 2.0 * u, -1.0 * u)
+            p.rotate(hov * 160.0)
+            sc = 0.2 + 0.8 * hov
+            p.scale(sc, sc)
+            p.setPen(pen(BLACK, 2.4 * u))
+            p.setBrush(WHITE)
+            p.drawPolygon(star_polygon(0, 0, 15.0 * u, 6.5 * u, 5))
+            p.restore()
+
         p.restore()
 
 
@@ -1914,8 +2051,9 @@ class PetController(QObject):
     def set_always_on_top(self, on: bool) -> None:
         self.on_top = on
         was_visible = self.pet.isVisible()
-        for w in (self.pet, self.bubble, self.menu):
+        for w in (self.pet, self.bubble):
             w.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, on)   # ini menyembunyikan window
+        self.menu.set_on_top(on)
         if was_visible:
             self.pet.show()
 
