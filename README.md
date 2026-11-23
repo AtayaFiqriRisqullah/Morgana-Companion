@@ -3,12 +3,13 @@
 Desktop companion bot themed after Morgana from Persona 5. Built with PyQt6.
 
 ## Features
-- Floating pet overlay with `Morgana/textbox.png` (tilted nameplate + 3-slice dialogue box placed cleanly below Morgana without overlapping UI elements) and a 6-wedge Persona 5 battle-menu style radial menu (3 left: `EVENTS`, `TIMER`, `SYSTEM`; 3 right: `TASKS`, `NOTES`, `STATS`) with radiating red-black spikes behind Morgana and a spinning star on hover
-- Persona 5 Morgana sprites: 10 expressions, blinking eyes, and a mouth that moves while text is typed. The expression follows the dialogue (e.g. shouting for "Go to bed!" or "Time's up!", excited for "RANK UP!")
+- Floating pet overlay with `assets/Morgana/textbox.png` (tilted nameplate + 3-slice dialogue box placed cleanly below Morgana without overlapping UI elements) and a 6-wedge Persona 5 battle-menu style radial menu (3 left: `EVENTS`, `TIMER`, `SYSTEM`; 3 right: `TASKS`, `NOTES`, `STATS`) with radiating red-black spikes behind Morgana and a spinning star on hover
+- Persona 5 Morgana sprites: 10 expressions, blinking eyes, and a mouth that moves while text is typed. Both expression and Japanese voiceline follow the dialogue context (e.g. `Oi!` for timers/deadlines, `Dousuru?` when opening the radial menu, `Oooh!` on rank-ups, `Yare yare...` at bedtime, `Uwooooh!` on fast bounces)
+- **Persona 5 Audio Engine (`assets/audio/`)**: radial menu hover/open/close SFX, window open/close cues, 3-stage P5R Social Stats point-gain & level-up fanfare synced with pentagon animations, and 8 Morgana voicelines — with live volume control & quick mute in Settings and the right-click menu
 - **Weekly Events window (`EVENTS`)**: dedicated 7-day Google Calendar view grouped by day with an interactive day strip and a dedicated Morgana briefing banner announcing your next upcoming event (works with a 7-day sample schedule when not configured)
-- **Social Stats (`STATS`)**: Persona 5 Royal-inspired 5-stat pentagon tracker (`Knowledge`, `Guts`, `Proficiency`, `Charm`, `Kindness`) for daily 2-hour time blocks (`Daytime` / `After School` / `Evening`), customizable point logging (`+1`/`+2`/`+3`/`+5` or custom), 20-point level intervals (`0–20` Lv 1, `21–40` Lv 2, …), rank-up celebrations, and 5-second undo
+- **Social Stats (`STATS`)**: Persona 5 Royal-inspired 5-stat pentagon tracker (`Knowledge`, `Guts`, `Proficiency`, `Charm`, `Kindness`) for daily 2-hour time blocks (`Daytime` / `After School` / `Evening`), customizable point logging (`+1`/`+2`/`+3`/`+5` or custom), 20-point level intervals (`0–20` Lv 1, `21–40` Lv 2, …), animated pentagon & rank-up celebrations, and 5-second undo
 - **Focus Mode & Manual Timers (`TIMER`)**: redesigned Persona 5 Focus Mode scoreboard (Pomodoro focus/break durations, live progress, session count) + multiple concurrent manual countdown timers with quick presets and Morgana alerts, backed by a slanted Persona 5 HUD tag under Morgana
-- Cohesive Persona 5 dark-themed Notes (pin, categories, reminders, debounced autosave, undo), Tasks (priority, search, filters, undo), and Settings (bedtime, reminders, focus timer, UI size, behavior) dialogs
+- Cohesive Persona 5 dark-themed Notes (pin, categories, reminders, debounced autosave, undo), Tasks (priority, search, filters, undo), and Settings (bedtime, reminders, focus timer, audio volume, UI size, behavior) dialogs
 - Live UI scaling (`75%–150%`) via right-click **UI SIZE** presets (`85%` / `100%` / `115%` / `130%`) or **Settings → UI size**, scaling dialogue box, radial menu, menus, timer HUD, and all dialog windows without restarting
 - Bedtime reminders, system monitor (CPU/RAM), and Morgana quotes (edit `morgana_list.md`)
 - Auto-start on Windows and Linux
@@ -37,13 +38,15 @@ End users do **not** need any `.json` files to run the app (`tasks.json`, `notes
 |------|---------|
 | `main.py` | pet window & P5 HUD, bubble, 6-wedge radial menu, timers, controller |
 | `ui_dialogs.py` | tasks, notes, events, social stats, timer, and settings dialogs |
+| `audio_manager.py` | cross-platform QtMultimedia SFX, Social Stats fanfare & Morgana voicelines |
 | `theme.py` / `motion.py` | Persona 5 style (colors, fonts, spikes) and spring animation |
 | `storage_manager.py` | atomic JSON storage (`tasks`, `notes`, `social_stats`, `settings`) |
 | `calendar_service.py` | 7-day Google Calendar fetch, day grouping & Morgana briefing |
 | `lines.py` / `morgana_list.md` | dialogue |
-| `emotions.py` | picks an expression from the dialogue text |
+| `emotions.py` | picks expression and voiceline from dialogue text |
 | `sprites.py` | composes base sprite + eye/mouth patches at their pixel offsets |
 | `autostart.py` | start on boot |
-| `fonts/` | bundled Persona 5-style SIL OFL fonts (`Anton`, `Barlow Condensed`, `Arsenal`) |
 | `app_paths.py` | resolves writable app folder vs. PyInstaller bundle (`_MEIPASS`) |
-| `Morgana/` | sprite images and `textbox.png` (`_e1` closed eyes, `_e2` half-closed, `_m1`-`_m3` mouth) |
+| `assets/Morgana/` | sprite images, `morgana.ico`, and `textbox.png` (`_e1`/`_e2` eyes, `_m1`-`_m3` mouth) |
+| `assets/fonts/` | bundled Persona 5-style SIL OFL fonts (`Anton`, `Barlow Condensed`, `Arsenal`) |
+| `assets/audio/` | UI sound effects, Social Stats WAV fanfares, and Morgana voicelines |
