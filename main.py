@@ -37,6 +37,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from datetime import time as dtime
@@ -56,12 +57,14 @@ from motion import FrameTicker, Spring, clamp
 from lines import LineBag, greeting_pool, load_lines
 import sprites
 from sprites import EYE_CLOSED, EYE_HALF, EYE_OPEN, MOUTH_BASE, MorganaSprites
-from storage_manager import NoteStore, SettingsStore, TaskStore, parse_dt
-from theme import (BLACK, BLACK_BURST_SHARDS, BLUE, LIGHT_RED, MENU_QSS, RED,
-                   RED_BURST_SHARDS, UI_SCALE_PRESETS, WHITE, lerp_color, load_fonts,
-                   menu_qss, p5_dialogue_font, p5_font, pen, scale_polygon, star_polygon,
-                   tapered_wedge)
-from ui_dialogs import NotesDialog, SettingsDialog, TasksDialog
+from storage_manager import (SOCIAL_STATS, NoteStore, SettingsStore, SocialStatsStore,
+                             TaskStore, parse_dt, stat_rank_title)
+from theme import (BLACK, BLACK_BURST_SHARDS, BLUE, GOLD, LIGHT_RED, MENU_QSS, P5_MINT_FG,
+                   P5_SURFACE, RED, RED_BURST_SHARDS, UI_SCALE_PRESETS, WHITE, lerp_color,
+                   load_fonts, menu_qss, p5_dialogue_font, p5_font, pen, scale_polygon,
+                   star_polygon, tapered_wedge)
+from ui_dialogs import (EventsDialog, NotesDialog, SettingsDialog, SocialStatsDialog,
+                        TasksDialog, TimerDialog)
 
 try:
     import psutil
@@ -163,6 +166,13 @@ def in_window(now: dtime, start: dtime, end: dtime) -> bool:
 
 def fmt_mmss(seconds: int) -> str:
     return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+
+def fmt_hms(seconds: int) -> str:
+    s = max(0, int(seconds))
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{sec:02d}" if h > 0 else f"{m:02d}:{sec:02d}"
 
 
 def launch_detached(cmd: list[str]) -> bool:
@@ -403,6 +413,7 @@ class PetWindow(QWidget):
         self._blink_t = -1.0                       # < 0 = tidak sedang berkedip
         self._mouth_t = 0.0
         self._badge = ""
+        self._hud: tuple[str, str, float, str, str] | None = None
         self._ui_scale = 1.0
         self._phase = 0.0
 
@@ -466,6 +477,19 @@ class PetWindow(QWidget):
     def set_badge(self, text: str) -> None:
         if text != self._badge:
             self._badge = text
+            self.update()
+
+    def set_hud(self, tag: str, clock: str, progress: float = 0.0,
+                accent: str = "red", extra: str = "") -> None:
+        state = (tag, clock, round(clamp(progress, 0.0, 1.0), 3), accent, extra)
+        if state != self._hud:
+            self._hud = state
+            self.update()
+
+    def clear_hud(self) -> None:
+        if self._hud is not None or self._badge:
+            self._hud = None
+            self._badge = ""
             self.update()
 
     def set_ui_scale(self, scale: float) -> None:
@@ -613,24 +637,108 @@ class PetWindow(QWidget):
         self._draw_sprite(p, self._expr)
         p.restore()
         p.setOpacity(1.0)
-        if self._badge:
+        if self._hud or self._badge:
             self._paint_badge(p)
 
     def _paint_badge(self, p: QPainter) -> None:
+        if self._hud:
+            tag, clock, prog, accent_key, extra = self._hud
+        else:
+            parts = self._badge.split(" ", 1)
+            tag = parts[0]
+            clock = parts[1] if len(parts) > 1 else ""
+            prog, accent_key, extra = 0.0, "red", ""
+
+        accent = P5_MINT_FG if accent_key == "mint" else (GOLD if accent_key == "gold" else RED)
+        tag_fg = BLACK if accent_key in ("mint", "gold") else WHITE
+
         sc = self._ui_scale
-        font = p5_font(max(10, int(round(12 * sc))))
-        p.setFont(font)
-        tw = QFontMetrics(font).horizontalAdvance(self._badge)
-        w, h = tw + int(round(22 * sc)), max(18, int(round(22 * sc)))
-        x = (self.width() - w) / 2
-        y = self.height() - PAD - h + 2
-        poly = QPolygonF([QPointF(x + 7, y), QPointF(x + w, y),
-                          QPointF(x + w - 7, y + h), QPointF(x, y + h)])
-        p.setPen(pen(WHITE, 2))
-        p.setBrush(RED)
-        p.drawPolygon(poly)
+        for _ in range(3):
+            tag_f = p5_font(max(9, int(round(11 * sc))), italic=False)
+            clk_f = p5_font(max(13, int(round(16 * sc))), italic=False)
+            ext_f = p5_font(max(9, int(round(10 * sc))), italic=False)
+            tw_tag = QFontMetrics(tag_f).horizontalAdvance(tag) + int(round(14 * sc))
+            tw_clk = QFontMetrics(clk_f).horizontalAdvance(clock) + int(round(16 * sc))
+            tw_ext = (QFontMetrics(ext_f).horizontalAdvance(extra) + int(round(10 * sc))) if extra else 0
+            skew = max(5.0, 7.0 * sc)
+            w = tw_tag + tw_clk + tw_ext + skew
+            if w <= self.width() - 10 or sc <= 0.65:
+                break
+            sc *= (self.width() - 12) / max(1.0, w)
+
+        h = max(22.0, 27.0 * sc)
+        x = (self.width() - w) / 2.0
+        y = self.height() - h - 5.0
+
+        outer = QPolygonF([
+            QPointF(x + skew, y),
+            QPointF(x + w, y),
+            QPointF(x + w - skew, y + h),
+            QPointF(x, y + h),
+        ])
+        # Signature Persona 5 offset accent shadow
+        p.save()
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(accent)
+        p.drawPolygon(outer.translated(3.0, 3.0))
+
+        # Obsidian main body
+        p.setBrush(BLACK)
+        p.drawPolygon(outer)
+
+        # Clip interior for slanted phase slash + progress track
+        clip = QPainterPath()
+        clip.addPolygon(outer)
+        clip.closeSubpath()
+        p.save()
+        p.setClipPath(clip)
+
+        slash_x = x + skew + tw_tag
+        slash = QPolygonF([
+            QPointF(x, y),
+            QPointF(slash_x + 2.0, y),
+            QPointF(slash_x - skew + 2.0, y + h),
+            QPointF(x, y + h),
+        ])
+        p.setBrush(accent)
+        p.drawPolygon(slash)
+
+        # Bottom progress strip inside HUD
+        bar_h = max(2.5, 3.5 * sc)
+        bar_y = y + h - bar_h - 0.5
+        p.setBrush(P5_SURFACE)
+        p.drawRect(QRectF(x, bar_y, w, bar_h))
+        if prog > 0.005:
+            p.setBrush(accent)
+            p.drawRect(QRectF(x, bar_y, w * prog, bar_h))
+        p.restore()
+
+        # Crisp white Persona 5 border
+        p.setPen(pen(WHITE, 1.8))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPolygon(outer)
+
+        # Phase tag text
+        text_h = h - bar_h
+        p.setFont(tag_f)
+        p.setPen(tag_fg)
+        p.drawText(QRectF(x + skew * 0.5, y, tw_tag, text_h),
+                   Qt.AlignmentFlag.AlignCenter.value, tag)
+
+        # Countdown digits
+        clk_x = x + skew * 0.5 + tw_tag
+        p.setFont(clk_f)
         p.setPen(WHITE)
-        p.drawText(QRectF(x, y, w, h), Qt.AlignmentFlag.AlignCenter.value, self._badge)
+        p.drawText(QRectF(clk_x, y, tw_clk, text_h),
+                   Qt.AlignmentFlag.AlignCenter.value, clock)
+
+        # Optional extra counter (+1)
+        if extra:
+            p.setFont(ext_f)
+            p.setPen(GOLD)
+            p.drawText(QRectF(clk_x + tw_clk - 4 * sc, y, tw_ext, text_h),
+                       Qt.AlignmentFlag.AlignCenter.value, extra)
+        p.restore()
 
     # -- mouse: bedakan klik vs drag; drag memiringkan, lempar meluncur ---------------
     def mousePressEvent(self, e) -> None:
@@ -1102,7 +1210,7 @@ class MenuBackdrop(QWidget):
     def configure(self, w: int, h: int, u: float) -> None:
         self.setFixedSize(w, h)
         self._u = u
-        cx, cy = w / 2.0, h / 2.0 + 18.0 * u
+        cx, cy = w / 2.0, h / 2.0 + 10.0 * u
         self._red = [scale_polygon(pts, cx, cy, u) for pts in RED_BURST_SHARDS]
         self._black = [scale_polygon(pts, cx, cy, u) for pts in BLACK_BURST_SHARDS]
 
@@ -1119,7 +1227,7 @@ class MenuBackdrop(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setOpacity(opacity)
         cx = self.width() / 2.0
-        cy = self.height() / 2.0 + 18.0 * self._u
+        cy = self.height() / 2.0 + 10.0 * self._u
         live = clamp(self._burst)
         pulse = 1.0 + 0.016 * math.sin(self._t * 2.4) * live
         sc = (0.18 + 0.82 * max(self._burst, 0.0)) * pulse
@@ -1157,15 +1265,18 @@ class RadialMenu(QWidget):
         self.setMouseTracking(True)
         self._pet = pet
         self._backdrop = MenuBackdrop()
-        # Susunan mengipas seperti menu battle P5 (kiri: ORDER/GUN, kanan: PERSONA/GUARD)
+        # 6-wedge P5 battle fan: 2 left (EVENTS, SYSTEM) + 4 right D-pad arc (TASKS, NOTES, STATS, TIMER)
         self._buttons = [
-            MenuButton("agenda", "AGENDA", "Next Event",      -1, -64, -14, +25.0, 184, 28, 54, 3, 0.0),
-            MenuButton("tasks",  "TASKS",  "To-Do List",      +1, +64,  -8, -21.0, 180, 27, 54, 3, 1.7),
-            MenuButton("notes",  "NOTES",  "Quick Notes",     +1, +66, +38, +19.0, 178, 27, 52, 2, 3.4),
-            MenuButton("system", "SYSTEM", "Options & Sleep", -1, -68, +34,  -7.5, 184, 26, 52, 2, 5.1),
+            MenuButton("events", "EVENTS", "This Week",       -1, -66, -24, +21.0, 182, 27, 52, 2, 0.0),
+            MenuButton("tasks",  "TASKS",  "To-Do List",      +1, +58, -78, -23.0, 174, 25, 48, 2, 1.0),
+            MenuButton("notes",  "NOTES",  "Quick Notes",     +1, +92, -20,  -6.5, 174, 25, 48, 2, 2.0),
+            MenuButton("stats",  "STATS",  "Social Stats",    +1, +56, +34,  +7.5, 174, 25, 48, 2, 3.0),
+            MenuButton("timer",  "TIMER",  "Focus & Timers",  +1, +74, +90, +23.0, 174, 25, 48, 2, 4.0),
+            MenuButton("system", "SYSTEM", "Options & Sleep", -1, -68, +38, -10.5, 184, 26, 50, 2, 5.0),
         ]
         self._u = 1.0                                    # button & font scale
-        self._u_pos = 1.0                                # radial clearance from Morgana body
+        self._u_pos = 1.0                                # horizontal clearance from Morgana body
+        self._u_y = 1.0                                  # vertical separation scale (prevents overlap at high UI scale)
         self._ui_scale = 1.0
         self._burst = Spring(0.0, 260.0, 17.0)           # animasi ledakan spike di belakang
         self._geom: dict[str, tuple] = {}                # cache poligon, huruf, dan path subjudul
@@ -1251,7 +1362,8 @@ class RadialMenu(QWidget):
         u_box = max(u_pos, u_btn)
         self._u_pos = u_pos
         self._u = u_btn
-        w, h = int(700 * u_box), int(380 * u_box)
+        self._u_y = u_box
+        w, h = int(770 * u_box), int(500 * u_box)
         self.setFixedSize(w, h)
         self._backdrop.configure(w, h, u_box)
         self._geom = {b.key: self._build_button_cache(b, u_btn) for b in self._buttons}
@@ -1352,9 +1464,9 @@ class RadialMenu(QWidget):
         fy = math.cos(self._t * 1.25 + b.phase * 1.3) * 2.4 * u * live if wobble else 0.0
         sway = math.sin(self._t * 1.1 + b.phase) * 0.7 * live if wobble else 0.0
         cx = self.width() / 2.0
-        cy = self.height() / 2.0 + 18.0 * self._u_pos
+        cy = self.height() / 2.0 + 10.0 * self._u_pos
         t = QTransform()
-        t.translate(cx + b.ox * self._u_pos * pop + fx, cy + b.oy * self._u_pos * pop + fy)
+        t.translate(cx + b.ox * self._u_pos * pop + fx, cy + b.oy * self._u_y * pop + fy)
         t.rotate(b.rot + (1.0 - live) * 20.0 * -b.side + sway)      # mengipas masuk saat muncul
         t.translate(b.side * 10.0 * u * hov, 0.0)                   # meluncur ke luar searah bilah saat hover
         s = (0.35 + 0.65 * max(pop, 0.0)) * (1.0 + 0.08 * hov) * (1.0 - 0.07 * prs)
@@ -1581,6 +1693,87 @@ class PomodoroTimer(QObject):
 
 
 @dataclass
+class ManualTimerItem:
+    id: str
+    label: str
+    total_s: int
+    deadline: float
+
+    def remaining(self, now: float | None = None) -> int:
+        ref = time.monotonic() if now is None else now
+        return max(0, math.ceil(self.deadline - ref))
+
+
+class ManualTimerManager(QObject):
+    """Multiple concurrent user-set countdown timers backed by time.monotonic()."""
+
+    changed = pyqtSignal()
+    fired = pyqtSignal(str, int)        # label, total_s
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._items: list[ManualTimerItem] = []
+        self._timer = QTimer(self)
+        self._timer.setInterval(1000)
+        self._timer.timeout.connect(self._on_tick)
+
+    def add(self, seconds: int, label: str = "") -> ManualTimerItem:
+        total = max(1, int(seconds))
+        title = (label or "").strip() or "Manual Timer"
+        item = ManualTimerItem(
+            id=uuid.uuid4().hex[:10],
+            label=title,
+            total_s=total,
+            deadline=time.monotonic() + total,
+        )
+        self._items.append(item)
+        self._items.sort(key=lambda x: x.deadline)
+        if not self._timer.isActive():
+            self._timer.start()
+        self.changed.emit()
+        return item
+
+    def cancel(self, timer_id: str) -> bool:
+        before = len(self._items)
+        self._items = [i for i in self._items if i.id != timer_id]
+        if len(self._items) != before:
+            if not self._items:
+                self._timer.stop()
+            self.changed.emit()
+            return True
+        return False
+
+    def active(self) -> list[ManualTimerItem]:
+        return list(self._items)
+
+    def nearest(self) -> ManualTimerItem | None:
+        return self._items[0] if self._items else None
+
+    def snapshot(self) -> list[dict]:
+        now = time.monotonic()
+        return [
+            {"id": i.id, "label": i.label, "total_s": i.total_s, "remaining_s": i.remaining(now)}
+            for i in self._items
+        ]
+
+    def _on_tick(self) -> None:
+        now = time.monotonic()
+        done: list[ManualTimerItem] = []
+        keep: list[ManualTimerItem] = []
+        for item in self._items:
+            if item.deadline <= now + 0.05:
+                done.append(item)
+            else:
+                keep.append(item)
+        self._items = keep
+        if not self._items:
+            self._timer.stop()
+        self.changed.emit()
+        for item in done:
+            self.fired.emit(item.label, item.total_s)
+
+
+@dataclass
 class SysSnapshot:
     cpu: float
     ram_percent: float
@@ -1684,6 +1877,7 @@ class PetController(QObject):
         self.menu = RadialMenu(self.pet)
         self.tasks = TaskStore(APP_DIR / "tasks.json")
         self.notes = NoteStore(APP_DIR / "notes.json")
+        self.social_stats = SocialStatsStore(APP_DIR / "social_stats.json")
         self.settings = SettingsStore(APP_DIR / "settings.json")
         if args.curfew is not None:               # CLI flags override for this session only
             self.settings.set(save=False, bedtime=args.curfew.strftime("%H:%M"))
@@ -1692,6 +1886,7 @@ class PetController(QObject):
         focus_m = args.focus if args.focus is not None else self.settings["focus_min"]
         rest_m = args.rest if args.rest is not None else self.settings["rest_min"]
         self.pomodoro = PomodoroTimer(focus_m, rest_m, self)
+        self.manual_timers = ManualTimerManager(self)
         self.monitor = SystemMonitor(self)
         lines = load_lines(LINES_FILE)            # kalimat Morgana dari morgana_list.md
         self._greetings = lines["greeting"]
@@ -1702,11 +1897,15 @@ class PetController(QObject):
         self.fetcher = CalendarFetcher(self.calendar, self)
         self.tasks_dialog: TasksDialog | None = None
         self.notes_dialog: NotesDialog | None = None
+        self.events_dialog: EventsDialog | None = None
+        self.stats_dialog: SocialStatsDialog | None = None
+        self.timer_dialog: TimerDialog | None = None
         self.settings_dialog: SettingsDialog | None = None
         self._cal_events: list[CalendarEvent] = []
+        self._last_cal_result: CalendarResult | None = None
         self._remind_last: dict[str, float] = {}    # kunci acara -> waktu (monotonic) pengingat terakhir
         self._remind_started: set[str] = set()      # acara yang sudah diberi pesan "dimulai sekarang"
-        self._agenda_wanted = False            # pengguna menunggu hasil AGENDA
+        self._agenda_wanted = False            # pengguna menunggu hasil EVENTS
 
         # state karakter
         self.forced_state: str | None = None   # override manual dari menu klik kanan
@@ -1735,7 +1934,9 @@ class PetController(QObject):
         self.pomodoro.tick.connect(self._on_pomo_tick)
         self.pomodoro.phase_started.connect(self._on_pomo_phase)
         self.pomodoro.finished.connect(self._on_pomo_finished)
-        self.pomodoro.stopped.connect(lambda: self.pet.set_badge(""))
+        self.pomodoro.stopped.connect(self._sync_timer_ui)
+        self.manual_timers.changed.connect(self._sync_timer_ui)
+        self.manual_timers.fired.connect(self._on_manual_timer_fired)
         self.fetcher.done.connect(self._on_calendar_result)
 
         self._curfew_timer = QTimer(self)
@@ -1845,53 +2046,89 @@ class PetController(QObject):
             self.notes_dialog.open_tasks.connect(self._open_tasks)
         self.notes_dialog.show_near(self.pet.geometry())
 
+    def _open_events(self) -> None:
+        if self.events_dialog is None:
+            self.events_dialog = EventsDialog(on_top=self.on_top, ui_scale=self.ui_scale)
+            self.events_dialog.refresh_requested.connect(self._refresh_events)
+            self.events_dialog.open_tasks.connect(self._open_tasks)
+            self.events_dialog.open_settings.connect(self._open_settings_deferred)
+        if self._last_cal_result is not None:
+            self.events_dialog.set_result(self._last_cal_result)
+        self.events_dialog.show_near(self.pet.geometry())
+        self._refresh_events(interactive=not self.calendar.has_token())
+
+    def _open_stats(self) -> None:
+        if self.stats_dialog is None:
+            self.stats_dialog = SocialStatsDialog(self.social_stats, on_top=self.on_top, ui_scale=self.ui_scale)
+            self.stats_dialog.stat_logged.connect(self._on_stat_logged)
+            self.stats_dialog.open_settings.connect(self._open_settings_deferred)
+        self.stats_dialog.show_near(self.pet.geometry())
+
+    def _open_timer(self) -> None:
+        if self.timer_dialog is None:
+            self.timer_dialog = TimerDialog(self.settings, on_top=self.on_top, ui_scale=self.ui_scale)
+            self.timer_dialog.focus_start_requested.connect(self._start_focus_from_dialog)
+            self.timer_dialog.focus_stop_requested.connect(self._stop_pomodoro)
+            self.timer_dialog.manual_add_requested.connect(self._add_manual_timer)
+            self.timer_dialog.manual_cancel_requested.connect(self._cancel_manual_timer)
+            self.timer_dialog.open_settings.connect(self._open_settings_deferred)
+        self._sync_timer_ui()
+        self.timer_dialog.show_near(self.pet.geometry())
+
     def _open_settings_deferred(self) -> None:
         """Open Settings after any QMenu/button release finishes (prevents Windows popup grab race)."""
         QTimer.singleShot(60, self._open_settings)
 
     def _on_menu_action(self, key: str, anchor: QPoint) -> None:
         self.menu.close_menu()
-        if key == "agenda":
-            self._act_agenda()
+        if key in ("events", "agenda"):
+            self._open_events()
         elif key == "tasks":
             self._open_tasks()
         elif key == "notes":
             self._open_notes()
+        elif key == "stats":
+            self._open_stats()
+        elif key == "timer":
+            self._open_timer()
         elif key == "system":
             self.system_menu.popup(anchor)
 
-    # -- AGENDA: Google Calendar ---------------------------------------------------
-    def _act_agenda(self) -> None:
+    # -- EVENTS: 7-day Google Calendar --------------------------------------------
+    def _refresh_events(self, interactive: bool = True) -> None:
         if not self.calendar.is_configured():
-            # Tanpa credentials.json: tampilkan panduan + jadwal dummy (instan, tanpa jaringan)
             result = self.calendar.get_upcoming()
-            self._cal_events = result.events if self.args.demo_reminders else self._cal_events
-            self._show_agenda(result)
+            self._last_cal_result = result
+            if self.args.demo_reminders:
+                self._cal_events = result.events
+            if self.events_dialog is not None:
+                self.events_dialog.set_result(result)
             return
-        self._agenda_wanted = True
-        if self.calendar.has_token():
-            self.say("Checking your calendar...", ms=5000)
-        else:
+        self._agenda_wanted = interactive
+        if self.events_dialog is not None and self._last_cal_result is None:
+            self.events_dialog.set_loading(True)
+        if interactive and not self.calendar.has_token():
             self.say("Opening your browser to connect Google Calendar (one-time setup). "
                      "Finish signing in there!", ms=9000)
-        self.fetcher.fetch(interactive=True)   # jika sedang sibuk, hasilnya tetap ditampilkan nanti
-
-    def _show_agenda(self, result: CalendarResult) -> None:
-        text = format_agenda(result)
-        self.say(text, "talking", ms=max(8000, 2500 + 50 * len(text)))
+        self.fetcher.fetch(interactive=interactive)
 
     def _refresh_calendar(self) -> None:
-        """Pembaruan latar (tanpa membuka browser). Dipakai untuk pengingat 15 menit sebelum acara."""
+        """Pembaruan latar (tanpa membuka browser). Dipakai untuk pengingat acara & cache mingguan."""
         if not self.calendar.is_configured():
+            result = self.calendar.get_upcoming()
+            self._last_cal_result = result
             if self.args.demo_reminders:
-                self._cal_events = self.calendar.get_upcoming().events
+                self._cal_events = result.events
             return
         if self.calendar.has_token():
             self.fetcher.fetch(interactive=False)
 
     def _on_calendar_result(self, result: CalendarResult) -> None:
+        self._last_cal_result = result
         if result.status == "ok" or (result.is_dummy and self.args.demo_reminders):
             self._cal_events = result.events
+        if self.events_dialog is not None:
+            self.events_dialog.set_result(result)
         if not self._agenda_wanted:
             return
         if result.status == "auth_needed":     # fetch latar gagal login -> ulangi interaktif
@@ -1899,7 +2136,20 @@ class PetController(QObject):
                 self.say("Your Google authorization expired. Opening your browser to sign in again...", ms=9000)
             return
         self._agenda_wanted = False
-        self._show_agenda(result)
+
+    # -- SOCIAL STATS -------------------------------------------------------------
+    def _on_stat_logged(self, stat: str, activity: str, pts: int, old_lv: int, new_lv: int) -> None:
+        label = SOCIAL_STATS.get(stat, {}).get("label", stat.title())
+        if new_lv > old_lv:
+            rank = stat_rank_title(stat, new_lv)
+            self.pet.bump(1.3)
+            play_beep()
+            self.say(f"RANK UP! Your {label} leveled up to Lv {new_lv} ({rank})! "
+                     "All that effort is really paying off!", "action", ms=7500)
+        else:
+            self.pet.bump(0.8)
+            self.say(f"Logged +{pts} {label} ({clip(activity, 36)})! Keep building your momentum!",
+                     "talking", ms=4500)
 
     # -- pengingat: acara H-2 jam (jeda 10 menit) & deadline catatan -------------------
     def _check_reminders(self) -> None:
@@ -1957,7 +2207,7 @@ class PetController(QObject):
         m.setStyleSheet(menu_qss(self.ui_scale))
         self.system_menu = m
         self.act_sys_status = m.addAction("SYSTEM STATUS (CPU / RAM)", self._act_item)
-        self.act_sys_pomo = m.addAction("FOCUS TIMER", self._act_heal)
+        self.act_sys_pomo = m.addAction("TIMER & FOCUS...", self._open_timer)
         self.act_sys_sleep = m.addAction("SLEEP MODE", self._toggle_sleep_mode)
         self.act_sys_bed = m.addAction("BEDTIME")
         self.act_sys_bed.setEnabled(False)
@@ -1969,10 +2219,12 @@ class PetController(QObject):
 
     def _refresh_system_menu(self) -> None:
         if self.pomodoro.running:
-            self.act_sys_pomo.setText(f"FOCUS TIMER  ({fmt_mmss(self.pomodoro.remaining())} left)")
+            self.act_sys_pomo.setText(f"TIMER & FOCUS  ({fmt_mmss(self.pomodoro.remaining())} left)")
+        elif self.manual_timers.nearest() is not None:
+            nxt = self.manual_timers.nearest()
+            self.act_sys_pomo.setText(f"TIMER & FOCUS  ({fmt_hms(nxt.remaining())} left)")
         else:
-            mins = max(1, round(self.pomodoro.focus_s / 60))
-            self.act_sys_pomo.setText(f"START FOCUS  ({mins} min)")
+            self.act_sys_pomo.setText("TIMER & FOCUS...")
         self.act_sys_sleep.setText("WAKE UP  (Disable Sleep Mode)" if self.sleep_mode
                                    else "SLEEP MODE  (Take a Break)")
         self.act_sys_bed.setText(self._bedtime_text())
@@ -2014,8 +2266,9 @@ class PetController(QObject):
             dlg.autostart_changed.connect(self._toggle_autostart)
             dlg.closed.connect(lambda d=dlg: self._on_settings_closed(d))
             self.settings_dialog = dlg
-        # If Notes or Tasks is currently open, center Settings directly over it so it's never buried
-        for panel in (self.notes_dialog, self.tasks_dialog):
+        # If any panel is open, center Settings over it so it's never buried
+        for panel in (self.notes_dialog, self.tasks_dialog, self.events_dialog,
+                      self.stats_dialog, self.timer_dialog):
             if panel is not None and panel.isVisible():
                 self.settings_dialog.show_near(panel.geometry(), prefer_center=True)
                 return
@@ -2029,6 +2282,8 @@ class PetController(QObject):
         self.act_curfew.blockSignals(False)
         self.pomodoro.focus_s = max(1, int(self.settings["focus_min"] * 60))
         self.pomodoro.rest_s = max(1, int(self.settings["rest_min"] * 60))
+        if self.timer_dialog is not None:
+            self.timer_dialog.refresh()
         new_pct = int(self.settings["ui_scale"])
         if abs(new_pct / 100.0 - self.ui_scale) > 0.001:
             self.set_ui_scale(new_pct, save=False, reopen_settings=True)
@@ -2056,37 +2311,93 @@ class PetController(QObject):
             text += "\nCPU/RAM usage is high. Try closing apps you don't need."
         self.say(text, "action" if heavy else "talking", ms=6500)
 
-    # -- Pomodoro (supportive focus companion) -----------------------------------
-    def _act_heal(self) -> None:
+    # -- Pomodoro & Manual Timers (Persona 5 Timer + HUD) -------------------------
+    def _sync_timer_ui(self) -> None:
+        manual = self.manual_timers.snapshot()
         if self.pomodoro.running:
-            t = fmt_mmss(self.pomodoro.remaining())
-            pool = _FOCUS_PROGRESS if self.pomodoro.phase == PomodoroTimer.FOCUS else _REST_PROGRESS
-            self.say(random.choice(pool).format(t=t))
+            is_rest = self.pomodoro.phase == PomodoroTimer.REST
+            total_s = self.pomodoro.rest_s if is_rest else self.pomodoro.focus_s
+            left_s = self.pomodoro.remaining()
+            extra = f"+{len(manual)}" if manual else ""
+            self.pet.set_hud(
+                "REST" if is_rest else "FOCUS",
+                fmt_mmss(left_s),
+                progress=left_s / float(max(1, total_s)),
+                accent="mint" if is_rest else "red",
+                extra=extra,
+            )
+        elif manual:
+            first = manual[0]
+            extra = f"+{len(manual) - 1}" if len(manual) > 1 else ""
+            self.pet.set_hud(
+                "TIMER",
+                fmt_hms(first["remaining_s"]),
+                progress=first["remaining_s"] / float(max(1, first["total_s"])),
+                accent="gold",
+                extra=extra,
+            )
         else:
-            self.pomodoro.start()
+            self.pet.clear_hud()
 
-    def _on_pomo_tick(self, phase: str, left: int) -> None:
-        name = "FOCUS" if phase == PomodoroTimer.FOCUS else "REST"
-        self.pet.set_badge(f"{name} {fmt_mmss(left)}")
+        if self.timer_dialog is not None:
+            total_s = self.pomodoro.rest_s if self.pomodoro.phase == PomodoroTimer.REST else self.pomodoro.focus_s
+            self.timer_dialog.update_focus(
+                running=self.pomodoro.running,
+                phase=self.pomodoro.phase,
+                remaining_s=self.pomodoro.remaining(),
+                total_s=total_s,
+                completed=self.pomodoro.completed,
+            )
+            self.timer_dialog.update_manual_timers(manual)
+
+    def _start_focus_from_dialog(self, focus_min: int, rest_min: int) -> None:
+        if focus_min != self.settings["focus_min"] or rest_min != self.settings["rest_min"]:
+            self.settings.set(focus_min=focus_min, rest_min=rest_min)
+        self.pomodoro.focus_s = max(1, int(focus_min * 60))
+        self.pomodoro.rest_s = max(1, int(rest_min * 60))
+        self.pomodoro.start()
+
+    def _add_manual_timer(self, total_s: int, label: str) -> None:
+        item = self.manual_timers.add(total_s, label)
+        self.pet.bump(0.8)
+        self.say(f"Timer set: {clip(item.label, 38)} ({fmt_hms(item.total_s)}). "
+                 "I'll remind you as soon as time's up!", "talking", ms=4500)
+
+    def _cancel_manual_timer(self, timer_id: str) -> None:
+        self.manual_timers.cancel(timer_id)
+
+    def _on_manual_timer_fired(self, label: str, total_s: int) -> None:
+        self.say(f"Time's up! Your timer '{clip(label, 42)}' ({fmt_hms(total_s)}) just finished!",
+                 "action", ms=11000)
+        self.pet.bump(1.4)
+        play_beep()
+
+    def _on_pomo_tick(self, _phase: str, _left: int) -> None:
+        self._sync_timer_ui()
 
     def _on_pomo_phase(self, phase: str) -> None:
+        self._sync_timer_ui()
         if phase == PomodoroTimer.FOCUS:
             t = fmt_mmss(self.pomodoro.focus_s)
             self.say(random.choice(_FOCUS_START).format(t=t), "action")
         else:
             t = fmt_mmss(self.pomodoro.rest_s)
+            self.pet.bump(1.2)
+            play_beep()
             self.say(random.choice(_FOCUS_REST).format(t=t))
 
     def _on_pomo_finished(self) -> None:
-        self.pet.set_badge("")
+        self._sync_timer_ui()
+        self.pet.bump(1.3)
+        play_beep()
         n = self.pomodoro.completed
         word = "session" if n == 1 else "sessions"
         self.say(f"Break's over! That's {n} focus {word} completed today—you're doing awesome! "
-                 "Open SYSTEM whenever you're ready for another round.", "action")
+                 "Open TIMER whenever you're ready for another round.", "action")
 
     def _stop_pomodoro(self) -> None:
         self.pomodoro.stop()
-        self.say("Timer paused! Rest up if you need to—start a new session from SYSTEM whenever you're ready.")
+        self.say("Timer paused! Rest up if you need to—start a new session from TIMER whenever you're ready.")
 
     # -- launchers ---------------------------------------------------------------
     def _launch_vscode(self) -> None:
@@ -2268,21 +2579,23 @@ class PetController(QObject):
         self.context_menu.setStyleSheet(qss)
 
         # Rebuild cached dialogs at the new scale (reopen any that were visible)
-        if self.tasks_dialog is not None:
-            was = self.tasks_dialog.isVisible()
-            self.tasks_dialog.hide()
-            self.tasks_dialog.deleteLater()
-            self.tasks_dialog = None
-            if was:
-                self._open_tasks()
-        if self.notes_dialog is not None:
-            was = self.notes_dialog.isVisible()
-            self.notes_dialog.on_closing()
-            self.notes_dialog.hide()
-            self.notes_dialog.deleteLater()
-            self.notes_dialog = None
-            if was:
-                self._open_notes()
+        for attr, opener, closing in (
+            ("tasks_dialog", self._open_tasks, False),
+            ("notes_dialog", self._open_notes, True),
+            ("events_dialog", self._open_events, False),
+            ("stats_dialog", self._open_stats, False),
+            ("timer_dialog", self._open_timer, False),
+        ):
+            dlg = getattr(self, attr)
+            if dlg is not None:
+                was = dlg.isVisible()
+                if closing:
+                    dlg.on_closing()
+                dlg.hide()
+                dlg.deleteLater()
+                setattr(self, attr, None)
+                if was:
+                    opener()
         if self.settings_dialog is not None:
             was = self.settings_dialog.isVisible()
             if reopen_settings or was:
@@ -2301,7 +2614,8 @@ class PetController(QObject):
         self.menu.set_on_top(on)
         if was_visible:
             self.pet.show()
-        for dlg in (self.tasks_dialog, self.notes_dialog, self.settings_dialog):
+        for dlg in (self.tasks_dialog, self.notes_dialog, self.events_dialog,
+                    self.stats_dialog, self.timer_dialog, self.settings_dialog):
             if dlg is not None:
                 dlg.set_on_top(on)
 
