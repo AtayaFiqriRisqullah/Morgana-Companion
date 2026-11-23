@@ -17,9 +17,12 @@ Berkas proyek (taruh dalam satu folder):
   calendar_service.py  Google Calendar read-only + jadwal dummy (panduan credentials.json ada di sini)
   autostart.py         auto-start saat boot (Windows Registry / Linux XDG)
   lines.py             pembaca kalimat Morgana; isinya dari morgana_list.md (edit file itu, bukan kode)
+  emotions.py          memilih ekspresi Morgana dari isi dialog
+  sprites.py           menyusun sprite Morgana (badan + patch mata + patch mulut)
 
 Berkas yang dibuat otomatis: tasks.json, notes.json, settings.json, token.json (login Google), pet.log (galat).
-Aset opsional: assets/idle.png, talking.png, sleepy.png, action.png (PNG transparan).
+Sprite    : folder Morgana/ (badan, patch mata e1/e2, patch mulut m1-m3; lihat sprites.py).
+            Tanpa folder itu dipakai placeholder bergaya P5.
 """
 from __future__ import annotations
 
@@ -47,8 +50,11 @@ from PyQt6.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QWidget
 
 import autostart
 from calendar_service import CalendarEvent, CalendarResult, CalendarService, format_agenda, human_delta
+from emotions import EXPRESSIONS, STATE_EXPRESSION, emotion_for_text
 from motion import FrameTicker, Spring, clamp
 from lines import LineBag, greeting_pool, load_lines
+import sprites
+from sprites import EYE_CLOSED, EYE_HALF, EYE_OPEN, MOUTH_BASE, MorganaSprites
 from storage_manager import NoteStore, SettingsStore, TaskStore, parse_dt
 from theme import (BLACK, BLUE, LIGHT_RED, MENU_QSS, RED, WHITE, lerp_color, p5_font, pen,
                    star_polygon)
@@ -67,7 +73,6 @@ IS_LINUX = sys.platform.startswith("linux")
 
 SCRIPT_PATH = Path(__file__).resolve()
 APP_DIR = SCRIPT_PATH.parent
-ASSETS_DIR = APP_DIR / "assets"
 LOG_FILE = APP_DIR / "pet.log"
 
 PET_NAME = "MORGANA"
@@ -326,29 +331,29 @@ def make_placeholder(state: str, size: int, dpr: float = 1.0) -> QPixmap:
 
 
 class SpriteBank:
-    """Memuat assets/<state>.png; jika tidak ada/korup -> placeholder. Di-cache per ukuran."""
+    """Sprite Morgana per ekspresi, lengkap dengan bingkai mata & mulut (lihat sprites.py).
+    Jika folder Morgana/ tidak ada atau berkas korup -> placeholder. Di-cache per ukuran."""
+
+    # gaya placeholder terdekat untuk tiap ekspresi
+    PLACEHOLDER = {"neutral": "idle", "sad": "sleepy", "worried": "sleepy", "uneasy": "sleepy",
+                   "wink": "action", "excited": "action", "smug": "action", "shout": "action"}
 
     def __init__(self) -> None:
+        self._real = MorganaSprites() if sprites.available() else None
         self._cache: dict[tuple, QPixmap] = {}
 
-    def get(self, state: str, size: int, dpr: float = 1.0) -> QPixmap:
-        key = (state, size, round(dpr, 2))
-        if key not in self._cache:
-            self._cache[key] = self._load(state, size, dpr)
-        return self._cache[key]
-
-    @staticmethod
-    def _load(state: str, size: int, dpr: float) -> QPixmap:
-        path = ASSETS_DIR / f"{state}.png"
-        if path.is_file():
-            pm = QPixmap(str(path))
-            if not pm.isNull():
-                px = int(size * dpr)
-                pm = pm.scaled(px, px, Qt.AspectRatioMode.KeepAspectRatio,
-                               Qt.TransformationMode.SmoothTransformation)
-                pm.setDevicePixelRatio(dpr)
+    def get(self, expr: str, size: int, dpr: float = 1.0,
+            eye: int = EYE_OPEN, mouth: int = MOUTH_BASE) -> QPixmap:
+        if expr in STATES:                          # nama state lama -> ekspresi dasarnya
+            expr = STATE_EXPRESSION[expr]
+        if self._real is not None:
+            pm = self._real.get(expr, size, dpr, eye, mouth)
+            if pm is not None:
                 return pm
-        return make_placeholder(state, size, dpr)
+        key = (expr, size, round(dpr, 2))
+        if key not in self._cache:
+            self._cache[key] = make_placeholder(self.PLACEHOLDER.get(expr, "talking"), size, dpr)
+        return self._cache[key]
 
 
 # ---------------------------------------------------------------------------
@@ -366,6 +371,11 @@ class PetWindow(QWidget):
     GLIDE_MIN_SPEED = 380.0     # px/detik; lebih lambat dari ini = tidak meluncur
     GLIDE_MAX_SPEED = 2600.0
     GLIDE_FRICTION = 5.0
+    # kedipan: (bingkai mata, detik); jeda antar kedipan (detik)
+    BLINK = ((EYE_HALF, 0.045), (EYE_CLOSED, 0.07), (EYE_HALF, 0.05))
+    BLINK_GAP = (2.2, 5.5)
+    BLINK_SLEEPY = ((EYE_CLOSED, 0.55),)
+    BLINK_GAP_SLEEPY = (1.8, 4.0)
     # amp: tinggi melayang (px) | speed: rad/detik | breathe: kembang-kempis | droop: turun (px)
     STYLE = {
         "idle":    dict(amp=3.0, speed=1.9, breathe=0.018, droop=0.0),
@@ -381,6 +391,14 @@ class PetWindow(QWidget):
         self._sprite_size = size
         self._state = "idle"
         self._prev_state = "idle"
+        self._expr = "neutral"                     # ekspresi wajah (kunci emotions.EXPRESSIONS)
+        self._prev_expr = "neutral"
+        self._speaking = False                     # mulut bergerak selama teks diketik
+        self._eye = EYE_OPEN                       # bingkai mata/mulut yang sedang tampil
+        self._mouth = MOUTH_BASE
+        self._blink_in = random.uniform(1.5, 3.5)  # detik sampai kedipan berikutnya
+        self._blink_t = -1.0                       # < 0 = tidak sedang berkedip
+        self._mouth_t = 0.0
         self._badge = ""
         self._phase = 0.0
 
@@ -410,14 +428,26 @@ class PetWindow(QWidget):
     def sprite_size(self) -> int:
         return self._sprite_size
 
-    def set_state(self, state: str) -> None:
-        if state in STATES and state != self._state:
-            self._prev_state = self._state
-            self._state = state
-            self._fade.snap(0.0)
-            self._fade.target = 1.0
-            self._fade.configure(150.0)
-            self.bump(0.7)
+    def set_state(self, state: str, emotion: str | None = None) -> None:
+        """Ganti gaya gerak (state) dan ekspresi wajah. Tanpa `emotion`, dipakai ekspresi dasar state."""
+        if state not in STATES:
+            return
+        expr = emotion if emotion in EXPRESSIONS else STATE_EXPRESSION[state]
+        if state == self._state and expr == self._expr:
+            return
+        self._prev_state, self._prev_expr = self._state, self._expr
+        self._state, self._expr = state, expr
+        self._fade.snap(0.0)
+        self._fade.target = 1.0
+        self._fade.configure(150.0)
+        self.bump(0.7)
+
+    def set_speaking(self, on: bool) -> None:
+        """Gerakkan mulut (m1-m3) selama `on`; kembali ke mulut gambar dasar saat dimatikan."""
+        self._speaking = on
+        if not on:
+            self._mouth = MOUTH_BASE
+        self._ticker.start()
 
     def set_talking(self, on: bool) -> None:
         self._talk.target = 1.0 if on else 0.0
@@ -455,8 +485,40 @@ class PetWindow(QWidget):
         screen = QGuiApplication.screenAt(self.geometry().center()) or QGuiApplication.primaryScreen()
         return screen.availableGeometry()
 
+    def _animate_face(self, dt: float) -> None:
+        """Kedip (e2 -> e1 -> e2) dan gerak mulut (acak m1/m2/m3) selama berbicara."""
+        sleepy = self._state == "sleepy"
+        sequence = self.BLINK_SLEEPY if sleepy else self.BLINK
+        eye = EYE_HALF if sleepy else EYE_OPEN      # mengantuk: kelopak setengah turun
+        if self._blink_t < 0:
+            self._blink_in -= dt
+            if self._blink_in <= 0:
+                self._blink_t = 0.0
+        else:
+            self._blink_t += dt
+            acc = 0.0
+            for frame, dur in sequence:
+                acc += dur
+                if self._blink_t < acc:
+                    eye = frame
+                    break
+            else:                                    # kedipan selesai
+                self._blink_t = -1.0
+                if not sleepy and random.random() < 0.2:
+                    self._blink_in = 0.2             # kedip ganda
+                else:
+                    self._blink_in = random.uniform(*(self.BLINK_GAP_SLEEPY if sleepy else self.BLINK_GAP))
+        self._eye = eye
+        if self._speaking:
+            self._mouth_t -= dt
+            if self._mouth_t <= 0:
+                self._mouth_t = random.uniform(0.07, 0.14)
+                options = [m for m in (1, 2, 3) if m != self._mouth]
+                self._mouth = random.choices(options, weights=[1 if m == 1 else 2 for m in options])[0]
+
     def _frame(self, dt: float) -> bool:
         self._phase += dt
+        self._animate_face(dt)
         moving = False
         if self._dragging:
             decay = math.exp(-dt * 7.0)            # kecepatan "basi" meluruh kalau kursor diam
@@ -503,8 +565,9 @@ class PetWindow(QWidget):
         return True
 
     # -- menggambar ----------------------------------------------------------
-    def _draw_sprite(self, p: QPainter, state: str) -> None:
-        pm = self._sprites.get(state, self._sprite_size, self.devicePixelRatioF())
+    def _draw_sprite(self, p: QPainter, expr: str) -> None:
+        eye, mouth = (self._eye, self._mouth) if expr == self._expr else (EYE_OPEN, MOUTH_BASE)
+        pm = self._sprites.get(expr, self._sprite_size, self.devicePixelRatioF(), eye, mouth)
         dpr = pm.devicePixelRatio()
         w, h = pm.width() / dpr, pm.height() / dpr
         x = PAD + (self._sprite_size - w) / 2
@@ -535,11 +598,11 @@ class PetWindow(QWidget):
         p.scale(max(sx, 0.2), max(sy, 0.2))
         p.translate(-px, -py)
         f = clamp(self._fade.value)
-        if f < 0.995 and self._prev_state != self._state:
+        if f < 0.995 and self._prev_expr != self._expr:
             p.setOpacity(1.0 - f)
-            self._draw_sprite(p, self._prev_state)
+            self._draw_sprite(p, self._prev_expr)
             p.setOpacity(f)
-        self._draw_sprite(p, self._state)
+        self._draw_sprite(p, self._expr)
         p.restore()
         p.setOpacity(1.0)
         if self._badge:
@@ -656,6 +719,7 @@ class BubbleWindow(QWidget):
     bayangan merah, ekor runcing, name tag merah, dan bintang bergerigi."""
 
     dismissed = pyqtSignal()
+    typing_finished = pyqtSignal()          # semua huruf sudah tampil (mulut karakter berhenti)
 
     MAX_TEXT_W = 240
     M, PADX, PADY = 22, 18, 12
@@ -730,6 +794,8 @@ class BubbleWindow(QWidget):
         if self._reveal < self._total:
             self._reveal = min(float(self._total), self._reveal + self._speed * dt)
             moving = True
+            if self._reveal >= self._total:
+                self.typing_finished.emit()
         self.update()
         if self._closing and self._show.value < 0.04:
             self._closing = False
@@ -1266,6 +1332,7 @@ class PetController(QObject):
 
         # state karakter
         self.forced_state: str | None = None   # override manual dari menu klik kanan
+        self.forced_expression: str | None = None
         self.sleep_mode = False
         self.curfew_enabled = bool(self.settings["curfew_enabled"])
         self.curfew_active = False
@@ -1280,6 +1347,7 @@ class PetController(QObject):
         self.pet.moved.connect(self._on_pet_moved)
         self.pet.context_requested.connect(self.context_menu.popup)
         self.bubble.dismissed.connect(self._restore_state)
+        self.bubble.typing_finished.connect(lambda: self.pet.set_speaking(False))
         self.menu.triggered.connect(self._on_menu_action)
         self.pomodoro.tick.connect(self._on_pomo_tick)
         self.pomodoro.phase_started.connect(self._on_pomo_phase)
@@ -1324,13 +1392,22 @@ class PetController(QObject):
         return "sleepy" if (self.sleep_mode or self.curfew_active) else "idle"
 
     def _restore_state(self) -> None:
-        self.pet.set_state(self.base_state())
+        self.pet.set_state(self.base_state(), self.forced_expression)
         self.pet.set_talking(False)
+        self.pet.set_speaking(False)
 
-    def say(self, text: str, state: str = "talking", ms: int | None = None) -> None:
-        if not self.forced_state:
-            self.pet.set_state(state)
+    def say(self, text: str, state: str = "talking", ms: int | None = None,
+            emotion: str | None = None) -> None:
+        """Ucapkan `text`. Ekspresi dipilih dari isi kalimat (atau `emotion` bila diberikan);
+        mulut bergerak selama balon mengetik."""
+        if emotion is None:
+            emotion = emotion_for_text(text, default=STATE_EXPRESSION.get(state, "neutral"))
+        if self.forced_state:
+            self.pet.set_state(self.forced_state, self.forced_expression)
+        else:
+            self.pet.set_state(state, self.forced_expression or emotion)
         self.pet.set_talking(True)
+        self.pet.set_speaking(True)
         self.bubble.show_message(text, ms or max(4000, 2500 + 55 * len(text)))
 
     def _schedule_chatter(self) -> None:
@@ -1628,6 +1705,18 @@ class PetController(QObject):
             state_menu.addAction(act)
         state_group.triggered.connect(lambda a: self.set_forced_state(a.data()))
 
+        expr_menu = m.addMenu("Ganti Ekspresi")
+        expr_group = QActionGroup(m)
+        expr_group.setExclusive(True)
+        for key in ("auto",) + tuple(EXPRESSIONS):
+            act = QAction(key.title(), m)
+            act.setCheckable(True)
+            act.setData(key)
+            act.setChecked(key == "auto")
+            expr_group.addAction(act)
+            expr_menu.addAction(act)
+        expr_group.triggered.connect(lambda a: self.set_forced_expression(a.data()))
+
         size_menu = m.addMenu("Ukuran Sprite")
         size_group = QActionGroup(m)
         size_group.setExclusive(True)
@@ -1671,7 +1760,7 @@ class PetController(QObject):
         self.tray: QSystemTrayIcon | None = None
         if not QSystemTrayIcon.isSystemTrayAvailable():
             return
-        self.tray = QSystemTrayIcon(QIcon(self.sprites.get("idle", 64, 1.0)), self)
+        self.tray = QSystemTrayIcon(QIcon(self.sprites.get("neutral", 64, 1.0)), self)
         self.tray.setToolTip(f"{PET_NAME.title()} - Coding Pet")
         self.tray.setContextMenu(self.context_menu)
         self.tray.activated.connect(self._on_tray_activated)
@@ -1698,6 +1787,10 @@ class PetController(QObject):
 
     def set_forced_state(self, key: str) -> None:
         self.forced_state = None if key == "auto" else key
+        self._restore_state()
+
+    def set_forced_expression(self, key: str) -> None:
+        self.forced_expression = None if key == "auto" else key
         self._restore_state()
 
     def set_size(self, px: int) -> None:
