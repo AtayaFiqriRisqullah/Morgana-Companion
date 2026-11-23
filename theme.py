@@ -1,8 +1,12 @@
 # -*- coding: utf-8 -*-
-"""Tema visual bersama (gaya Persona 5, khusus UI): warna, font, bentuk, dan stylesheet Qt.
+"""Shared Persona 5 visual theme: colors, typography hierarchy, shapes, and Qt stylesheets.
 
-Palet : merah Persona (#E60012), hitam pekat, putih. Tanpa gradasi; semua bidang datar.
-Bentuk: jajargenjang miring, bayangan merah bergeser, bintang bergerigi, spike merah-hitam.
+Palette : Persona Crimson (#E60012), Obsidian Black (#0B0B0E / #131318 / #1B1B22),
+          Crisp White (#FFFFFF), and subtle Morgana Scarf Gold (#F5C400) for highlights.
+Type    : p5_font() for ALL-CAPS display headers, badges & action buttons;
+          p5_dialogue_font() for dialogue textbox & popup menus (crisp upright sans);
+          ui_font() for note bodies, task titles, and form inputs.
+Rule    : Hover states shift surface/background/border only—never text color.
 """
 from __future__ import annotations
 
@@ -11,28 +15,58 @@ import math
 from PyQt6.QtCore import QPointF, Qt
 from PyQt6.QtGui import QColor, QFont, QPen, QPolygonF
 
+# Core Persona 5 palette
 RED = QColor("#E60012")
+RED_HOVER = QColor("#FF1F30")
 DEEP_RED = QColor("#8F000C")
 LIGHT_RED = QColor("#FF4B55")
 BLACK = QColor("#0B0B0B")
 WHITE = QColor("#FFFFFF")
-BLUE = QColor("#2E9BFF")      # hanya dipakai placeholder karakter, bukan UI
+GOLD = QColor("#F5C400")        # Morgana's scarf accent (pinned / pending badges)
+BLUE = QColor("#2E9BFF")        # placeholder fallback only
+
+# Dark Persona 5 window surfaces (Notes, Tasks, Settings)
+P5_BG = QColor("#0E0E12")
+P5_CARD = QColor("#15151B")
+P5_SURFACE = QColor("#1C1C24")
+P5_HOVER = QColor("#252530")
+P5_SELECTED = QColor("#2A0C11")
+P5_BORDER = QColor("#2C2C38")
+P5_BORDER_HI = QColor("#444456")
+P5_TEXT = QColor("#F4F4F8")
+P5_MUTED = QColor("#9292A4")
+P5_GOLD_BG = QColor("#2B2208")
+P5_GOLD_FG = QColor("#FAD02C")
+P5_RED_BG = QColor("#360A10")
+P5_RED_FG = QColor("#FF5E6B")
+P5_MINT_BG = QColor("#10281E")
+P5_MINT_FG = QColor("#5CE09A")
 
 
 def p5_font(px: int, italic: bool = True) -> QFont:
-    """Font tebal bergaya komik; urutan fallback aman untuk Windows & Linux."""
+    """Heavy Persona 5 display font for titles, section headers, menu wedges, and CTA buttons."""
     f = QFont()
-    f.setFamilies(["Arial Black", "Segoe UI", "Noto Sans", "DejaVu Sans", "Sans Serif"])
+    f.setFamilies(["Arial Black", "Bahnschrift", "Segoe UI", "Liberation Sans", "DejaVu Sans", "Sans Serif"])
     f.setPixelSize(px)
-    f.setWeight(QFont.Weight.Bold)
+    f.setWeight(QFont.Weight.Black)
     f.setItalic(italic)
+    f.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 103.0)
+    return f
+
+
+def p5_dialogue_font(px: int = 14) -> QFont:
+    """Crisp upright Persona 5 dialogue font for the textbox and popup menus."""
+    f = QFont()
+    f.setFamilies(["Segoe UI", "Liberation Sans", "Noto Sans", "DejaVu Sans", "Sans Serif"])
+    f.setPixelSize(px)
+    f.setWeight(QFont.Weight.DemiBold)
     return f
 
 
 def ui_font(px: int, bold: bool = True) -> QFont:
-    """Font biasa yang mudah dibaca (daftar, isi catatan); font p5_font hanya untuk judul/tombol."""
+    """Clean upright sans-serif for note bodies, task items, search inputs, and settings rows."""
     f = QFont()
-    f.setFamilies(["Segoe UI", "Noto Sans", "DejaVu Sans", "Sans Serif"])
+    f.setFamilies(["Segoe UI", "Liberation Sans", "Noto Sans", "DejaVu Sans", "Sans Serif"])
     f.setPixelSize(px)
     f.setWeight(QFont.Weight.Bold if bold else QFont.Weight.Normal)
     return f
@@ -51,7 +85,7 @@ def lerp_color(a: QColor, b: QColor, t: float) -> QColor:
 
 
 def star_polygon(cx: float, cy: float, r_out: float, r_in: float, points: int = 5) -> QPolygonF:
-    """Bintang bergerigi (ujung runcing) ala ikon/kursor Persona 5."""
+    """Sharp 5-point Persona 5 cursor/hover star."""
     pts = []
     for i in range(points * 2):
         r = r_out if i % 2 == 0 else r_in
@@ -60,39 +94,38 @@ def star_polygon(cx: float, cy: float, r_out: float, r_in: float, points: int = 
     return QPolygonF(pts)
 
 
-# Serpihan spike merah & hitam yang memancar dari belakang karakter (ala menu battle P5).
-# Koordinat relatif terhadap titik pusat ledakan, untuk ukuran sprite dasar 180 px.
+# Radiating red & black shards bursting from behind Morgana (Persona 5 battle menu).
+# Coordinates relative to the burst center, authored at base sprite size 180 px.
 RED_BURST_SHARDS: tuple[tuple[tuple[float, float], ...], ...] = (
-    ((-6, 10), (-26, 2), (-106, -168), (-96, -162)),            # jarum merah tinggi kiri-atas
-    ((-14, 14), (-28, 28), (-248, -114), (-238, -120)),         # garis merah panjang di atas kiri
-    ((-8, 4), (-212, 18), (-186, 48), (-252, 74), (-182, 76),   # pecahan merah besar kiri-bawah
+    ((-6, 10), (-26, 2), (-106, -168), (-96, -162)),
+    ((-14, 14), (-28, 28), (-248, -114), (-238, -120)),
+    ((-8, 4), (-212, 18), (-186, 48), (-252, 74), (-182, 76),
      (-224, 118), (-128, 96), (-166, 144), (-78, 96), (-12, 54)),
-    ((-24, 40), (-36, 52), (-240, 126)),                        # jarum tipis kiri-bawah
-    ((16, -2), (248, -56), (236, -6), (22, 26)),                # bilah merah di belakang kanan-atas
-    ((10, -14), (24, -6), (178, -126)),                         # jarum merah kanan-atas
-    ((18, 22), (244, 84), (222, 114), (16, 46)),                # bilah merah di bawah kanan-bawah
-    ((18, 34), (30, 26), (192, 134)),                           # jarum tipis kanan-bawah
+    ((-24, 40), (-36, 52), (-240, 126)),
+    ((16, -2), (248, -56), (236, -6), (22, 26)),
+    ((10, -14), (24, -6), (178, -126)),
+    ((18, 22), (244, 84), (222, 114), (16, 46)),
+    ((18, 34), (30, 26), (192, 134)),
 )
 
 BLACK_BURST_SHARDS: tuple[tuple[tuple[float, float], ...], ...] = (
-    ((-14, 6), (-36, 18), (-182, -138)),                        # serpihan hitam kiri-atas
-    ((-18, 2), (-244, -8), (-22, 20)),                          # jarum hitam di celah kiri
-    ((-16, 30), (-38, 44), (-196, 126)),                        # tebasan hitam kiri-bawah
-    ((12, -10), (30, -2), (144, -118)),                         # serpihan hitam kanan-atas
-    ((20, 4), (238, 12), (20, 22)),                             # jarum hitam di celah kanan
-    ((12, 34), (32, 24), (130, 130)),                           # serpihan hitam kanan-bawah
+    ((-14, 6), (-36, 18), (-182, -138)),
+    ((-18, 2), (-244, -8), (-22, 20)),
+    ((-16, 30), (-38, 44), (-196, 126)),
+    ((12, -10), (30, -2), (144, -118)),
+    ((20, 4), (238, 12), (20, 22)),
+    ((12, 34), (32, 24), (130, 130)),
 )
 
 
 def scale_polygon(points: tuple[tuple[float, float], ...], cx: float, cy: float,
                   scale: float) -> QPolygonF:
-    """Bangun QPolygonF dari koordinat relatif `points` dengan pusat `(cx, cy)` dan skala."""
+    """Build a QPolygonF from relative `points` around `(cx, cy)` scaled by `scale`."""
     return QPolygonF([QPointF(cx + x * scale, cy + y * scale) for x, y in points])
 
 
 def tapered_wedge(side: int, length: float, h_in: float, h_out: float) -> QPolygonF:
-    """Trapesium meruncing ala tombol menu battle Persona 5: sempit di sisi karakter (x=0),
-    melebar ke luar (x = side * length) dengan potongan ujung miring."""
+    """Asymmetric Persona 5 command trapezoid: narrow near the character (x=0), wide outward."""
     if side < 0:
         return QPolygonF([
             QPointF(-length - 6.0, -h_out * 0.56),
@@ -107,177 +140,172 @@ def tapered_wedge(side: int, length: float, h_in: float, h_out: float) -> QPolyg
         QPointF(0.0, h_in * 0.48),
     ])
 
-# Menu klik kanan & menu popup (QMenu)
+
+# Context & SYSTEM popup menus (Persona 5 obsidian + white frame + crimson highlight, constant white text)
 MENU_QSS = """
-QMenu { background-color: #0B0B0B; color: #FFFFFF; border: 2px solid #FFFFFF;
-        padding: 4px; font-family: "Arial Black", "Segoe UI", "Noto Sans", sans-serif;
-        font-weight: bold; }
-QMenu::item { padding: 6px 26px 6px 18px; border-left: 4px solid transparent; }
-QMenu::item:selected { background-color: #E60012; color: #FFFFFF; border-left: 4px solid #FFFFFF; }
-QMenu::item:disabled { color: #777777; }
-QMenu::separator { height: 2px; background: #E60012; margin: 4px 6px; }
-"""
-
-# Palet lembut untuk jendela Notes, Tasks, dan Settings (kartu putih membulat di atas kanvas terang)
-UI_BG = QColor("#EAEEF5")
-UI_CARD = QColor("#FFFFFF")
-UI_SURFACE = QColor("#F6F8FC")
-UI_HOVER = QColor("#EEF2FA")
-UI_SELECTED = QColor("#E9EEFF")
-UI_BORDER = QColor("#E2E7F2")
-UI_TEXT = QColor("#1E2433")
-UI_MUTED = QColor("#737C91")
-UI_ACCENT = QColor("#6E85F7")
-UI_ACCENT_HOVER = QColor("#5B73EB")
-UI_AMBER = QColor("#FCD674")
-UI_AMBER_HOVER = QColor("#F6C956")
-UI_AMBER_SOFT = QColor("#FEF0C7")
-UI_AMBER_TEXT = QColor("#8F5F00")
-UI_MINT_SOFT = QColor("#DCFCE7")
-UI_MINT_TEXT = QColor("#166534")
-UI_ROSE_SOFT = QColor("#FEE4E7")
-UI_ROSE_HOVER = QColor("#FCD1D7")
-UI_ROSE_TEXT = QColor("#C43245")
-UI_LAVENDER_SOFT = QColor("#E3E7FF")
-
-# Stylesheet jendela popup (Notes, Tasks, Settings) — terang, bersih, membulat.
-# Warna teks sengaja tidak berubah saat hover.
-DIALOG_QSS = """
-QLabel {
-    color: #1E2433;
-    font-family: "Segoe UI", "Inter", "Noto Sans", "DejaVu Sans", sans-serif;
-}
-QLabel#heading {
-    color: #1E2433;
-    font-size: 16px;
-    font-weight: bold;
-}
-QLabel#subhead {
-    color: #6E85F7;
+QMenu {
+    background-color: #0E0E12;
+    color: #FFFFFF;
+    border: 2px solid #FFFFFF;
+    padding: 5px 0px;
+    font-family: "Segoe UI", "Liberation Sans", "Noto Sans", "DejaVu Sans", sans-serif;
     font-size: 12px;
     font-weight: bold;
 }
+QMenu::item {
+    padding: 7px 28px 7px 16px;
+    border-left: 4px solid transparent;
+    color: #FFFFFF;
+}
+QMenu::item:selected {
+    background-color: #E60012;
+    color: #FFFFFF;
+    border-left: 4px solid #FFFFFF;
+}
+QMenu::item:disabled {
+    color: #848496;
+}
+QMenu::separator {
+    height: 2px;
+    background: #E60012;
+    margin: 5px 10px;
+}
+QMenu::indicator {
+    width: 13px;
+    height: 13px;
+    margin-left: 6px;
+    border: 1.5px solid #FFFFFF;
+    background: #0E0E12;
+}
+QMenu::indicator:checked {
+    background: #E60012;
+    border: 1.5px solid #FFFFFF;
+}
+"""
+
+# Popup windows (Notes, Tasks, Settings): cohesive dark Persona 5 obsidian / crimson / crisp white.
+# Hover changes background/border only—text color never changes.
+DIALOG_QSS = """
+QLabel {
+    color: #F4F4F8;
+    font-family: "Segoe UI", "Liberation Sans", "Noto Sans", "DejaVu Sans", sans-serif;
+}
+QLabel#heading {
+    color: #FFFFFF;
+    font-family: "Arial Black", "Bahnschrift", "Segoe UI", "Liberation Sans", "DejaVu Sans", sans-serif;
+    font-size: 15px;
+    font-weight: 900;
+}
+QLabel#subhead {
+    color: #FF4B55;
+    font-size: 11px;
+    font-weight: bold;
+}
 QLabel#tip {
-    color: #7B8499;
+    color: #8E8EA0;
     font-size: 11px;
     font-weight: normal;
 }
 QLabel#section {
-    color: #1E2433;
-    font-size: 13px;
-    font-weight: bold;
+    color: #FF4B55;
+    font-family: "Arial Black", "Bahnschrift", "Segoe UI", "Liberation Sans", "DejaVu Sans", sans-serif;
+    font-size: 12px;
+    font-weight: 900;
 }
 QFrame#card {
-    background-color: #FFFFFF;
-    border: 1px solid #E2E7F2;
-    border-radius: 16px;
-}
-QFrame#topbar {
-    background-color: #FFFFFF;
-    border: 1px solid #E2E7F2;
-    border-radius: 14px;
-}
-QFrame#toolbarPill {
-    background-color: #F4F6FB;
-    border: 1px solid #E6EBF5;
+    background-color: #15151B;
+    border: 1px solid #2C2C38;
     border-radius: 10px;
 }
 QFrame#subcard {
-    background-color: #F7F9FD;
-    border: 1px solid #E7ECF5;
-    border-radius: 12px;
+    background-color: #1B1B23;
+    border: 1px solid #323240;
+    border-radius: 8px;
+}
+QFrame#toolbarPill {
+    background-color: #1B1B23;
+    border: 1px solid #2E2E3B;
+    border-radius: 8px;
+}
+QFrame#undoBar {
+    background-color: #24090E;
+    border: 1px solid #E60012;
+    border-radius: 8px;
 }
 QProgressBar {
-    background-color: #EAEEF7;
+    background-color: #1E1E27;
     border: none;
-    border-radius: 4px;
+    border-radius: 3px;
 }
 QProgressBar::chunk {
-    background-color: #6E85F7;
-    border-radius: 4px;
+    background-color: #E60012;
+    border-radius: 3px;
 }
 QToolTip {
-    background-color: #1E2433;
+    background-color: #0B0B0E;
     color: #FFFFFF;
-    border: none;
-    border-radius: 6px;
-    padding: 5px 8px;
+    border: 1.5px solid #E60012;
+    padding: 4px 8px;
     font-size: 11px;
 }
 QLineEdit, QTextEdit, QDateTimeEdit, QTimeEdit, QSpinBox {
-    background-color: #F6F8FC;
-    color: #1E2433;
-    border: 1px solid #E2E7F2;
-    border-radius: 10px;
-    selection-background-color: #B9C9FF;
-    selection-color: #1E2433;
-    padding: 4px 10px;
+    background-color: #1A1A22;
+    color: #F4F4F8;
+    border: 1.5px solid #323240;
+    border-radius: 7px;
+    selection-background-color: #E60012;
+    selection-color: #FFFFFF;
+    padding: 5px 10px;
     font-size: 13px;
-    font-family: "Segoe UI", "Inter", "Noto Sans", "DejaVu Sans", sans-serif;
+    font-family: "Segoe UI", "Liberation Sans", "Noto Sans", "DejaVu Sans", sans-serif;
 }
 QLineEdit:focus, QTextEdit:focus, QDateTimeEdit:focus, QTimeEdit:focus, QSpinBox:focus {
-    background-color: #FFFFFF;
-    border: 1px solid #6E85F7;
+    background-color: #14141A;
+    border: 1.5px solid #E60012;
 }
 QLineEdit#titleInput {
     background-color: transparent;
-    border: 1px solid transparent;
-    border-radius: 8px;
-    font-size: 16px;
+    border: 1.5px solid transparent;
+    border-radius: 6px;
+    font-family: "Segoe UI", "Liberation Sans", "Noto Sans", "DejaVu Sans", sans-serif;
+    font-size: 17px;
     font-weight: bold;
-    color: #1E2433;
-    padding: 4px 6px;
+    color: #FFFFFF;
+    padding: 3px 6px;
 }
 QLineEdit#titleInput:hover {
-    background-color: #F6F8FC;
+    background-color: #1D1D26;
 }
 QLineEdit#titleInput:focus {
-    background-color: #F6F8FC;
-    border: 1px solid #D3DCFA;
+    background-color: #1A1A22;
+    border: 1.5px solid #E60012;
 }
 QLineEdit#searchInput {
-    background-color: #F4F6FB;
-    border: 1px solid #E6EBF5;
-    border-radius: 10px;
+    background-color: #1A1A22;
+    border: 1.5px solid #2C2C38;
+    border-radius: 7px;
     padding: 5px 10px;
     font-size: 12px;
-    color: #1E2433;
+    color: #F4F4F8;
 }
 QLineEdit#searchInput:focus {
-    background-color: #FFFFFF;
-    border: 1px solid #6E85F7;
+    border: 1.5px solid #E60012;
 }
 QTextEdit#noteBody {
-    background-color: #FFFFFF;
-    border: none;
-    padding: 4px 2px;
+    background-color: #121217;
+    border: 1px solid #262632;
+    border-radius: 8px;
+    padding: 8px 10px;
     font-size: 13px;
-    color: #2B3245;
+    color: #EAEAF0;
+}
+QTextEdit#noteBody:focus {
+    border: 1px solid #4A1921;
 }
 QListWidget {
     background-color: transparent;
     border: none;
     outline: none;
-}
-QCheckBox {
-    color: #1E2433;
-    font-weight: 600;
-    font-size: 13px;
-    spacing: 8px;
-}
-QCheckBox::indicator {
-    width: 18px;
-    height: 18px;
-    border: 1.5px solid #C4CCDE;
-    border-radius: 6px;
-    background-color: #FFFFFF;
-}
-QCheckBox::indicator:hover {
-    border: 1.5px solid #6E85F7;
-}
-QCheckBox::indicator:checked {
-    border: 1.5px solid #6E85F7;
-    background-color: #6E85F7;
 }
 QScrollBar:vertical {
     background: transparent;
@@ -285,33 +313,33 @@ QScrollBar:vertical {
     margin: 4px 0px;
 }
 QScrollBar::handle:vertical {
-    background: #CFD6E6;
+    background: #3A3A4A;
     border-radius: 3px;
     min-height: 26px;
 }
 QScrollBar::handle:vertical:hover {
-    background: #AEB8CF;
+    background: #E60012;
 }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
     height: 0px;
 }
 QCalendarWidget QWidget {
-    background-color: #FFFFFF;
-    color: #1E2433;
+    background-color: #15151B;
+    color: #FFFFFF;
 }
 QCalendarWidget QAbstractItemView:enabled {
-    color: #1E2433;
-    background-color: #FFFFFF;
-    selection-background-color: #6E85F7;
+    color: #FFFFFF;
+    background-color: #15151B;
+    selection-background-color: #E60012;
     selection-color: #FFFFFF;
 }
 QCalendarWidget QAbstractItemView:disabled {
-    color: #B2BACB;
+    color: #5C5C6E;
 }
 QCalendarWidget QToolButton {
-    color: #1E2433;
-    background-color: #F4F6FB;
-    border-radius: 6px;
+    color: #FFFFFF;
+    background-color: #20202A;
+    border-radius: 4px;
     padding: 3px 6px;
 }
 """
