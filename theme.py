@@ -7,9 +7,8 @@ Bentuk: jajargenjang miring, bayangan merah bergeser, bintang bergerigi, spike m
 from __future__ import annotations
 
 import math
-import random
 
-from PyQt6.QtCore import QPointF, QRectF, Qt
+from PyQt6.QtCore import QPointF, Qt
 from PyQt6.QtGui import QColor, QFont, QPen, QPolygonF
 
 RED = QColor("#E60012")
@@ -61,30 +60,52 @@ def star_polygon(cx: float, cy: float, r_out: float, r_in: float, points: int = 
     return QPolygonF(pts)
 
 
-def spike_border(rect: QRectF, length: float = 22.0, step: float = 26.0, seed: int = 0,
-                 lean: float = 0.45, jitter: float = 0.45) -> QPolygonF:
-    """Serpihan runcing (spike) di sekeliling `rect`, seperti pecahan merah-hitam di menu
-    Persona 5. Tiap spike menjorok keluar sejauh `length` (diacak, deterministik per `seed`)
-    dan sedikit miring (`lean`). Isi polygon dengan RED/BLACK di belakang bentuk utama."""
-    rnd = random.Random(seed)
-    corners = [rect.topLeft(), rect.topRight(), rect.bottomRight(), rect.bottomLeft()]
-    pts = []
-    for k in range(4):
-        a, b = corners[k], corners[(k + 1) % 4]
-        dx, dy = b.x() - a.x(), b.y() - a.y()
-        side = math.hypot(dx, dy)
-        if side < 1e-6:
-            continue
-        nx, ny = dy / side, -dx / side                 # normal keluar (sisi searah jarum jam)
-        n = max(1, round(side / step))
-        for i in range(n):
-            t0, t1 = i / n, (i + 1) / n
-            pts.append(QPointF(a.x() + dx * t0, a.y() + dy * t0))             # pangkal spike
-            tm = (t0 + t1) / 2 + lean * (t1 - t0) * 0.5                       # ujung, agak miring
-            ln = length * (1.0 - jitter + rnd.random() * jitter * 2.0)
-            pts.append(QPointF(a.x() + dx * tm + nx * ln, a.y() + dy * tm + ny * ln))
-    return QPolygonF(pts)
+# Serpihan spike merah & hitam yang memancar dari belakang karakter (ala menu battle P5).
+# Koordinat relatif terhadap titik pusat ledakan, untuk ukuran sprite dasar 180 px.
+RED_BURST_SHARDS: tuple[tuple[tuple[float, float], ...], ...] = (
+    ((-6, 10), (-26, 2), (-106, -168), (-96, -162)),            # jarum merah tinggi kiri-atas
+    ((-14, 14), (-28, 28), (-248, -114), (-238, -120)),         # garis merah panjang di atas kiri
+    ((-8, 4), (-212, 18), (-186, 48), (-252, 74), (-182, 76),   # pecahan merah besar kiri-bawah
+     (-224, 118), (-128, 96), (-166, 144), (-78, 96), (-12, 54)),
+    ((-24, 40), (-36, 52), (-240, 126)),                        # jarum tipis kiri-bawah
+    ((16, -2), (248, -56), (236, -6), (22, 26)),                # bilah merah di belakang kanan-atas
+    ((10, -14), (24, -6), (178, -126)),                         # jarum merah kanan-atas
+    ((18, 22), (244, 84), (222, 114), (16, 46)),                # bilah merah di bawah kanan-bawah
+    ((18, 34), (30, 26), (192, 134)),                           # jarum tipis kanan-bawah
+)
 
+BLACK_BURST_SHARDS: tuple[tuple[tuple[float, float], ...], ...] = (
+    ((-14, 6), (-36, 18), (-182, -138)),                        # serpihan hitam kiri-atas
+    ((-18, 2), (-244, -8), (-22, 20)),                          # jarum hitam di celah kiri
+    ((-16, 30), (-38, 44), (-196, 126)),                        # tebasan hitam kiri-bawah
+    ((12, -10), (30, -2), (144, -118)),                         # serpihan hitam kanan-atas
+    ((20, 4), (238, 12), (20, 22)),                             # jarum hitam di celah kanan
+    ((12, 34), (32, 24), (130, 130)),                           # serpihan hitam kanan-bawah
+)
+
+
+def scale_polygon(points: tuple[tuple[float, float], ...], cx: float, cy: float,
+                  scale: float) -> QPolygonF:
+    """Bangun QPolygonF dari koordinat relatif `points` dengan pusat `(cx, cy)` dan skala."""
+    return QPolygonF([QPointF(cx + x * scale, cy + y * scale) for x, y in points])
+
+
+def tapered_wedge(side: int, length: float, h_in: float, h_out: float) -> QPolygonF:
+    """Trapesium meruncing ala tombol menu battle Persona 5: sempit di sisi karakter (x=0),
+    melebar ke luar (x = side * length) dengan potongan ujung miring."""
+    if side < 0:
+        return QPolygonF([
+            QPointF(-length - 6.0, -h_out * 0.56),
+            QPointF(2.0, -h_in * 0.52),
+            QPointF(0.0, h_in * 0.48),
+            QPointF(-length + 8.0, h_out * 0.46),
+        ])
+    return QPolygonF([
+        QPointF(-2.0, -h_in * 0.52),
+        QPointF(length + 6.0, -h_out * 0.56),
+        QPointF(length - 8.0, h_out * 0.46),
+        QPointF(0.0, h_in * 0.48),
+    ])
 
 # Menu klik kanan & menu popup (QMenu)
 MENU_QSS = """
