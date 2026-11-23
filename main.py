@@ -433,8 +433,7 @@ class PetWindow(QWidget):
         self._gx = self._gy = 0.0
         self._fpos = QPointF()
 
-        side = size + 2 * PAD
-        self.setFixedSize(side, side)
+        self._resize_window(keep_center=False)
         self.setCursor(Qt.CursorShape.OpenHandCursor)
         self._ticker = FrameTicker(self._frame, self)
 
@@ -442,6 +441,31 @@ class PetWindow(QWidget):
     @property
     def sprite_size(self) -> int:
         return self._sprite_size
+
+    def hud_top_local(self) -> int:
+        return PAD + int(round(self._sprite_size * 0.97)) + 4
+
+    def hud_height(self) -> int:
+        return max(22, int(round(27 * self._ui_scale)))
+
+    def _resize_window(self, keep_center: bool = True) -> None:
+        old_center = self.sprite_center() if keep_center else None
+        w = max(self._sprite_size + 2 * PAD, int(round(176 * self._ui_scale)) + 16)
+        h = self.hud_top_local() + self.hud_height() + 10
+        self.setFixedSize(w, h)
+        if old_center is not None:
+            self.move(old_center.x() - w // 2, old_center.y() - (PAD + self._sprite_size // 2))
+
+    def sprite_center(self) -> QPoint:
+        return QPoint(self.x() + self.width() // 2, self.y() + PAD + self._sprite_size // 2)
+
+    def visual_top(self) -> int:
+        return self.y() + PAD + int(round(self._sprite_size * 0.08))
+
+    def visual_bottom(self) -> int:
+        if self._hud or self._badge:
+            return self.y() + self.hud_top_local() + self.hud_height() + 5
+        return self.y() + PAD + int(round(self._sprite_size * 0.95)) + 3
 
     def set_state(self, state: str, emotion: str | None = None) -> None:
         """Ganti gaya gerak (state) dan ekspresi wajah. Tanpa `emotion`, dipakai ekspresi dasar state."""
@@ -494,14 +518,12 @@ class PetWindow(QWidget):
 
     def set_ui_scale(self, scale: float) -> None:
         self._ui_scale = max(0.75, min(1.5, float(scale)))
+        self._resize_window(keep_center=True)
         self.update()
 
     def set_sprite_size(self, size: int) -> None:
-        center = self.geometry().center()
         self._sprite_size = size
-        side = size + 2 * PAD
-        self.setFixedSize(side, side)
-        self.move(center.x() - side // 2, center.y() - side // 2)
+        self._resize_window(keep_center=True)
         self.update()
 
     # -- loop animasi -----------------------------------------------------------
@@ -602,8 +624,8 @@ class PetWindow(QWidget):
         pm = self._sprites.get(expr, self._sprite_size, self.devicePixelRatioF(), eye, mouth)
         dpr = pm.devicePixelRatio()
         w, h = pm.width() / dpr, pm.height() / dpr
-        x = PAD + (self._sprite_size - w) / 2
-        y = PAD + (self._sprite_size - h) / 2
+        x = (self.width() - w) / 2.0
+        y = PAD + (self._sprite_size - h) / 2.0
         p.drawPixmap(QPointF(x, y), pm)
 
     def paintEvent(self, _event) -> None:
@@ -666,9 +688,9 @@ class PetWindow(QWidget):
                 break
             sc *= (self.width() - 12) / max(1.0, w)
 
-        h = max(22.0, 27.0 * sc)
+        h = float(self.hud_height())
         x = (self.width() - w) / 2.0
-        y = self.height() - h - 5.0
+        y = float(self.hud_top_local())
 
         outer = QPolygonF([
             QPointF(x + skew, y),
@@ -885,6 +907,8 @@ class BubbleWindow(QWidget):
         super().__init__()
         setup_overlay(self)
         self._pet = pet
+        self._menu = None
+        self._avoid_rects_fn = None
         self._pages: list[list[str]] = []
         self._page_idx = 0
         self._lines: list[str] = []
@@ -895,7 +919,7 @@ class BubbleWindow(QWidget):
         self._bw = self._bh = 0
         self._line_h = 20
         self._ascent = 14
-        self._below = False
+        self._below = True
         self._tail_x = 0
         self._closing = False
         self._ui_scale = 1.0
@@ -915,6 +939,12 @@ class BubbleWindow(QWidget):
         self._hide_timer.timeout.connect(self._on_page_timeout)
         self._ticker = FrameTicker(self._frame, self)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def set_menu(self, menu) -> None:
+        self._menu = menu
+
+    def set_avoid_rects(self, fn) -> None:
+        self._avoid_rects_fn = fn
 
     def set_ui_scale(self, scale: float) -> None:
         sc = max(0.75, min(1.5, float(scale)))
@@ -1015,24 +1045,72 @@ class BubbleWindow(QWidget):
             return False
         return moving or self._closing
 
+    def visible_global_rect(self) -> QRect:
+        """Exact visible bounding rect of the dialogue box in global screen coordinates."""
+        tag_over = 0 if self._use_img else self.TAG_OVER
+        shadow = 0 if self._use_img else self.SHADOW
+        top = self.M + tag_over + (self._tail_h if self._below else 0)
+        return QRect(self.x() + self.M, self.y() + top - tag_over,
+                     self._bw + shadow, self._bh + tag_over + shadow)
+
     def _place(self) -> None:
-        pet = self._pet.geometry()
-        screen = QGuiApplication.screenAt(pet.center()) or QGuiApplication.primaryScreen()
+        center = self._pet.sprite_center()
+        screen = QGuiApplication.screenAt(center) or QGuiApplication.primaryScreen()
         area = screen.availableGeometry()
         w = self.width()
-        size = self._pet.sprite_size
         tag_over = 0 if self._use_img else self.TAG_OVER
+        shadow = 0 if self._use_img else self.SHADOW
+        gap = 8
 
-        head_y = pet.top() + PAD + int(size * 0.10)
-        tip_local = self.M + tag_over + self._bh + self._tail_h
-        y = head_y - tip_local
-        self._below = y < area.top()
-        if self._below:
-            foot_y = pet.bottom() - PAD - int(size * 0.04)
-            y = foot_y - (self.M + tag_over)
-        x = pet.center().x() - w // 2
+        # Default: strictly BELOW Morgana (clearing HUD badge AND open radial menu wedges)
+        bottom_barrier = self._pet.visual_bottom()
+        top_barrier = self._pet.visual_top()
+        if self._menu is not None and self._menu.is_open:
+            bottom_barrier = max(bottom_barrier, self._menu.wedges_global_bottom())
+            top_barrier = min(top_barrier, self._menu.wedges_global_top())
+
+        vis_top_below = self.M + (self._tail_h if not self._use_img else 0)
+        vis_bot_below = self.M + tag_over + self._tail_h + self._bh + shadow
+        y_below = bottom_barrier + gap - vis_top_below
+
+        vis_top_above = self.M
+        vis_bot_above = self.M + tag_over + self._bh + self._tail_h + shadow
+        y_above = top_barrier - gap - vis_bot_above
+
+        if y_below + vis_bot_below <= area.bottom() - 4:
+            self._below = True
+            y = y_below
+        elif y_above + vis_top_above >= area.top() + 4:
+            self._below = False
+            y = y_above
+        else:
+            # Tiny screen fallback: pick whichever side has more open space
+            space_below = area.bottom() - bottom_barrier
+            space_above = top_barrier - area.top()
+            self._below = space_below >= space_above
+            y = max(area.top() - vis_top_above,
+                    min(y_below if self._below else y_above, area.bottom() - vis_bot_below))
+
+        x = center.x() - w // 2
         x = max(area.left(), min(x, area.right() - w))
-        self._tail_x = max(self.M + 24, min(pet.center().x() - x, w - self.M - self.SHADOW - 34))
+
+        # Avoid overlapping any open dialog window horizontally when space permits
+        if self._avoid_rects_fn is not None:
+            vis_y = y + (vis_top_below if self._below else vis_top_above)
+            vis_h = self._bh + tag_over + shadow
+            cand = QRect(x + self.M, vis_y, self._bw + shadow, vis_h)
+            for obstacle in self._avoid_rects_fn():
+                if cand.intersects(obstacle):
+                    # Try shifting clear to the right of the dialog, else to the left
+                    rx = obstacle.right() + gap - self.M
+                    lx = obstacle.left() - gap - self._bw - shadow - self.M
+                    if rx + w <= area.right() and not QRect(rx + self.M, vis_y, self._bw + shadow, vis_h).intersects(obstacle):
+                        x = rx
+                    elif lx >= area.left() and not QRect(lx + self.M, vis_y, self._bw + shadow, vis_h).intersects(obstacle):
+                        x = lx
+                    break
+
+        self._tail_x = max(self.M + 24, min(center.x() - x, w - self.M - self.SHADOW - 34))
         self.move(x, y)
 
     def _paint_box(self, p: QPainter, x0: float, y0: float) -> None:
@@ -1210,7 +1288,7 @@ class MenuBackdrop(QWidget):
     def configure(self, w: int, h: int, u: float) -> None:
         self.setFixedSize(w, h)
         self._u = u
-        cx, cy = w / 2.0, h / 2.0 + 10.0 * u
+        cx, cy = w / 2.0, h / 2.0
         self._red = [scale_polygon(pts, cx, cy, u) for pts in RED_BURST_SHARDS]
         self._black = [scale_polygon(pts, cx, cy, u) for pts in BLACK_BURST_SHARDS]
 
@@ -1227,7 +1305,7 @@ class MenuBackdrop(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setOpacity(opacity)
         cx = self.width() / 2.0
-        cy = self.height() / 2.0 + 10.0 * self._u
+        cy = self.height() / 2.0
         live = clamp(self._burst)
         pulse = 1.0 + 0.016 * math.sin(self._t * 2.4) * live
         sc = (0.18 + 0.82 * max(self._burst, 0.0)) * pulse
@@ -1247,7 +1325,7 @@ class MenuBackdrop(QWidget):
 class RadialMenu(QWidget):
     """Menu radial bergaya menu battle Persona 5:
       * Lapisan belakang (MenuBackdrop): ledakan serpihan spike merah-hitam di belakang karakter.
-      * Lapisan depan (jendela ini): 4 tombol trapesium meruncing yang mengipas dari kiri & kanan
+      * Lapisan depan (jendela ini): 6 tombol trapesium (3 kiri + 3 kanan) yang mengipas dari
         karakter, huruf besar bergaya cutout dengan subjudul bergaris hitam di tepi bawah.
       * Hover: bilah bergeser keluar, sapuan merah diagonal + bayangan putih + bintang berputar.
       * Tutup dengan redaman kritis (tanpa pantulan)."""
@@ -1265,18 +1343,18 @@ class RadialMenu(QWidget):
         self.setMouseTracking(True)
         self._pet = pet
         self._backdrop = MenuBackdrop()
-        # 6-wedge P5 battle fan: 2 left (EVENTS, SYSTEM) + 4 right D-pad arc (TASKS, NOTES, STATS, TIMER)
+        # 6-wedge P5 battle fan: 3 left (EVENTS, TIMER, SYSTEM) + 3 right (TASKS, NOTES, STATS)
         self._buttons = [
-            MenuButton("events", "EVENTS", "This Week",       -1, -66, -24, +21.0, 182, 27, 52, 2, 0.0),
-            MenuButton("tasks",  "TASKS",  "To-Do List",      +1, +58, -78, -23.0, 174, 25, 48, 2, 1.0),
-            MenuButton("notes",  "NOTES",  "Quick Notes",     +1, +92, -20,  -6.5, 174, 25, 48, 2, 2.0),
-            MenuButton("stats",  "STATS",  "Social Stats",    +1, +56, +34,  +7.5, 174, 25, 48, 2, 3.0),
-            MenuButton("timer",  "TIMER",  "Focus & Timers",  +1, +74, +90, +23.0, 174, 25, 48, 2, 4.0),
-            MenuButton("system", "SYSTEM", "Options & Sleep", -1, -68, +38, -10.5, 184, 26, 50, 2, 5.0),
+            MenuButton("events", "EVENTS", "This Week",       -1, -80, -56, +20.0, 176, 25, 48, 2, 0.0),
+            MenuButton("tasks",  "TASKS",  "To-Do List",      +1, +78, -56, -20.0, 176, 25, 48, 2, 1.0),
+            MenuButton("timer",  "TIMER",  "Focus & Timers",  -1, -94,  -4,  +2.0, 176, 25, 48, 2, 2.0),
+            MenuButton("notes",  "NOTES",  "Quick Notes",     +1, +92,  -4,  -2.0, 176, 25, 48, 2, 3.0),
+            MenuButton("system", "SYSTEM", "Options & Sleep", -1, -88, +48, -11.0, 176, 25, 48, 2, 4.0),
+            MenuButton("stats",  "STATS",  "Social Stats",    +1, +86, +48, +11.0, 176, 25, 48, 2, 5.0),
         ]
         self._u = 1.0                                    # button & font scale
-        self._u_pos = 1.0                                # horizontal clearance from Morgana body
-        self._u_y = 1.0                                  # vertical separation scale (prevents overlap at high UI scale)
+        self._u_pos = 1.0                                # horizontal clearance from Morgana & HUD
+        self._u_y = 1.0                                  # vertical separation scale
         self._ui_scale = 1.0
         self._burst = Spring(0.0, 260.0, 17.0)           # animasi ledakan spike di belakang
         self._geom: dict[str, tuple] = {}                # cache poligon, huruf, dan path subjudul
@@ -1357,13 +1435,14 @@ class RadialMenu(QWidget):
         return L, h_in, h_out, poly, shape, glyphs, sub_path
 
     def _layout(self) -> None:
-        u_pos = max(0.72, self._pet.sprite_size / 180.0)
-        u_btn = max(0.70, u_pos * self._ui_scale)
-        u_box = max(u_pos, u_btn)
-        self._u_pos = u_pos
+        u_sprite = max(0.72, self._pet.sprite_size / 180.0)
+        u_btn = max(0.70, u_sprite * self._ui_scale)
+        u_x = max(u_sprite, u_btn, self._ui_scale)
+        u_box = max(u_x, u_btn)
+        self._u_pos = u_x
         self._u = u_btn
-        self._u_y = u_box
-        w, h = int(770 * u_box), int(500 * u_box)
+        self._u_y = max(u_sprite, u_btn)
+        w, h = int(840 * u_box), int(460 * u_box)
         self.setFixedSize(w, h)
         self._backdrop.configure(w, h, u_box)
         self._geom = {b.key: self._build_button_cache(b, u_btn) for b in self._buttons}
@@ -1387,7 +1466,7 @@ class RadialMenu(QWidget):
         for b in self._buttons:
             b.pop.configure(self.OPEN_STIFFNESS, self.OPEN_DAMPING)
         self.follow(force=True)
-        # Urutan tumpukan: spike belakang -> karakter Morgana -> 4 tombol di depan
+        # Urutan tumpukan: spike belakang -> karakter Morgana -> 6 tombol di depan
         self._backdrop.show()
         self._pet.raise_()
         self.show()
@@ -1415,10 +1494,36 @@ class RadialMenu(QWidget):
 
     def follow(self, force: bool = False) -> None:
         if self.isVisible() or force:
-            c = self._pet.geometry().center()
+            c = self._pet.sprite_center()
             pos = QPoint(c.x() - self.width() // 2, c.y() - self.height() // 2)
             self.move(pos)
             self._backdrop.move(pos)
+
+    def wedges_global_bottom(self) -> int:
+        """Lowest global Y reached by any radial wedge (including hover/shadow/subtitle)."""
+        if not self._geom:
+            return self._pet.visual_bottom()
+        u = self._u
+        max_y = float(self.height() / 2.0)
+        for b in self._buttons:
+            poly = self._geom[b.key][3]
+            for hv in (0.0, 1.0):
+                br = self._xf(b, pop=1.0, hover=hv, wobble=False).map(poly).boundingRect()
+                max_y = max(max_y, br.bottom() + 10.0 * u)
+        return self.y() + int(math.ceil(max_y))
+
+    def wedges_global_top(self) -> int:
+        """Highest global Y reached by any radial wedge (including hover)."""
+        if not self._geom:
+            return self._pet.visual_top()
+        u = self._u
+        min_y = float(self.height() / 2.0)
+        for b in self._buttons:
+            poly = self._geom[b.key][3]
+            for hv in (0.0, 1.0):
+                br = self._xf(b, pop=1.0, hover=hv, wobble=False).map(poly).boundingRect()
+                min_y = min(min_y, br.top() - 6.0 * u)
+        return self.y() + int(math.floor(min_y))
 
     # -- loop animasi ---------------------------------------------------------
     def _frame(self, dt: float) -> bool:
@@ -1464,7 +1569,7 @@ class RadialMenu(QWidget):
         fy = math.cos(self._t * 1.25 + b.phase * 1.3) * 2.4 * u * live if wobble else 0.0
         sway = math.sin(self._t * 1.1 + b.phase) * 0.7 * live if wobble else 0.0
         cx = self.width() / 2.0
-        cy = self.height() / 2.0 + 10.0 * self._u_pos
+        cy = self.height() / 2.0
         t = QTransform()
         t.translate(cx + b.ox * self._u_pos * pop + fx, cy + b.oy * self._u_y * pop + fy)
         t.rotate(b.rot + (1.0 - live) * 20.0 * -b.side + sway)      # mengipas masuk saat muncul
@@ -1930,7 +2035,10 @@ class PetController(QObject):
         self.bubble.dismissed.connect(self._restore_state)
         self.bubble.typing_finished.connect(lambda: self.pet.set_speaking(False))
         self.bubble.page_started.connect(lambda: self.pet.set_speaking(True))
+        self.bubble.set_menu(self.menu)
+        self.bubble.set_avoid_rects(self._visible_dialog_rects)
         self.menu.triggered.connect(self._on_menu_action)
+        self.menu.closed.connect(self.bubble.follow)
         self.pomodoro.tick.connect(self._on_pomo_tick)
         self.pomodoro.phase_started.connect(self._on_pomo_phase)
         self.pomodoro.finished.connect(self._on_pomo_finished)
@@ -2075,12 +2183,22 @@ class PetController(QObject):
         self._sync_timer_ui()
         self.timer_dialog.show_near(self.pet.geometry())
 
+    def _visible_dialog_rects(self) -> list[QRect]:
+        rects: list[QRect] = []
+        for dlg in (self.tasks_dialog, self.notes_dialog, self.events_dialog,
+                    self.stats_dialog, self.timer_dialog, self.settings_dialog):
+            if dlg is not None and dlg.isVisible():
+                rects.append(dlg.geometry())
+        return rects
+
     def _open_settings_deferred(self) -> None:
         """Open Settings after any QMenu/button release finishes (prevents Windows popup grab race)."""
         QTimer.singleShot(60, self._open_settings)
 
     def _on_menu_action(self, key: str, anchor: QPoint) -> None:
         self.menu.close_menu()
+        if key in ("events", "agenda", "tasks", "notes", "stats", "timer"):
+            self.bubble.dismiss()
         if key in ("events", "agenda"):
             self._open_events()
         elif key == "tasks":
@@ -2313,6 +2431,7 @@ class PetController(QObject):
 
     # -- Pomodoro & Manual Timers (Persona 5 Timer + HUD) -------------------------
     def _sync_timer_ui(self) -> None:
+        had_hud = self.pet._hud is not None
         manual = self.manual_timers.snapshot()
         if self.pomodoro.running:
             is_rest = self.pomodoro.phase == PomodoroTimer.REST
@@ -2338,6 +2457,9 @@ class PetController(QObject):
             )
         else:
             self.pet.clear_hud()
+
+        if (self.pet._hud is not None) != had_hud:
+            self.bubble.follow()
 
         if self.timer_dialog is not None:
             total_s = self.pomodoro.rest_s if self.pomodoro.phase == PomodoroTimer.REST else self.pomodoro.focus_s
@@ -2630,7 +2752,11 @@ class PetController(QObject):
 
     def _move_to_corner(self, screen) -> None:
         area = screen.availableGeometry()
-        self.pet.move(area.right() - self.pet.width() - 24, area.bottom() - self.pet.height() - 24)
+        bubble_reserve = min(area.height() // 2, int(round(195 * self.ui_scale)) + 20)
+        right_reserve = min(area.width() // 3, max(48, int(round(180 * self.ui_scale))))
+        x = max(area.left() + 24, area.right() - self.pet.width() - right_reserve)
+        y = max(area.top() + 24, area.bottom() - self.pet.height() - bubble_reserve)
+        self.pet.move(x, y)
 
 
 # ---------------------------------------------------------------------------

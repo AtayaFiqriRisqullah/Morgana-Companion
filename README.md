@@ -3,7 +3,7 @@
 Desktop companion bot themed after Morgana from Persona 5. Built with PyQt6.
 
 ## Features
-- Floating pet overlay with `Morgana/textbox.png` (tilted nameplate + 3-slice dialogue box) and a 6-wedge Persona 5 battle-menu style radial menu (2 left: `EVENTS`, `SYSTEM`; 4 right D-pad fan: `TASKS`, `NOTES`, `STATS`, `TIMER`) with radiating red-black spikes behind Morgana and a spinning star on hover
+- Floating pet overlay with `Morgana/textbox.png` (tilted nameplate + 3-slice dialogue box placed cleanly below Morgana without overlapping UI elements) and a 6-wedge Persona 5 battle-menu style radial menu (3 left: `EVENTS`, `TIMER`, `SYSTEM`; 3 right: `TASKS`, `NOTES`, `STATS`) with radiating red-black spikes behind Morgana and a spinning star on hover
 - Persona 5 Morgana sprites: 10 expressions, blinking eyes, and a mouth that moves while text is typed. The expression follows the dialogue (e.g. shouting for "Go to bed!" or "Time's up!", excited for "RANK UP!")
 - **Weekly Events window (`EVENTS`)**: dedicated 7-day Google Calendar view grouped by day with an interactive day strip and a dedicated Morgana briefing banner announcing your next upcoming event (works with a 7-day sample schedule when not configured)
 - **Social Stats (`STATS`)**: Persona 5 Royal-inspired 5-stat pentagon tracker (`Knowledge`, `Guts`, `Proficiency`, `Charm`, `Kindness`) for daily 2-hour time blocks (`Daytime` / `After School` / `Evening`), customizable point logging (`+1`/`+2`/`+3`/`+5` or custom), 20-point level intervals (`0–20` Lv 1, `21–40` Lv 2, …), rank-up celebrations, and 5-second undo
