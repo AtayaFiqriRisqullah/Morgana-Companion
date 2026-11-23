@@ -3,15 +3,15 @@
 Desktop companion bot themed after Morgana from Persona 5. Built with PyQt6.
 
 ## Features
-- Floating pet overlay with `assets/Morgana/textbox.png` (tilted nameplate + 3-slice dialogue box placed cleanly below Morgana without overlapping UI elements) and a 6-wedge Persona 5 battle-menu style radial menu (3 left: `EVENTS`, `TIMER`, `SYSTEM`; 3 right: `TASKS`, `NOTES`, `STATS`) with radiating red-black spikes behind Morgana and a spinning star on hover
-- Persona 5 Morgana sprites: 10 expressions, blinking eyes, and a mouth that moves while text is typed. Both expression and Japanese voiceline follow the dialogue context (e.g. `Oi!` for timers/deadlines, `Dousuru?` when opening the radial menu, `Oooh!` on rank-ups, `Yare yare...` at bedtime, `Uwooooh!` on fast bounces)
-- **Persona 5 Audio Engine (`assets/audio/`)**: radial menu hover/open/close SFX, window open/close cues, 3-stage P5R Social Stats point-gain & level-up fanfare synced with pentagon animations, and 8 Morgana voicelines — with live volume control & quick mute in Settings and the right-click menu
+- Floating pet overlay with `assets/Morgana/textbox.png` (tilted nameplate + 3-slice dialogue box placed cleanly below Morgana without overlapping UI elements) and a configurable 6-wedge Persona 5 battle-menu style radial menu (3 left: `EVENTS`, `TIMER`, `SYSTEM`; 3 right: `TASKS`, `NOTES`, `STATS` — enable or disable individual tabs in **Settings**) with radiating red-black spikes behind Morgana and a spinning star on hover
+- Context-aware Morgana sprites & dialogue: 10 expressions, blinking eyes, lip-sync typing, and dynamic lines that react to opening/closing the radial menu and dialog windows, task completions, timers, schedules, wall bounces, and time of day — paired naturally with 8 Japanese voicelines (`Dousuru?`, `Fumu...`, `Oi!`, `Naa naa`, `Oh?`, `Oooh!`, `Uwooooh!`, `Yare yare...`)
+- **Persona 5 Audio Engine (`assets/audio/`)**: radial menu & in-window UI hover/select/cancel SFX, window open/close cues, 3-stage P5R Social Stats point-gain & level-up fanfare synced with pentagon animations, and 8 Morgana voicelines — with live volume control & quick mute in Settings and the right-click menu
 - **Weekly Events window (`EVENTS`)**: dedicated 7-day Google Calendar view grouped by day with an interactive day strip and a dedicated Morgana briefing banner announcing your next upcoming event (works with a 7-day sample schedule when not configured)
 - **Social Stats (`STATS`)**: Persona 5 Royal-inspired 5-stat pentagon tracker (`Knowledge`, `Guts`, `Proficiency`, `Charm`, `Kindness`) for daily 2-hour time blocks (`Daytime` / `After School` / `Evening`), customizable point logging (`+1`/`+2`/`+3`/`+5` or custom), 20-point level intervals (`0–20` Lv 1, `21–40` Lv 2, …), animated pentagon & rank-up celebrations, and 5-second undo
 - **Focus Mode & Manual Timers (`TIMER`)**: redesigned Persona 5 Focus Mode scoreboard (Pomodoro focus/break durations, live progress, session count) + multiple concurrent manual countdown timers with quick presets and Morgana alerts, backed by a slanted Persona 5 HUD tag under Morgana
-- Cohesive Persona 5 dark-themed Notes (pin, categories, reminders, debounced autosave, undo), Tasks (priority, search, filters, undo), and Settings (bedtime, reminders, focus timer, audio volume, UI size, behavior) dialogs
+- Cohesive Persona 5 dark-themed Notes (pin, categories, reminders, debounced autosave, undo), Tasks (priority, search, filters, undo), and Settings (bedtime, reminders, focus timer, audio volume, radial menu tab toggles, UI size, behavior) dialogs
 - Live UI scaling (`75%–150%`) via right-click **UI SIZE** presets (`85%` / `100%` / `115%` / `130%`) or **Settings → UI size**, scaling dialogue box, radial menu, menus, timer HUD, and all dialog windows without restarting
-- Bedtime reminders, system monitor (CPU/RAM), and Morgana quotes (edit `morgana_list.md`)
+- Bedtime reminders (default every 30 seconds during bedtime window), system monitor (CPU/RAM), and customizable Morgana quotes (edit `morgana_list.md`)
 - Auto-start on Windows and Linux
 
 ## Setup
