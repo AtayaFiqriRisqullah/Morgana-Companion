@@ -1,12 +1,14 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller spec for Morgana Companion (onedir, windowed).
+"""PyInstaller spec for Morgana Companion (onedir, windowed, Windows & Linux).
 
 Build with:
-    pyinstaller --noconfirm MorganaCompanion.spec
+    pyinstaller --noconfirm --clean MorganaCompanion.spec
 """
+import sys
 from pathlib import Path
 
 ROOT = Path(SPECPATH)
+ICON = str(ROOT / "Morgana" / "morgana.ico") if sys.platform.startswith("win") else None
 
 a = Analysis(
     ["main.py"],
@@ -39,7 +41,7 @@ exe = EXE(
     upx=True,
     console=False,
     disable_windowed_traceback=False,
-    icon=str(ROOT / "Morgana" / "morgana.ico"),
+    icon=ICON,
 )
 coll = COLLECT(
     exe,

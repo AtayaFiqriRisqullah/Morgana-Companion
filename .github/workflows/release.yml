@@ -1,4 +1,4 @@
-name: Build & Release Windows Executable
+name: Build & Release (Windows & Linux)
 
 on:
   push:
@@ -31,27 +31,86 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
 
-      - name: Build executable with PyInstaller
+      - name: Build Windows executable
         run: |
           pyinstaller --noconfirm --clean MorganaCompanion.spec
 
-      - name: Package release archive
+      - name: Package Windows archive
         shell: pwsh
         run: |
           $tag = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}" } else { "${{ inputs.tag }}" }
           $zip = "dist/Morgana-Companion-$tag-win64.zip"
           Compress-Archive -Path "dist/Morgana Companion" -DestinationPath $zip -Force
-          echo "RELEASE_TAG=$tag" >> $env:GITHUB_ENV
-          echo "RELEASE_ZIP=$zip" >> $env:GITHUB_ENV
+          echo "ARCHIVE=$zip" >> $env:GITHUB_ENV
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-win64
+          path: ${{ env.ARCHIVE }}
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Qt6 system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1 libegl1 libxcb-cursor0 libxkbcommon-x11-0 \
+            libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
+            libxcb-render-util0 libxcb-shape0 libxcb-xfixes0 libxcb-xinerama0
+
+      - name: Install Python dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build Linux executable
+        run: |
+          pyinstaller --noconfirm --clean MorganaCompanion.spec
+
+      - name: Package Linux archive
+        run: |
+          TAG=$([ "${{ github.ref_type }}" = "tag" ] && echo "${{ github.ref_name }}" || echo "${{ inputs.tag }}")
+          TAR="dist/Morgana-Companion-${TAG}-linux-x64.tar.gz"
+          tar -czf "$TAR" -C dist "Morgana Companion"
+          echo "ARCHIVE=$TAR" >> "$GITHUB_ENV"
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-x64
+          path: ${{ env.ARCHIVE }}
+
+  publish-release:
+    needs: [build-windows, build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
 
       - name: Create or update GitHub Release
-        shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $exists = gh release view "$env:RELEASE_TAG" 2>$null
-          if ($LASTEXITCODE -eq 0) {
-            gh release upload "$env:RELEASE_TAG" "$env:RELEASE_ZIP" --clobber
-          } else {
-            gh release create "$env:RELEASE_TAG" "$env:RELEASE_ZIP" --title "Morgana Companion $env:RELEASE_TAG" --generate-notes
-          }
+          TAG=$([ "${{ github.ref_type }}" = "tag" ] && echo "${{ github.ref_name }}" || echo "${{ inputs.tag }}")
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release-assets/* --clobber
+          else
+            gh release create "$TAG" release-assets/* \
+              --title "Morgana Companion $TAG" \
+              --generate-notes
+          fi

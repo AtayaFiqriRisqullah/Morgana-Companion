@@ -20,3 +20,4 @@ pet.log
 build/
 dist/
 *.zip
+*.tar.gz
