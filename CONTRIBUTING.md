@@ -39,7 +39,7 @@ This document outlines the architecture, UI/UX, packaging, and Git rules for dev
 ## 3. Git, Security & Cross-Platform Releases
 
 - **Commit format:** Use **Conventional Commits** in English, imperative mood, summary ≤ 72 characters, grouped into logical incremental commits (e.g., `feat(ui): ...`, `fix(dialogs): ...`, `ci(release): ...`).
-- **Never commit secrets or runtime files:** Keep `credentials.json`, `token.json`, `settings.json`, `tasks.json`, `notes.json`, `pet.log`, `__pycache__/`, `build/`, `dist/`, `*.zip`, and `*.tar.gz` ignored in `.gitignore`.
+- **Never commit secrets or runtime files:** Keep `credentials.json`, `token.json`, `settings.json`, `tasks.json`, `notes.json`, `social_stats.json`, `pet.log`, `__pycache__/`, `build/`, `dist/`, `*.zip`, and `*.tar.gz` ignored in `.gitignore`.
 - **Windows & Linux compatibility:**
   - Guard OS-specific code with `sys.platform` (e.g., `autostart.py`, `MorganaCompanion.spec`) so both `build-windows` and `build-linux` jobs in `.github/workflows/release.yml` pass cleanly.
 - **Pre-push verification:** Run `python3 -m py_compile *.py` and verify UI rendering (including `85%` and `130%` UI scales) before pushing to `main`.
