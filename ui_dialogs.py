@@ -604,6 +604,9 @@ class P5FluidPanel(QWidget):
 
     def showEvent(self, e) -> None:
         super().showEvent(e)
+        if not self._closing and self._open.value < 0.35 and self._open.target < 0.5:
+            self._open.snap(1.0)
+            self.setWindowOpacity(1.0)
         self.refresh()
 
     def show_near(self, anchor: QRect, prefer_center: bool = False) -> None:
@@ -3325,6 +3328,7 @@ class SettingsDialog(P5FluidPanel):
     saved = pyqtSignal()
     always_on_top_changed = pyqtSignal(bool)
     autostart_changed = pyqtSignal(bool)
+    test_ai_requested = pyqtSignal(dict)
 
     def __init__(self, store: SettingsStore, get_on_top=None, get_autostart=None,
                  get_hotkey_status=None, on_top: bool = True, ui_scale: float = 1.0) -> None:
@@ -3489,31 +3493,61 @@ class SettingsDialog(P5FluidPanel):
         law.addWidget(self._hotkey_status_lbl)
         cards_lay.addWidget(c_aw)
 
-        # Card 6: Optional AI Chat Backend (strictly opt-in, off by default)
+        # Card 6: AI Companion (Google Gemini API Key or OpenAI-Compatible / Ollama)
         c_ai = _make_card()
         lai = QVBoxLayout(c_ai)
         lai.setContentsMargins(pad_x, pad_y, pad_x, pad_y)
         lai.setSpacing(row_gap)
-        hai = QLabel("OPTIONAL AI CHAT (QUICK COMMAND)")
+        hai = QLabel("AI COMPANION (GEMINI / JOKER ↔ MORGANA)")
         hai.setObjectName("section")
         lai.addWidget(hai)
-        self.ai_enabled_check = P5CheckBox("Use OpenAI-compatible AI (Ollama / OpenAI) for free chat", scale=sc)
+
+        self.ai_enabled_check = P5CheckBox("Enable AI Morgana ↔ Joker dialogue (opt-in)", scale=sc)
         self.ai_enabled_check.toggled.connect(self._sync_ai_fields)
         lai.addWidget(self.ai_enabled_check)
-        self.ai_endpoint_edit = QLineEdit()
-        self.ai_endpoint_edit.setPlaceholderText("http://localhost:11434/v1/chat/completions")
-        self._row(lai, "API Endpoint", self.ai_endpoint_edit, wide=True)
-        self.ai_model_edit = QLineEdit()
-        self.ai_model_edit.setPlaceholderText("llama3.2")
-        self._row(lai, "Model", self.ai_model_edit, wide=True)
+
+        self.ai_provider_combo = P5ComboBox()
+        self.ai_provider_combo.addItem("Google Gemini (API Key)", "gemini")
+        self.ai_provider_combo.addItem("OpenAI-Compatible / Ollama", "openai")
+        self.ai_provider_combo.currentIndexChanged.connect(self._on_ai_provider_changed)
+        self._row(lai, "Provider", self.ai_provider_combo, wide=True)
+
         self.ai_key_edit = QLineEdit()
         self.ai_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.ai_key_edit.setPlaceholderText("Optional (blank for local Ollama)")
+        self.ai_key_edit.setPlaceholderText("AIza... (from aistudio.google.com/apikey)")
         self._row(lai, "API Key", self.ai_key_edit, wide=True)
-        ai_tip = QLabel("Off by default. When disabled, Ask & Command runs 100% locally with zero network calls.")
-        ai_tip.setObjectName("tip")
-        ai_tip.setWordWrap(True)
-        lai.addWidget(ai_tip)
+
+        self.ai_model_edit = QLineEdit()
+        self.ai_model_edit.setPlaceholderText("gemini-2.5-flash")
+        self._row(lai, "Model", self.ai_model_edit, wide=True)
+
+        self._ai_endpoint_wrap = QWidget()
+        ep_lay = QVBoxLayout(self._ai_endpoint_wrap)
+        ep_lay.setContentsMargins(0, 0, 0, 0)
+        ep_lay.setSpacing(0)
+        self.ai_endpoint_edit = QLineEdit()
+        self.ai_endpoint_edit.setPlaceholderText("http://localhost:11434/v1/chat/completions")
+        self._row(ep_lay, "API Endpoint", self.ai_endpoint_edit, wide=True)
+        lai.addWidget(self._ai_endpoint_wrap)
+
+        self.ai_call_user_edit = QLineEdit()
+        self.ai_call_user_edit.setPlaceholderText("Joker")
+        self._row(lai, "Call me", self.ai_call_user_edit, wide=True)
+
+        self.ai_dialogue_check = P5CheckBox("Use AI for Talk / Choice Prompts & live reactions", scale=sc)
+        lai.addWidget(self.ai_dialogue_check)
+
+        test_row = QHBoxLayout()
+        test_row.setSpacing(_sc(8, sc, 6))
+        self._ai_test_btn = self._btn("TEST KEY", variant="gold", display=True, px=10)
+        self._ai_test_btn.setFixedHeight(_sc(26, sc, 22))
+        self._ai_test_btn.clicked.connect(self._on_test_ai_clicked)
+        test_row.addWidget(self._ai_test_btn)
+        self._ai_test_lbl = QLabel("Off by default. Free Gemini keys: aistudio.google.com/apikey")
+        self._ai_test_lbl.setObjectName("tip")
+        self._ai_test_lbl.setWordWrap(True)
+        test_row.addWidget(self._ai_test_lbl, 1)
+        lai.addLayout(test_row)
         cards_lay.addWidget(c_ai)
 
         # Card 7: Radial menu tabs (enable/disable individual tabs)
@@ -3584,8 +3618,47 @@ class SettingsDialog(P5FluidPanel):
         QShortcut(QKeySequence("Ctrl+S"), self).activated.connect(self._save)
 
     def _sync_ai_fields(self, enabled: bool) -> None:
-        for w in (self.ai_endpoint_edit, self.ai_model_edit, self.ai_key_edit):
-            w.setEnabled(bool(enabled))
+        on = bool(enabled)
+        prov = str(self.ai_provider_combo.currentData() or "gemini")
+        is_gemini = (prov == "gemini")
+        self._ai_endpoint_wrap.setVisible(not is_gemini)
+        self.ai_key_edit.setPlaceholderText(
+            "AIza... (from aistudio.google.com/apikey)" if is_gemini else "Optional (blank for local Ollama)"
+        )
+        self.ai_model_edit.setPlaceholderText("gemini-2.5-flash" if is_gemini else "llama3.2")
+        for w in (self.ai_provider_combo, self.ai_endpoint_edit, self.ai_model_edit,
+                  self.ai_key_edit, self.ai_call_user_edit, self.ai_dialogue_check):
+            w.setEnabled(on)
+        self._ai_test_btn.setEnabled(on)
+
+    def _on_ai_provider_changed(self, _idx: int) -> None:
+        if not self._filling:
+            prov = str(self.ai_provider_combo.currentData() or "gemini")
+            cur_model = self.ai_model_edit.text().strip().lower()
+            if prov == "gemini" and cur_model in ("", "llama3.2", "llama3", "gpt-4o-mini"):
+                self.ai_model_edit.setText("gemini-2.5-flash")
+            elif prov == "openai" and cur_model in ("", "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"):
+                self.ai_model_edit.setText("llama3.2")
+        self._sync_ai_fields(self.ai_enabled_check.isChecked())
+
+    def _on_test_ai_clicked(self) -> None:
+        prov = str(self.ai_provider_combo.currentData() or "gemini")
+        self._ai_test_btn.setEnabled(False)
+        self._ai_test_lbl.setStyleSheet(f"color: #FAD02C; font-size: {_sc(12, self._ui_scale, 9)}px;")
+        self._ai_test_lbl.setText("Testing connection with Morgana...")
+        self.test_ai_requested.emit({
+            "provider": prov,
+            "api_key": self.ai_key_edit.text().strip(),
+            "model": self.ai_model_edit.text().strip() or ("gemini-2.5-flash" if prov == "gemini" else "llama3.2"),
+            "endpoint": self.ai_endpoint_edit.text().strip() or SETTINGS_DEFAULTS["ai_endpoint"],
+            "call_user": self.ai_call_user_edit.text().strip() or "Joker",
+        })
+
+    def set_ai_test_result(self, ok: bool, message: str) -> None:
+        self._ai_test_btn.setEnabled(self.ai_enabled_check.isChecked())
+        color = "#5CE09A" if ok else "#FF6B78"
+        self._ai_test_lbl.setStyleSheet(f"color: {color}; font-size: {_sc(12, self._ui_scale, 9)}px; font-weight: bold;")
+        self._ai_test_lbl.setText(message)
 
     def _row(self, layout: QVBoxLayout, text: str, widget: QWidget, wide: bool = False) -> None:
         sc = self._ui_scale
@@ -3720,9 +3793,16 @@ class SettingsDialog(P5FluidPanel):
                 self._hotkey_status_lbl.setText("Press shortcut anywhere to open Ask & Command (In-app: Ctrl+K).")
             ai_on = bool(values.get("ai_enabled", SETTINGS_DEFAULTS["ai_enabled"]))
             self.ai_enabled_check.setChecked(ai_on)
+            prov = str(values.get("ai_provider", SETTINGS_DEFAULTS["ai_provider"]))
+            p_idx = self.ai_provider_combo.findData(prov)
+            self.ai_provider_combo.setCurrentIndex(p_idx if p_idx >= 0 else 0)
             self.ai_endpoint_edit.setText(str(values.get("ai_endpoint", SETTINGS_DEFAULTS["ai_endpoint"])))
             self.ai_model_edit.setText(str(values.get("ai_model", SETTINGS_DEFAULTS["ai_model"])))
             self.ai_key_edit.setText(str(values.get("ai_api_key", SETTINGS_DEFAULTS["ai_api_key"])))
+            self.ai_call_user_edit.setText(str(values.get("ai_call_user", SETTINGS_DEFAULTS["ai_call_user"])))
+            self.ai_dialogue_check.setChecked(bool(values.get("ai_dialogue_enabled", SETTINGS_DEFAULTS["ai_dialogue_enabled"])))
+            self._ai_test_lbl.setStyleSheet("")
+            self._ai_test_lbl.setText("Off by default. Free Gemini keys: aistudio.google.com/apikey")
             self._sync_ai_fields(ai_on)
             enabled = set(values.get("enabled_tabs", RADIAL_TAB_KEYS))
             for key, cb in self.tab_checks.items():
@@ -3788,9 +3868,14 @@ class SettingsDialog(P5FluidPanel):
                 manual_dnd=self.manual_dnd_check.isChecked(),
                 quick_hotkey=str(self.hotkey_combo.currentData() or "Off"),
                 ai_enabled=self.ai_enabled_check.isChecked(),
+                ai_provider=str(self.ai_provider_combo.currentData() or "gemini"),
                 ai_endpoint=self.ai_endpoint_edit.text().strip() or SETTINGS_DEFAULTS["ai_endpoint"],
-                ai_model=self.ai_model_edit.text().strip() or SETTINGS_DEFAULTS["ai_model"],
+                ai_model=self.ai_model_edit.text().strip() or (
+                    "gemini-2.5-flash" if str(self.ai_provider_combo.currentData() or "gemini") == "gemini" else "llama3.2"
+                ),
                 ai_api_key=self.ai_key_edit.text().strip(),
+                ai_call_user=self.ai_call_user_edit.text().strip() or "Joker",
+                ai_dialogue_enabled=self.ai_dialogue_check.isChecked(),
                 enabled_tabs=chosen_tabs,
             )
             self.saved.emit()
@@ -6834,11 +6919,12 @@ class QuickCommandDialog(P5FluidPanel):
 
     submitted = pyqtSignal(str)
     action_requested = pyqtSignal(str)
+    clear_requested = pyqtSignal()
 
     def __init__(self, on_top: bool = True, ui_scale: float = 1.0) -> None:
-        super().__init__("ASK & COMMAND", QSize(565, 315), on_top=on_top, ui_scale=ui_scale)
+        super().__init__("ASK & COMMAND", QSize(565, 330), on_top=on_top, ui_scale=ui_scale)
         sc = self._ui_scale
-        self.setFixedSize(_sc(565, sc, 450), _sc(315, sc, 270))
+        self.setFixedSize(_sc(565, sc, 450), _sc(330, sc, 280))
         self._history: list[str] = []
         self._hist_idx = -1
         self._action_target = ""
@@ -6880,7 +6966,7 @@ class QuickCommandDialog(P5FluidPanel):
         in_row = QHBoxLayout()
         in_row.setSpacing(_sc(6, sc, 4))
         self.input_edit = QLineEdit()
-        self.input_edit.setPlaceholderText("Ask Morgana, or type: task <title> at 15:00 · note <idea> · focus 25 · dnd")
+        self.input_edit.setPlaceholderText("Talk to Morgana, or type: task <title> at 15:00 · note <idea> · focus 25 · dnd")
         self.input_edit.setFixedHeight(_sc(38, sc, 30))
         self.input_edit.returnPressed.connect(self._submit)
         self.input_edit.installEventFilter(self)
@@ -6927,6 +7013,13 @@ class QuickCommandDialog(P5FluidPanel):
         top_r.addWidget(self._resp_badge)
         top_r.addStretch(1)
 
+        self._clear_btn = self._btn("NEW CHAT", variant="ghost", display=True, px=9)
+        self._clear_btn.setFixedHeight(_sc(22, sc, 19))
+        self._clear_btn.setToolTip("Clear multi-turn AI chat memory")
+        self._clear_btn.clicked.connect(self.clear_requested.emit)
+        self._clear_btn.setVisible(False)
+        top_r.addWidget(self._clear_btn)
+
         self._jump_btn = self._btn("OPEN", variant="gold", display=True, px=9)
         self._jump_btn.setFixedHeight(_sc(22, sc, 19))
         self._jump_btn.clicked.connect(self._on_jump_clicked)
@@ -6951,7 +7044,7 @@ class QuickCommandDialog(P5FluidPanel):
         # Compact hint strip
         self._hint_lbl = QLabel(
             "Examples:  \"remind me send report tomorrow 10:00\"  ·  \"note great idea #work\"  ·  "
-            "\"status\"  ·  \"dnd on\"  ·  \"I'm feeling tired\""
+            "\"status\"  ·  \"dnd on\"  ·  or just banter with Morgana!"
         )
         self._hint_lbl.setObjectName("tip")
         self._hint_lbl.setWordWrap(True)
@@ -6983,15 +7076,18 @@ class QuickCommandDialog(P5FluidPanel):
         if alert:
             self._hdr_badge.setStyleSheet(
                 f'background: #360A10; color: #FF5E6B; border: 1px solid #E60012; border-radius: 4px; '
-                f'padding: 1px {_sc(7, sc, 5)}px; font-family: "Barlow Condensed", sans-serif; '
+                f'padding: 0px {_sc(8, sc, 6)}px; font-family: "Barlow Condensed", sans-serif; '
                 f'font-weight: 800; font-size: {_sc(11, sc, 9)}px;'
             )
         else:
             self._hdr_badge.setStyleSheet(
                 f'background: #1C1C26; color: #FAD02C; border: 1px solid #4A3B12; border-radius: 4px; '
-                f'padding: 1px {_sc(7, sc, 5)}px; font-family: "Barlow Condensed", sans-serif; '
+                f'padding: 0px {_sc(8, sc, 6)}px; font-family: "Barlow Condensed", sans-serif; '
                 f'font-weight: 800; font-size: {_sc(11, sc, 9)}px;'
             )
+
+    def set_has_chat_history(self, has_history: bool) -> None:
+        self._clear_btn.setVisible(bool(has_history))
 
     def show_reply(self, text: str, badge: str = "MORGANA", action_label: str = "",
                    action_target: str = "", accent_red: bool = False) -> None:
@@ -7007,21 +7103,38 @@ class QuickCommandDialog(P5FluidPanel):
 
     def show_thinking(self, prompt: str) -> None:
         short = (prompt[:36] + "…") if len(prompt) > 36 else prompt
-        self.show_reply(f"Thinking about \"{short}\"...", badge="THINKING...", accent_red=False)
+        self.show_reply(f"Hmm... let me think about \"{short}\"...", badge="GEMINI · THINKING", accent_red=False)
+
+    def _focus_input(self) -> None:
+        if self.isVisible() and not self._closing:
+            self._bring_to_front()
+            self.input_edit.setFocus()
+            self.input_edit.selectAll()
 
     def show_spotlight(self) -> None:
-        """Open centered near the top-center of the active cursor screen and focus input immediately."""
+        """Open cleanly at full opacity centered near the top of the active cursor screen."""
         from PyQt6.QtGui import QCursor as _QCursor
         screen = QGuiApplication.screenAt(_QCursor.pos()) or QGuiApplication.primaryScreen()
         area = screen.availableGeometry()
-        x = area.left() + (area.width() - self.width()) // 2
-        y = area.top() + max(32, int(area.height() * 0.16))
-        self.move(x, y)
-        self.show()
-        self.raise_()
-        self.activateWindow()
-        self.input_edit.setFocus()
-        self.input_edit.selectAll()
+        x = max(area.left() + 8, min(area.left() + (area.width() - self.width()) // 2, area.right() - self.width() - 8))
+        y = max(area.top() + 16, min(area.top() + max(32, int(area.height() * 0.16)), area.bottom() - self.height() - 16))
+        self._base_pos = QPoint(x, y)
+        self._closing = False
+        self.setWindowOpacity(1.0)
+        if not self.isVisible():
+            self._open.snap(0.45)
+            self.move(self._base_pos.x(), self._base_pos.y() + int(round(0.55 * self.SLIDE)))
+            self.show()
+        else:
+            self.move(self._base_pos)
+            self.refresh()
+        self._open.configure(360.0)
+        self._open.target = 1.0
+        self._ticker.start()
+        self.update()
+        self._focus_input()
+        QTimer.singleShot(0, self._focus_input)
+        QTimer.singleShot(50, self._focus_input)
 
     def _prefill(self, prefix: str) -> None:
         self.input_edit.setText(prefix)

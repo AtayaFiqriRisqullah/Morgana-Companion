@@ -59,9 +59,12 @@ from awareness import (AppAwarenessMonitor, ScreenTimeStore, format_duration, ge
 from calendar_service import (CalendarEvent, CalendarResult, CalendarService, events_by_day,
                               format_agenda, human_delta, local_calendar_events,
                               merge_companion_items, note_deadline_events, task_deadline_events)
-from command_engine import CommandResult, parse_and_plan, query_ai_endpoint
+from command_engine import CommandResult, parse_and_plan
 from dialogue_engine import DialogueEngine, DialogueMemoryStore
 from emotions import EXPRESSIONS, STATE_EXPRESSION, emotion_for_text, voice_for_dialogue
+from gemini_ai import (ACTION_LABELS, AIConfig, AIReply, AITalkScene, ConversationBuffer,
+                       ask_morgana_chat, continue_joker_talk_choice, generate_ambient_reaction,
+                       generate_joker_talk_scene, test_ai_connection)
 from hotkeys import GlobalHotkeyManager
 from motion import FrameTicker, Spring, clamp
 from lines import (ContextualDialogue, LineBag, build_daily_briefing, build_evening_wrapup,
@@ -2512,39 +2515,104 @@ class CalendarFetcher(QObject):
 
 
 class AIFetcher(QObject):
-    """Background worker for strictly opt-in OpenAI-compatible AI replies (never blocks UI)."""
+    """Non-blocking background worker for Gemini / OpenAI Morgana <-> Joker AI dialogue."""
 
-    done = pyqtSignal(bool, str, object)  # (ok, reply_text, fallback_CommandResult)
+    chat_done = pyqtSignal(object, object)        # (AIReply, fallback_CommandResult)
+    talk_scene_done = pyqtSignal(object, dict)    # (AITalkScene, ctx)
+    talk_reply_done = pyqtSignal(object, str, str)  # (AIReply, chosen_label, action)
+    ambient_done = pyqtSignal(object, object)     # (AIReply, fallback_tuple)
+    test_done = pyqtSignal(bool, str)             # (ok, status_message)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self._busy = False
+        self._chat_busy = False
+        self._talk_busy = False
+        self._ambient_busy = False
+        self._test_busy = False
 
-    @property
-    def busy(self) -> bool:
-        return self._busy
-
-    def ask(self, prompt: str, ctx: dict, endpoint: str, model: str,
-            api_key: str, fallback: CommandResult) -> bool:
-        if self._busy:
+    def ask_chat(self, prompt: str, ctx: dict, cfg: AIConfig,
+                 history: list[dict[str, str]], fallback: CommandResult) -> bool:
+        if self._chat_busy:
             return False
-        self._busy = True
-        threading.Thread(
-            target=self._run,
-            args=(prompt, ctx, endpoint, model, api_key, fallback),
-            daemon=True,
-            name="morgana-ai-ask",
-        ).start()
+        self._chat_busy = True
+
+        def _run() -> None:
+            try:
+                res = ask_morgana_chat(prompt, ctx, cfg, history=history)
+            except Exception as exc:
+                res = AIReply(ok=False, text="", error=str(exc))
+            self._chat_busy = False
+            self.chat_done.emit(res, fallback)
+
+        threading.Thread(target=_run, daemon=True, name="morgana-ai-chat").start()
         return True
 
-    def _run(self, prompt: str, ctx: dict, endpoint: str, model: str,
-             api_key: str, fallback: CommandResult) -> None:
-        try:
-            ok, text = query_ai_endpoint(prompt, ctx, endpoint, model, api_key)
-        except Exception as exc:
-            ok, text = False, str(exc)
-        self._busy = False
-        self.done.emit(ok, text, fallback)
+    def ask_talk_scene(self, ctx: dict, cfg: AIConfig,
+                       history: list[dict[str, str]], trigger_hint: str = "talk") -> bool:
+        if self._talk_busy:
+            return False
+        self._talk_busy = True
+
+        def _run() -> None:
+            try:
+                scene = generate_joker_talk_scene(ctx, cfg, history=history, trigger_hint=trigger_hint)
+            except Exception as exc:
+                scene = AITalkScene(ok=False, line="", error=str(exc))
+            self._talk_busy = False
+            self.talk_scene_done.emit(scene, ctx)
+
+        threading.Thread(target=_run, daemon=True, name="morgana-ai-talk").start()
+        return True
+
+    def ask_talk_reply(self, opening_line: str, chosen_label: str, action: str,
+                       ctx: dict, cfg: AIConfig, history: list[dict[str, str]]) -> bool:
+        if self._talk_busy:
+            return False
+        self._talk_busy = True
+
+        def _run() -> None:
+            try:
+                res = continue_joker_talk_choice(opening_line, chosen_label, ctx, cfg, history=history)
+            except Exception as exc:
+                res = AIReply(ok=False, text="", error=str(exc))
+            self._talk_busy = False
+            self.talk_reply_done.emit(res, chosen_label, action)
+
+        threading.Thread(target=_run, daemon=True, name="morgana-ai-talk-reply").start()
+        return True
+
+    def ask_ambient(self, event_desc: str, ctx: dict, cfg: AIConfig,
+                    fallback_tuple: tuple[str, str, str, str]) -> bool:
+        if self._ambient_busy:
+            return False
+        self._ambient_busy = True
+
+        def _run() -> None:
+            try:
+                res = generate_ambient_reaction(event_desc, ctx, cfg)
+            except Exception as exc:
+                res = AIReply(ok=False, text="", error=str(exc))
+            self._ambient_busy = False
+            self.ambient_done.emit(res, fallback_tuple)
+
+        threading.Thread(target=_run, daemon=True, name="morgana-ai-ambient").start()
+        return True
+
+    def test_key(self, cfg: AIConfig) -> bool:
+        if self._test_busy:
+            return False
+        self._test_busy = True
+
+        def _run() -> None:
+            try:
+                ok, msg = test_ai_connection(cfg)
+            except Exception as exc:
+                ok, msg = False, str(exc)
+            self._test_busy = False
+            self.test_done.emit(ok, msg)
+
+        threading.Thread(target=_run, daemon=True, name="morgana-ai-test").start()
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -2611,6 +2679,9 @@ class PetController(QObject):
         self.calendar = CalendarService(APP_DIR)
         self.fetcher = CalendarFetcher(self.calendar, self)
         self.ai_fetcher = AIFetcher(self)
+        self.ai_conversation = ConversationBuffer(max_turns=12)
+        self._ai_talk_scene: AITalkScene | None = None
+        self._ai_ambient_last_t = 0.0
         self.hotkeys = GlobalHotkeyManager(self)
         self.tasks_dialog: TasksDialog | None = None
         self.notes_dialog: NotesDialog | None = None
@@ -2692,8 +2763,12 @@ class PetController(QObject):
         self.manual_timers.changed.connect(self._sync_timer_ui)
         self.manual_timers.fired.connect(self._on_manual_timer_fired)
         self.fetcher.done.connect(self._on_calendar_result)
-        self.ai_fetcher.done.connect(self._on_ai_reply)
-        self.hotkeys.activated.connect(self._open_quick_command)
+        self.ai_fetcher.chat_done.connect(self._on_ai_chat_reply)
+        self.ai_fetcher.talk_scene_done.connect(self._on_ai_talk_scene)
+        self.ai_fetcher.talk_reply_done.connect(self._on_ai_talk_reply)
+        self.ai_fetcher.ambient_done.connect(self._on_ai_ambient_reply)
+        self.ai_fetcher.test_done.connect(self._on_ai_test_done)
+        self.hotkeys.activated.connect(lambda: self._open_quick_command(toggle=True))
 
         self._curfew_timer = QTimer(self)
         self._curfew_timer.setInterval(5_000)      # 5s precision check for 30s bedtime cadence
@@ -2856,6 +2931,16 @@ class PetController(QObject):
             next_title = next_ev.title
             next_delta = human_delta(next_ev.start - aware_now)
 
+        top_tasks = [str(t.get("title") or "")[:44] for t in pending[:3] if t.get("title")]
+        stat_parts = []
+        try:
+            totals = self.social_stats.totals()
+            for sk in SOCIAL_STAT_KEYS:
+                lv = stat_level(int(totals.get(sk, 0)))
+                stat_parts.append(f"{SOCIAL_STATS[sk]['label']} Lv{lv}")
+        except Exception:
+            pass
+
         return {
             "curfew_active": self.curfew_active,
             "sleep_mode": self.sleep_mode,
@@ -2866,6 +2951,7 @@ class PetController(QObject):
             "overdue_count": len(overdue_tasks),
             "high_tasks": len(high_pending),
             "top_task": top_task,
+            "top_tasks": top_tasks,
             "notes_count": len(notes_all),
             "due_notes": len(due_notes),
             "habits_done": h_done,
@@ -2874,9 +2960,12 @@ class PetController(QObject):
             "streak_days": self.social_stats.streak_days(),
             "lowest_stat_label": SOCIAL_STATS[lowest_k]["label"],
             "top_stat_label": SOCIAL_STATS[top_k]["label"],
+            "social_stats_summary": ", ".join(stat_parts),
             "active_app_cat": cur_app.category if cur_app else "",
+            "active_app_category": cur_app.category if cur_app else "",
             "active_app_name": cur_app.display_name if cur_app else "",
             "active_app_topic": cur_app.topic if cur_app else "",
+            "active_window_title": cur_app.title if cur_app else "",
             "active_app_phrase": cur_app.phrase if cur_app else "",
             "active_app_dwell": self.awareness.app_dwell_text(now_mono),
             "prev_app_name": prev_app.display_name if prev_app else "",
@@ -2901,6 +2990,21 @@ class PetController(QObject):
             "dnd_active": self.is_dnd_active(),
             "dnd_reason": self.dnd_reason(),
         }
+
+    def _ai_config(self) -> AIConfig:
+        return AIConfig(
+            provider=str(self.settings["ai_provider"] or "gemini"),
+            api_key=str(self.settings["ai_api_key"] or ""),
+            model=str(self.settings["ai_model"] or "gemini-2.5-flash"),
+            endpoint=str(self.settings["ai_endpoint"] or ""),
+            call_user=str(self.settings["ai_call_user"] or "Joker"),
+        )
+
+    def _ai_ready(self) -> bool:
+        return bool(self.settings["ai_enabled"]) and self._ai_config().is_ready()
+
+    def _ai_dialogue_ready(self) -> bool:
+        return self._ai_ready() and bool(self.settings["ai_dialogue_enabled"])
 
     # -- Do Not Disturb (Manual + Auto-DND for Meetings & Fullscreen) --------
     def is_dnd_active(self) -> bool:
@@ -3029,7 +3133,13 @@ class PetController(QObject):
             self.quick_cmd_dialog.set_header_badge("AUTO-DND · FULL", alert=True)
         else:
             hk = str(self.settings["quick_hotkey"])
-            self.quick_cmd_dialog.set_header_badge(hk if hk and hk != "Off" else "CTRL+K", alert=False)
+            hk_s = hk if hk and hk != "Off" else "CTRL+K"
+            if self._ai_ready():
+                prov = "GEMINI" if str(self.settings["ai_provider"]) == "gemini" else "AI"
+                self.quick_cmd_dialog.set_header_badge(f"{prov} · {hk_s}", alert=False)
+            else:
+                self.quick_cmd_dialog.set_header_badge(hk_s, alert=False)
+        self.quick_cmd_dialog.set_has_chat_history(len(self.ai_conversation) > 0)
 
     def _schedule_chatter(self) -> None:
         base_ms = max(0.05, self.args.chatter) * 60_000
@@ -3115,26 +3225,90 @@ class PetController(QObject):
                 return
             trigger = self.awareness.update(info, now_mono=now_mono)
             if trigger is not None:
-                text, emotion, voice, particle = self.dialogue.app_awareness(
-                    trigger.category, trigger.display_name, self._ctx()
-                )
+                ctx = self._ctx()
+                fb = self.dialogue.app_awareness(trigger.category, trigger.display_name, ctx)
+                if self._ai_dialogue_ready() and (now_mono - self._ai_ambient_last_t) >= 90.0:
+                    self._ai_ambient_last_t = now_mono
+                    desc = f"User is currently in {trigger.phrase} (window: {trigger.title[:60]})"
+                    started = self.ai_fetcher.ask_ambient(desc, ctx, self._ai_config(), fb)
+                    if started:
+                        return
+                text, emotion, voice, particle = fb
                 self.say(text, "talking", ms=5600, emotion=emotion, voice=voice, particle=particle)
+
+    def _on_ai_ambient_reply(self, res: AIReply, fallback_tuple: tuple[str, str, str, str]) -> None:
+        if self.is_dnd_active() or self.sleep_mode or not self.pet.isVisible():
+            return
+        if self.bubble.isVisible() or self.choices.is_open or self.menu.is_open:
+            return
+        if res.ok and res.text:
+            self.ai_conversation.add_model(res.text)
+            self.say(res.text, "talking", ms=6000, emotion=res.emotion, voice=res.voice, particle=res.particle)
+        else:
+            text, emotion, voice, particle = fallback_tuple
+            self.say(text, "talking", ms=5600, emotion=emotion, voice=voice, particle=particle)
 
     # -- Interactive Multi-Turn Persona 5 Choice Prompts ----------------------
     def _start_talk(self, tree_id: str | None = None) -> None:
         if self.menu.is_open:
             self.menu.close_menu(silent=True, emit_user_close=False)
+        self._ai_talk_scene = None
         # Live-sample the foreground external window before building Talk context
         if bool(self.settings["app_awareness_enabled"]):
             fresh = get_active_window()
             if fresh is not None:
                 self.awareness.note_window(fresh)
         ctx = self._ctx()
+        # Use dynamic Gemini Morgana <-> Joker Choice Scene when enabled and no scripted tree is forced
+        if tree_id is None and self._ai_dialogue_ready():
+            self.dialogue_engine.cancel()
+            call_user = str(self.settings["ai_call_user"] or "Joker").strip() or "Joker"
+            self.say(
+                f"Hey {call_user}... give me a sec!",
+                state="talking",
+                ms=12000,
+                emotion="neutral",
+                voice="oh_asking",
+                hold=True,
+                keep_choices=False,
+            )
+            started = self.ai_fetcher.ask_talk_scene(
+                ctx=ctx,
+                cfg=self._ai_config(),
+                history=self.ai_conversation.snapshot(),
+                trigger_hint="interactive talk",
+            )
+            if started:
+                return
         node = (self.dialogue_engine.start_tree(tree_id, ctx) if tree_id
                 else self.dialogue_engine.start_contextual(ctx))
         if node is None:
             return
         self._present_choice_node(node)
+
+    def _on_ai_talk_scene(self, scene: AITalkScene, ctx: dict) -> None:
+        if self.is_dnd_active() or not self.pet.isVisible():
+            return
+        if scene.ok and scene.line and scene.choices:
+            self._ai_talk_scene = scene
+            self.ai_conversation.add_model(scene.line)
+            labels = [c.label for c in scene.choices] + ["Chat freely..."]
+            self._present_choice_node({
+                "text": scene.line,
+                "emotion": scene.emotion,
+                "voice": scene.voice,
+                "particle": scene.particle,
+                "has_choices": True,
+                "choices": labels,
+            })
+            return
+        # Seamless fallback to local DialogueEngine if offline / quota limited
+        node = self.dialogue_engine.start_contextual(ctx)
+        if node is not None:
+            self._present_choice_node(node)
+        else:
+            self.bubble.dismiss()
+            self._restore_state()
 
     def _present_choice_node(self, node: dict) -> None:
         has_choices = bool(node.get("has_choices"))
@@ -3151,6 +3325,42 @@ class PetController(QObject):
         )
 
     def _on_choice_selected(self, index: int) -> None:
+        # Handle dynamic Gemini Morgana <-> Joker Talk choice!
+        if self._ai_talk_scene is not None:
+            scene = self._ai_talk_scene
+            self._ai_talk_scene = None
+            self._pending_choices = []
+            # Last appended option ("Chat freely...") transitions smoothly into Ask & Command
+            if index >= len(scene.choices):
+                self.bubble.dismiss()
+                self._restore_state()
+                self._open_quick_command(toggle=False)
+                return
+            chosen = scene.choices[max(0, index)]
+            self.ai_conversation.add_user(chosen.label)
+            self.say(
+                "Ooh...!",
+                state="talking",
+                ms=10000,
+                emotion="wink",
+                voice="hmm",
+                hold=True,
+                keep_choices=False,
+            )
+            started = self.ai_fetcher.ask_talk_reply(
+                opening_line=scene.line,
+                chosen_label=chosen.label,
+                action=chosen.action,
+                ctx=self._ctx(),
+                cfg=self._ai_config(),
+                history=self.ai_conversation.snapshot(),
+            )
+            if not started:
+                self.say("Heh, you got it! I'm right behind you.", "talking", ms=4800, emotion="smug", voice="hmm")
+                if chosen.action:
+                    self._execute_ai_action(chosen.action)
+            return
+
         res = self.dialogue_engine.choose(index)
         if res is None:
             self.bubble.dismiss()
@@ -3168,7 +3378,49 @@ class PetController(QObject):
         if action:
             self._execute_choice_action(action)
 
+    def _on_ai_talk_reply(self, res: AIReply, chosen_label: str, action: str) -> None:
+        if res.ok and res.text:
+            self.ai_conversation.add_model(res.text)
+            self._sync_quick_cmd_badge()
+            self.say(
+                res.text,
+                state="talking",
+                ms=7200,
+                emotion=res.emotion,
+                voice=res.voice,
+                particle=res.particle,
+            )
+            eff_action = action or res.suggested_action
+        else:
+            self.say(
+                "Heh, leave it to me! Let's make our next move count.",
+                state="talking",
+                ms=5000,
+                emotion="smug",
+                voice="hmm",
+                particle="sparkle",
+            )
+            eff_action = action
+        if eff_action:
+            QTimer.singleShot(260, lambda a=eff_action: self._execute_ai_action(a))
+
+    def _execute_ai_action(self, action: str) -> None:
+        mapping = {
+            "focus_25": "focus_25",
+            "break_5": "break_5",
+            "open_tasks": "tasks",
+            "open_notes": "notes",
+            "open_events": "events",
+            "open_stats": "stats",
+            "open_briefing": "briefing",
+            "open_wrapup": "wrapup",
+        }
+        target = mapping.get((action or "").strip().lower(), "")
+        if target:
+            self._on_quick_command_action(target)
+
     def _on_choice_cancelled(self) -> None:
+        self._ai_talk_scene = None
         self._pending_choices = []
         self.dialogue_engine.cancel()
         self.bubble.dismiss()
@@ -3405,7 +3657,7 @@ class PetController(QObject):
             play_ui("select")
             if self.pet.isVisible() and not self.is_dnd_active():
                 self.say("Saved your reflection to your Journal in Notes! Thanks for sharing today with me.",
-                         "talking", ms=4800, particle="hearts")
+                         "talking", ms=4800, particle="heart")
 
     # -- Quick Command & Free-Form Ask Bar (Spotlight / Global Hotkey) --------
     def _ensure_quick_cmd_dialog(self) -> QuickCommandDialog:
@@ -3413,34 +3665,53 @@ class PetController(QObject):
             self.quick_cmd_dialog = QuickCommandDialog(on_top=self.on_top, ui_scale=self.ui_scale)
             self.quick_cmd_dialog.submitted.connect(self._on_quick_command_submitted)
             self.quick_cmd_dialog.action_requested.connect(self._on_quick_command_action)
+            self.quick_cmd_dialog.clear_requested.connect(self._clear_ai_chat)
         self._sync_quick_cmd_badge()
         return self.quick_cmd_dialog
 
-    def _open_quick_command(self) -> None:
+    def _open_quick_command(self, toggle: bool = False) -> None:
         dlg = self._ensure_quick_cmd_dialog()
-        if dlg.isVisible():
-            dlg.raise_()
-            dlg.activateWindow()
-            dlg.input_edit.setFocus()
+        if toggle and dlg.isVisible() and not dlg._closing and dlg.isActiveWindow():
+            dlg.close_animated()
             return
+        was_visible = dlg.isVisible() and not dlg._closing
         dlg.show_spotlight()
-        play_ui("open_window")
+        if not was_visible:
+            play_ui("open_window")
+
+    def _clear_ai_chat(self) -> None:
+        self.ai_conversation.clear()
+        self._sync_quick_cmd_badge()
+        if self.quick_cmd_dialog is not None:
+            call_user = str(self.settings["ai_call_user"] or "Joker").strip() or "Joker"
+            self.quick_cmd_dialog.show_reply(
+                f"Fresh slate, {call_user}! What's our next move?",
+                badge="NEW CHAT",
+                accent_red=False,
+            )
 
     def _on_quick_command_submitted(self, raw_text: str) -> None:
         dlg = self._ensure_quick_cmd_dialog()
         ctx = self._ctx()
-        ai_on = bool(self.settings["ai_enabled"])
+        ai_on = self._ai_ready()
         res = parse_and_plan(raw_text, ctx=ctx, ai_enabled=ai_on)
 
-        # Optional async AI fallback for free-form chat
+        if res.kind == "clear_chat":
+            self._clear_ai_chat()
+            return
+
+        # Multi-turn Gemini / OpenAI Morgana <-> Joker free chat (non-blocking)
         if res.kind == "needs_ai":
-            dlg.show_thinking(raw_text)
-            started = self.ai_fetcher.ask(
-                prompt=res.payload.get("prompt", raw_text),
+            prompt_txt = str(res.payload.get("prompt") or raw_text)
+            hist_before = self.ai_conversation.snapshot()
+            self.ai_conversation.add_user(prompt_txt)
+            self._sync_quick_cmd_badge()
+            dlg.show_thinking(prompt_txt)
+            started = self.ai_fetcher.ask_chat(
+                prompt=prompt_txt,
                 ctx=ctx,
-                endpoint=str(self.settings["ai_endpoint"]),
-                model=str(self.settings["ai_model"]),
-                api_key=str(self.settings["ai_api_key"]),
+                cfg=self._ai_config(),
+                history=hist_before,
                 fallback=res.payload.get("fallback", res),
             )
             if not started:
@@ -3507,28 +3778,59 @@ class PetController(QObject):
         elif res.kind == "open_panel":
             target = str(res.payload.get("target") or "")
             self._present_quick_result(res)
-            dlg.hide()
+            dlg.close_animated()
             self._on_quick_command_action(target)
             return
 
         self._present_quick_result(res)
 
-    def _on_ai_reply(self, ok: bool, text: str, fallback: CommandResult) -> None:
-        if ok and text.strip():
+    def _on_ai_chat_reply(self, ai_res: AIReply, fallback: CommandResult) -> None:
+        if ai_res.ok and ai_res.text:
+            self.ai_conversation.add_model(ai_res.text)
+            self._sync_quick_cmd_badge()
+            prov = "GEMINI" if str(self.settings["ai_provider"]) == "gemini" else "AI"
+            act_map = {
+                "focus_25": "focus_25",
+                "break_5": "break_5",
+                "open_tasks": "tasks",
+                "open_notes": "notes",
+                "open_events": "events",
+                "open_stats": "stats",
+                "open_briefing": "briefing",
+                "open_wrapup": "wrapup",
+            }
+            act_key = ai_res.suggested_action
             res = CommandResult(
                 kind="chat",
-                reply=text.strip(),
-                emotion=fallback.emotion or "happy",
-                voice="hmm",
-                particle=fallback.particle,
-                badge="AI · MORGANA",
-                action_label=fallback.action_label,
-                action_target=fallback.action_target,
+                reply=ai_res.text,
+                emotion=ai_res.emotion,
+                voice=ai_res.voice,
+                particle=ai_res.particle,
+                badge=f"{prov} · MORGANA",
+                action_label=ACTION_LABELS.get(act_key, fallback.action_label),
+                action_target=act_map.get(act_key, fallback.action_target),
             )
         else:
             res = fallback
-            res.badge = "LOCAL · MORGANA"
+            res.badge = "LOCAL FALLBACK"
+            if ai_res.error:
+                log.debug("AI chat fallback: %s", ai_res.error)
         self._present_quick_result(res)
+
+    def _on_test_ai_requested(self, data: dict) -> None:
+        cfg = AIConfig(
+            provider=str(data.get("provider") or "gemini"),
+            api_key=str(data.get("api_key") or ""),
+            model=str(data.get("model") or "gemini-2.5-flash"),
+            endpoint=str(data.get("endpoint") or ""),
+            call_user=str(data.get("call_user") or "Joker"),
+        )
+        if not self.ai_fetcher.test_key(cfg) and self.settings_dialog is not None:
+            self.settings_dialog.set_ai_test_result(False, "Already testing — please wait a second.")
+
+    def _on_ai_test_done(self, ok: bool, msg: str) -> None:
+        if self.settings_dialog is not None:
+            self.settings_dialog.set_ai_test_result(ok, msg)
 
     def _present_quick_result(self, res: CommandResult) -> None:
         if self.quick_cmd_dialog is not None:
@@ -4248,6 +4550,7 @@ class PetController(QObject):
             dlg.saved.connect(self.apply_settings)
             dlg.always_on_top_changed.connect(self.set_always_on_top)
             dlg.autostart_changed.connect(self._toggle_autostart)
+            dlg.test_ai_requested.connect(self._on_test_ai_requested)
             dlg.closed.connect(lambda d=dlg: self._on_settings_closed(d))
             self.settings_dialog = dlg
         # If any panel is open, center Settings over it so it's never buried
