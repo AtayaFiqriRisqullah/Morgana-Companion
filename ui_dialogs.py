@@ -23,7 +23,7 @@ from PyQt6.QtGui import (QColor, QFontMetrics, QGuiApplication, QKeySequence, QP
                          QPainterPath, QPen, QPixmap, QPolygonF, QShortcut, QTextCursor)
 from PyQt6.QtWidgets import (QAbstractItemView, QCheckBox, QDateTimeEdit, QFrame, QGridLayout,
                              QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-                             QProgressBar, QPushButton, QScrollArea, QSpinBox, QStyle,
+                             QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSpinBox, QStyle,
                              QStyledItemDelegate, QTextEdit, QTimeEdit, QVBoxLayout, QWidget)
 
 import sprites
@@ -1440,30 +1440,34 @@ class NotesDialog(P5FluidPanel):
         db.setContentsMargins(10, 8, 10, 8)
         db.setSpacing(6)
         r1 = QHBoxLayout()
-        r1.setSpacing(5)
+        r1.setSpacing(6)
         self.deadline_check = P5CheckBox("Remind me", scale=sc)
         self.deadline_check.toggled.connect(self._on_deadline_toggled)
         r1.addWidget(self.deadline_check)
-        r1.addStretch(1)
-        for text, kind in (("+30m", "30m"), ("+1h", "1h"), ("+3h", "3h"), ("Tomorrow 9:00", "tomorrow")):
-            pb = self._btn(text, variant="soft", px=11)
-            pb.setFixedHeight(_sc(25, sc, 21))
-            pb.clicked.connect(lambda _c=False, k=kind: self._apply_preset(k))
-            r1.addWidget(pb)
+        self.deadline_edit = QDateTimeEdit()
+        self.deadline_edit.setCalendarPopup(True)
+        self.deadline_edit.setDisplayFormat("dd MMM yyyy HH:mm")
+        self.deadline_edit.setDateTime(self._default_deadline())
+        self.deadline_edit.setMinimumHeight(_sc(28, sc, 24))
+        self.deadline_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.deadline_edit.dateTimeChanged.connect(self._on_deadline_changed)
+        r1.addWidget(self.deadline_edit, 1)
+        self.deadline_hint = QLabel("")
+        self.deadline_hint.setObjectName("tip")
+        self.deadline_hint.setMinimumWidth(0)
+        r1.addWidget(self.deadline_hint)
         db.addLayout(r1)
 
         r2 = QHBoxLayout()
-        r2.setSpacing(8)
-        self.deadline_edit = QDateTimeEdit()
-        self.deadline_edit.setCalendarPopup(True)
-        self.deadline_edit.setDisplayFormat("dd MMM yyyy   HH:mm")
-        self.deadline_edit.setDateTime(self._default_deadline())
-        self.deadline_edit.setMinimumHeight(_sc(30, sc, 25))
-        self.deadline_edit.dateTimeChanged.connect(self._on_deadline_changed)
-        r2.addWidget(self.deadline_edit)
-        self.deadline_hint = QLabel("")
-        self.deadline_hint.setObjectName("tip")
-        r2.addWidget(self.deadline_hint, 1)
+        r2.setSpacing(_sc(5, sc, 4))
+        for text, kind in (("+30m", "30m"), ("+1h", "1h"), ("+3h", "3h"), ("23:59", "eod"), ("Tomorrow 9:00", "tomorrow")):
+            pb = self._btn(text, variant="gold" if kind == "eod" else "soft", px=10)
+            pb.setFixedHeight(_sc(24, sc, 21))
+            if kind == "eod":
+                pb.setToolTip("Set deadline to 23:59 today (or tomorrow if past 23:59)")
+            pb.clicked.connect(lambda _c=False, k=kind: self._apply_preset(k))
+            r2.addWidget(pb)
+        r2.addStretch(1)
         db.addLayout(r2)
         self.deadline_box.setVisible(False)
         el.addWidget(self.deadline_box)
@@ -1613,18 +1617,18 @@ class NotesDialog(P5FluidPanel):
 
     def _update_hint(self) -> None:
         if not self.deadline_check.isChecked():
-            self.deadline_hint.setText("No reminder set")
+            self.deadline_hint.setText("Off")
             self._rem_btn.set_variant("soft")
             self._rem_btn.setText("REMINDER")
             return
         dt = _from_qdt(self.deadline_edit.dateTime())
         delta = dt - datetime.now()
         if delta.total_seconds() > 0:
-            self.deadline_hint.setText(f"Triggers in {human_delta(delta)}")
+            self.deadline_hint.setText(f"In {human_delta(delta)}")
             self._rem_btn.set_variant("gold")
             self._rem_btn.setText(f"DUE {dt:%d %b %H:%M}".upper())
         else:
-            self.deadline_hint.setText("This time has already passed")
+            self.deadline_hint.setText("Past due")
             self._rem_btn.set_variant("danger")
             self._rem_btn.setText("OVERDUE")
 
@@ -1636,6 +1640,10 @@ class NotesDialog(P5FluidPanel):
             target = now + timedelta(hours=1)
         elif kind == "3h":
             target = now + timedelta(hours=3)
+        elif kind == "eod":
+            target = now.replace(hour=23, minute=59, second=0, microsecond=0)
+            if target <= now:
+                target += timedelta(days=1)
         else:
             target = (now + timedelta(days=1)).replace(hour=9, minute=0)
         self.deadline_check.setChecked(True)
@@ -3445,8 +3453,14 @@ class TimerDialog(P5FluidPanel):
             pb.setFixedHeight(_sc(26, sc, 22))
             pb.clicked.connect(lambda _c=False, m=mins: self._apply_preset(m))
             prow.addWidget(pb, 1)
+        self._eod_btn = self._btn("23:59", variant="gold", display=True, px=10)
+        self._eod_btn.setFixedHeight(_sc(26, sc, 22))
+        self._eod_btn.setToolTip("Set countdown until 23:59 today (or tomorrow if past 23:59)")
+        self._eod_btn.clicked.connect(self._apply_until_2359)
+        prow.addWidget(self._eod_btn, 1)
         ml.addLayout(prow)
 
+        self._preset_default_label = ""
         hms_row = QHBoxLayout()
         hms_row.setSpacing(_sc(6, sc, 4))
         dur_lbl = QLabel("Duration")
@@ -3468,6 +3482,7 @@ class TimerDialog(P5FluidPanel):
 
         for w in (self._h_spin, self._m_spin, self._s_spin):
             w.setMinimumWidth(_sc(76, sc, 60))
+            w.valueChanged.connect(self._on_manual_spin_edited)
             hms_row.addWidget(w, 1)
         ml.addLayout(hms_row)
 
@@ -3535,11 +3550,35 @@ class TimerDialog(P5FluidPanel):
             self._rest_spin.interpretText()
             self.focus_start_requested.emit(self._focus_spin.value(), self._rest_spin.value())
 
+    def _on_manual_spin_edited(self, _val: int) -> None:
+        self._preset_default_label = ""
+
     def _apply_preset(self, minutes: int) -> None:
         h, m = divmod(minutes, 60)
+        self._preset_default_label = ""
         self._h_spin.setValue(h)
         self._m_spin.setValue(m)
         self._s_spin.setValue(0)
+        self._manual_err.hide()
+        self._label_edit.setFocus()
+
+    def _apply_until_2359(self) -> None:
+        now = datetime.now()
+        target = now.replace(hour=23, minute=59, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        remaining = max(1, int(round((target - now).total_seconds())))
+        remaining = min(remaining, 23 * 3600 + 59 * 60 + 59)
+        h, rem = divmod(remaining, 3600)
+        m, s = divmod(rem, 60)
+        for sp in (self._h_spin, self._m_spin, self._s_spin):
+            sp.blockSignals(True)
+        self._h_spin.setValue(h)
+        self._m_spin.setValue(m)
+        self._s_spin.setValue(s)
+        for sp in (self._h_spin, self._m_spin, self._s_spin):
+            sp.blockSignals(False)
+        self._preset_default_label = "23:59 Reminder"
         self._manual_err.hide()
         self._label_edit.setFocus()
 
@@ -3552,7 +3591,8 @@ class TimerDialog(P5FluidPanel):
             self._manual_err.show()
             return
         self._manual_err.hide()
-        label = self._label_edit.text().strip()
+        label = self._label_edit.text().strip() or self._preset_default_label
+        self._preset_default_label = ""
         self._label_edit.clear()
         self.manual_add_requested.emit(total, label)
 
