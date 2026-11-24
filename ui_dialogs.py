@@ -14,24 +14,27 @@ Design principles:
 from __future__ import annotations
 
 import math
+import random
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from PyQt6.QtCore import (QDate, QDateTime, QEvent, QPoint, QPointF, QRect, QRectF, QSize, Qt,
                           QTime, QTimer, pyqtSignal)
-from PyQt6.QtGui import (QColor, QFontMetrics, QGuiApplication, QKeySequence, QPainter,
-                         QPainterPath, QPen, QPixmap, QPolygonF, QShortcut, QTextCursor)
-from PyQt6.QtWidgets import (QAbstractItemView, QCheckBox, QDateTimeEdit, QFrame, QGridLayout,
-                             QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-                             QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSlider,
-                             QSpinBox, QStyle, QStyledItemDelegate, QTextEdit, QTimeEdit,
-                             QVBoxLayout, QWidget)
+from PyQt6.QtGui import (QColor, QFontMetrics, QGuiApplication, QKeySequence, QLinearGradient,
+                         QPainter, QPainterPath, QPen, QPixmap, QPolygonF, QRadialGradient,
+                         QShortcut, QTextCursor)
+from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QDateTimeEdit, QFrame,
+                             QGridLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+                             QListWidgetItem, QMenu, QProgressBar, QPushButton, QScrollArea,
+                             QSizePolicy, QSlider, QSpinBox, QStyle, QStyledItemDelegate,
+                             QTextBrowser, QTextEdit, QTimeEdit, QVBoxLayout, QWidget)
 
 import sprites
 from audio_manager import audio, play_ui, play_voice
 from calendar_service import CalendarResult, events_by_day, human_delta, morgana_briefing
 from lines import build_daily_briefing
 from motion import FrameTicker, Spring, clamp
+from particles import P5_NOTE_GOLD, P5_STAR_COLORS, Particle, draw_particle
 from storage_manager import (DAILY_BLOCK_TARGET, DEFAULT_STAT_POINTS, QUICK_STAT_POINTS,
                              RADIAL_TAB_KEYS, SETTINGS_DEFAULTS, SOCIAL_STAT_KEYS, SOCIAL_STATS,
                              STAT_MASTERY_STEP, STAT_RANK_THRESHOLDS, TIME_BLOCKS, HabitStore,
@@ -42,10 +45,11 @@ from storage_manager import (DAILY_BLOCK_TARGET, DEFAULT_STAT_POINTS, QUICK_STAT
 from theme import (BLACK, DEEP_RED, GOLD, LIGHT_RED, P5_BG, P5_BORDER, P5_BORDER_HI,
                    P5_CARD, P5_GOLD_BG, P5_GOLD_FG, P5_HOVER, P5_MINT_BG, P5_MINT_FG, P5_MUTED,
                    P5_RED_BG, P5_RED_FG, P5_SELECTED, P5_SURFACE, P5_TEXT, RED, RED_HOVER, WHITE,
-                   dialog_qss, lerp_color, load_fonts, p5_font, pen, ui_font)
+                   dialog_qss, lerp_color, load_fonts, menu_qss, p5_font, pen, star_polygon,
+                   ui_font)
 
 ROLE_ID = Qt.ItemDataRole.UserRole.value      # item id; None = empty-state hint row
-ROLE_DONE = ROLE_ID + 1                       # bool: completed
+ROLE_DONE = ROLE_ID + 1                       # bool: completed / archived
 ROLE_PREVIEW = ROLE_ID + 2                    # preview snippet (notes)
 ROLE_BADGE = ROLE_ID + 3                      # status chip text ("IN 2H", "OVERDUE", "DONE")
 ROLE_DATE = ROLE_ID + 4                       # date / time label
@@ -53,8 +57,32 @@ ROLE_CAT = ROLE_ID + 5                        # category / tone
 ROLE_FLAG = ROLE_ID + 6                       # bool: high priority (tasks) or pinned (notes)
 ROLE_OVERDUE = ROLE_ID + 7                    # bool: task deadline overdue
 ROLE_STREAK = ROLE_ID + 8                     # str: habit streak badge text
+ROLE_TAGS = ROLE_ID + 9                       # list[str]: #tags on note card
 
-NOTE_CATEGORIES = ("Personal", "Work", "Study")
+NOTE_CATEGORIES = ("Personal", "Study", "Work", "Ideas", "Journal")
+NOTE_TEMPLATES: dict[str, tuple[str, str, str]] = {
+    "blank": ("", "", "Personal"),
+    "meeting": (
+        "Meeting Notes — {date}",
+        "## Agenda\n- \n\n## Key Points\n- \n\n## Decisions & Follow-ups\n- [ ] \n\n#meeting",
+        "Work",
+    ),
+    "study": (
+        "Study Summary — {date}",
+        "## Core Concept\n\n\n## Key Takeaways (In My Own Words)\n- \n- \n\n## Questions to Review\n- \n\n#study",
+        "Study",
+    ),
+    "idea": (
+        "Idea Sketch — {date}",
+        "## Spark\n\n\n## Why It Matters\n- \n\n## Rough First Steps\n- \n\n#ideas",
+        "Ideas",
+    ),
+    "journal": (
+        "Daily Reflection — {date}",
+        "## Wins Today\n- \n\n## What I Learned\n- \n\n## Focus for Tomorrow\n- \n\n#journal",
+        "Journal",
+    ),
+}
 _AVATAR_CACHE: dict[int, QPixmap] = {}
 
 
@@ -860,16 +888,14 @@ class NoteCardDelegate(QStyledItemDelegate):
         super().__init__(view)
         self._sc = max(0.75, min(1.5, float(scale)))
         self._title_font = ui_font(_sc(15, self._sc, 11), bold=True)
-        self._done_font = ui_font(_sc(15, self._sc, 11), bold=True)
-        self._done_font.setStrikeOut(True)
         self._preview_font = ui_font(_sc(12, self._sc, 10), bold=False)
-        self._chip_font = p5_font(_sc(11, self._sc, 9), italic=False)
+        self._chip_font = p5_font(_sc(10, self._sc, 8), italic=False)
         self._date_font = ui_font(_sc(11, self._sc, 9), bold=False)
         self._hint_font = ui_font(_sc(13, self._sc, 11), bold=False)
 
     def sizeHint(self, option, index) -> QSize:
         if index.data(ROLE_ID) is None:
-            return QSize(180, _sc(90, self._sc, 70))
+            return QSize(180, _sc(92, self._sc, 72))
         return QSize(180, _sc(96, self._sc, 78))
 
     def paint(self, painter, option, index) -> None:
@@ -889,7 +915,7 @@ class NoteCardDelegate(QStyledItemDelegate):
             return
 
         card = r.adjusted(2, 3, -4, -3)
-        done = bool(index.data(ROLE_DONE))
+        archived = bool(index.data(ROLE_DONE))
         pinned = bool(index.data(ROLE_FLAG))
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
         hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
@@ -914,12 +940,11 @@ class NoteCardDelegate(QStyledItemDelegate):
         tx = card.left() + 12
         tw = max(40.0, card.right() - tx - 10)
 
-        # Title + optional gold pin dot (text color never changes on hover)
+        # Title + optional gold pin icon
         title = index.data(Qt.ItemDataRole.DisplayRole) or "(Untitled)"
-        tf = self._done_font if done else self._title_font
-        tfm = QFontMetrics(tf)
-        painter.setFont(tf)
-        painter.setPen(P5_MUTED if done else WHITE)
+        tfm = QFontMetrics(self._title_font)
+        painter.setFont(self._title_font)
+        painter.setPen(P5_MUTED if archived else WHITE)
         title_w = int(tw - (16 if pinned else 0))
         painter.drawText(QPointF(tx, card.top() + 9 + tfm.ascent()),
                          tfm.elidedText(title, Qt.TextElideMode.ElideRight, title_w))
@@ -946,42 +971,55 @@ class NoteCardDelegate(QStyledItemDelegate):
             painter.drawText(QPointF(tx, y_p + pfm.height() + 1),
                              pfm.elidedText(" ".join(rest), Qt.TextElideMode.ElideRight, max_w))
 
-        # Bottom strip: category chip + status badge + date
+        # Bottom strip: notebook chip + first #tag chip (or ARCHIVED) + updated date
         sc = self._sc
         ch = 16.0 * sc
         by = card.bottom() - ch - 5.0
         x_cur = tx
         cfm = QFontMetrics(self._chip_font)
+        date_txt = index.data(ROLE_DATE) or ""
+        dfm = QFontMetrics(self._date_font)
+        date_w = (dfm.horizontalAdvance(date_txt) + 8.0) if date_txt else 0.0
+        max_chip_right = card.right() - date_w - 8.0
+
         cat = (index.data(ROLE_CAT) or "Personal").upper()
-        cw = cfm.horizontalAdvance(cat) + 12.0 * sc
+        cw = cfm.horizontalAdvance(cat) + 10.0 * sc
         cpill = QRectF(x_cur, by, cw, ch)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor("#242430"))
+        painter.setBrush(QColor("#242432"))
         painter.drawRoundedRect(cpill, 4.0, 4.0)
         painter.setFont(self._chip_font)
-        painter.setPen(QColor("#C8C8D6"))
+        painter.setPen(QColor("#D0D0E2"))
         painter.drawText(cpill, Qt.AlignmentFlag.AlignCenter.value, cat)
-        x_cur = cpill.right() + 5
+        x_cur = cpill.right() + 4.0
 
         badge = index.data(ROLE_BADGE) or ""
+        tags = index.data(ROLE_TAGS) or []
         if badge:
-            bw = cfm.horizontalAdvance(badge) + 12.0 * sc
-            bpill = QRectF(x_cur, by, bw, ch)
-            if badge == "OVERDUE":
-                bbg, bfg = P5_RED_BG, P5_RED_FG
-            elif badge == "DONE":
-                bbg, bfg = P5_MINT_BG, P5_MINT_FG
-            else:
-                bbg, bfg = P5_GOLD_BG, P5_GOLD_FG
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(bbg)
-            painter.drawRoundedRect(bpill, 4.0, 4.0)
-            painter.setFont(self._chip_font)
-            painter.setPen(bfg)
-            painter.drawText(bpill, Qt.AlignmentFlag.AlignCenter.value, badge)
-            x_cur = bpill.right() + 6
+            bw = cfm.horizontalAdvance(badge) + 10.0 * sc
+            if x_cur + bw <= max_chip_right:
+                bpill = QRectF(x_cur, by, bw, ch)
+                bbg, bfg = (P5_RED_BG, P5_RED_FG) if badge == "LEGACY DUE" else (QColor("#22222C"), P5_MUTED)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(bbg)
+                painter.drawRoundedRect(bpill, 4.0, 4.0)
+                painter.setFont(self._chip_font)
+                painter.setPen(bfg)
+                painter.drawText(bpill, Qt.AlignmentFlag.AlignCenter.value, badge)
+                x_cur = bpill.right() + 4.0
+        elif tags:
+            tag_lbl = f"#{tags[0]}"
+            bw = cfm.horizontalAdvance(tag_lbl) + 10.0 * sc
+            if x_cur + bw <= max_chip_right:
+                tpill = QRectF(x_cur, by, bw, ch)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(P5_GOLD_BG)
+                painter.drawRoundedRect(tpill, 4.0, 4.0)
+                painter.setFont(self._chip_font)
+                painter.setPen(P5_GOLD_FG)
+                painter.drawText(tpill, Qt.AlignmentFlag.AlignCenter.value, tag_lbl)
+                x_cur = tpill.right() + 4.0
 
-        date_txt = index.data(ROLE_DATE) or ""
         if date_txt:
             painter.setFont(self._date_font)
             painter.setPen(QColor("#7C7C90"))
@@ -1469,29 +1507,47 @@ class TasksDialog(P5FluidPanel):
 # NOTES DIALOG (2-column Persona 5 workspace: full-height editor + fast sidebar)
 # ---------------------------------------------------------------------------
 class NotesDialog(P5FluidPanel):
-    FILTERS = (("ALL", "all"), ("PIN", "pinned"), ("DUE", "reminders"), ("DONE", "done"))
+    """Frictionless Persona 5 Note-Taking workspace (distinct from Tasks).
+
+    Built around proven desktop note UX (Apple Notes / Bear / Obsidian / Evernote):
+      * Zero-friction capture with instant debounced auto-save (no Save button friction).
+      * Notebooks (`Personal`, `Study`, `Work`, `Ideas`, `Journal`) + automatic `#tag` discovery.
+      * Quick Templates (`Meeting`, `Study`, `Idea`, `Journal`) & Markdown Write/Preview toggle.
+      * 1-click `→ TASK` bridge: turn any highlighted line or note title into a Task without
+        duplicating to-do checklists or deadlines inside Notes.
+      * Clean Archive + Undo Delete + legacy deadline migration banner for older `notes.json`.
+    """
+
+    FILTERS = (("ALL", "all"), ("PIN", "pinned"), ("ARCHIVE", "archived"))
+    SORT_MODES = (("recent", "RECENT"), ("alpha", "A–Z"), ("created", "CREATED"))
+
     open_settings = pyqtSignal()
     open_tasks = pyqtSignal()
     tasks_changed = pyqtSignal()
     notes_changed = pyqtSignal()
-    note_completed = pyqtSignal(str)          # emits note_id when marked done
+    note_completed = pyqtSignal(str)                # kept for legacy signal compatibility
+    send_to_task = pyqtSignal(str, object)          # (task_title, optional_deadline_datetime)
 
     def __init__(self, store: NoteStore, task_store: TaskStore | None = None,
                  on_top: bool = True, ui_scale: float = 1.0) -> None:
-        super().__init__("NOTES", QSize(820, 600), on_top=on_top, ui_scale=ui_scale)
+        super().__init__("NOTES", QSize(870, 625), on_top=on_top, ui_scale=ui_scale)
         sc = self._ui_scale
         self.store = store
         self.task_store = task_store
         self._current_id: str | None = None
         self._category = "Personal"
         self._filter = "all"
-        self._sort_recent = False
+        self._active_tag = ""
+        self._sort_idx = 0
+        self._preview_mode = False
         self._loading = False
         self._dirty = False
         self._undo_note: dict | None = None
+        self._legacy_dl_note_id: str | None = None
 
-        # Header quick actions (1-click jump to Tasks or Settings)
+        # Header quick actions
         self._tasks_btn = self._btn("TASKS", variant="soft", display=True, px=10)
+        self._tasks_btn.setToolTip("Open Tasks for to-dos & deadlines")
         self._tasks_btn.clicked.connect(lambda _c=False: self.open_tasks.emit())
         self.header_bar.addWidget(self._tasks_btn)
 
@@ -1502,26 +1558,36 @@ class NotesDialog(P5FluidPanel):
         self.header_bar.addWidget(set_btn)
         self._add_close_button()
 
-        # Two-column body
+        # Two-column split workspace
         cols = QHBoxLayout()
-        cols.setSpacing(12)
+        cols.setSpacing(_sc(12, sc, 8))
 
-        # -- Left sidebar: New button, search, filters, note list --
+        # -- Left sidebar: Capture, Search, Filter, #Tags, Note List --
         left_card = _make_card()
-        left_card.setMinimumWidth(_sc(210, sc, 185))
-        left_card.setMaximumWidth(_sc(284, sc, 225))
+        left_card.setMinimumWidth(_sc(228, sc, 195))
+        left_card.setMaximumWidth(_sc(305, sc, 245))
         ll = QVBoxLayout(left_card)
         ll.setContentsMargins(10, 10, 10, 10)
-        ll.setSpacing(8)
+        ll.setSpacing(_sc(7, sc, 5))
 
+        new_row = QHBoxLayout()
+        new_row.setSpacing(_sc(5, sc, 4))
         new_btn = self._btn("NEW NOTE", variant="primary", icon="plus", display=True, px=11)
         new_btn.setFixedHeight(_sc(32, sc, 26))
-        new_btn.clicked.connect(self._new)
-        ll.addWidget(new_btn)
+        new_btn.setToolTip("Create blank note (Ctrl+N)")
+        new_btn.clicked.connect(lambda _c=False: self._new())
+        new_row.addWidget(new_btn, 1)
+
+        self._tmpl_btn = self._btn("TMPL ▾", variant="gold", display=True, px=10)
+        self._tmpl_btn.setFixedHeight(_sc(32, sc, 26))
+        self._tmpl_btn.setToolTip("Start a note from a quick template")
+        self._tmpl_btn.clicked.connect(self._open_template_menu)
+        new_row.addWidget(self._tmpl_btn)
+        ll.addLayout(new_row)
 
         self.search_edit = QLineEdit()
         self.search_edit.setObjectName("searchInput")
-        self.search_edit.setPlaceholderText("Search notes... (Ctrl+F)")
+        self.search_edit.setPlaceholderText("Search notes or #tags... (Ctrl+F)")
         self.search_edit.setClearButtonEnabled(True)
         self.search_edit.textChanged.connect(self.refresh)
         ll.addWidget(self.search_edit)
@@ -1534,19 +1600,41 @@ class NotesDialog(P5FluidPanel):
             fb.setFixedHeight(_sc(24, sc, 20))
             fb.clicked.connect(lambda _c=False, k=key: self._set_filter(k))
             self._fchips[key] = fb
-            frow.addWidget(fb)
+            frow.addWidget(fb, 1)
         self._fchips["all"].set_active(True)
         ll.addLayout(frow)
+
+        # Dynamic #Tag filter strip inside a sleek horizontal scroll area (zero chip clipping at any scale)
+        self._tags_scroll = QScrollArea()
+        self._tags_scroll.setWidgetResizable(True)
+        self._tags_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._tags_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._tags_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._tags_scroll.setFixedHeight(_sc(30, sc, 25))
+        self._tags_scroll.setStyleSheet(
+            "QScrollArea { background: transparent; border: none; }"
+            "QScrollArea > QWidget > QWidget { background: transparent; }"
+            "QScrollBar:horizontal { height: 4px; background: transparent; margin: 0px; }"
+            "QScrollBar::handle:horizontal { background: #3D3D4E; border-radius: 2px; min-width: 18px; }"
+            "QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0px; }"
+        )
+        self._tags_bar = QWidget()
+        self._tags_lay = QHBoxLayout(self._tags_bar)
+        self._tags_lay.setContentsMargins(0, 1, 0, 1)
+        self._tags_lay.setSpacing(4)
+        self._tags_scroll.setWidget(self._tags_bar)
+        self._tags_scroll.setVisible(False)
+        ll.addWidget(self._tags_scroll)
 
         mrow = QHBoxLayout()
         self.count_label = QLabel("0 NOTES")
         self.count_label.setObjectName("subhead")
         mrow.addWidget(self.count_label)
         mrow.addStretch(1)
-        self._sort_btn = self._btn("DEADLINES", variant="ghost", icon="sort", px=10)
+        self._sort_btn = self._btn("RECENT", variant="ghost", icon="sort", px=10)
         self._sort_btn.setFixedHeight(_sc(22, sc, 20))
-        self._sort_btn.setToolTip("Switch sort order (Deadlines / Recent)")
-        self._sort_btn.clicked.connect(self._toggle_sort)
+        self._sort_btn.setToolTip("Switch sort order (Recent / A–Z / Created)")
+        self._sort_btn.clicked.connect(self._cycle_sort)
         mrow.addWidget(self._sort_btn)
         ll.addLayout(mrow)
 
@@ -1558,35 +1646,29 @@ class NotesDialog(P5FluidPanel):
         self.list.setItemDelegate(self._delegate)
         self.list.itemSelectionChanged.connect(self._on_select)
         ll.addWidget(self.list, 1)
-        cols.addWidget(left_card, 34)
+        cols.addWidget(left_card, 35)
 
-        # -- Right panel: Full-height Note Editor --
+        # -- Right panel: Clean Note Editor + Markdown Preview --
         editor_card = _make_card()
         el = QVBoxLayout(editor_card)
         el.setContentsMargins(14, 12, 14, 12)
-        el.setSpacing(8)
+        el.setSpacing(_sc(6, sc, 5))
 
-        # Title + Pin + Done + Delete
+        # Row 1: Spacious full-width Title + Pin + Delete (title never squeezes at 130%)
         eh = QHBoxLayout()
-        eh.setSpacing(6)
+        eh.setSpacing(_sc(5, sc, 4))
         self.title_edit = QLineEdit()
         self.title_edit.setObjectName("titleInput")
-        self.title_edit.setPlaceholderText("Note title...")
+        self.title_edit.setPlaceholderText("Untitled note...")
         self.title_edit.textChanged.connect(self._on_edited)
         eh.addWidget(self.title_edit, 1)
 
         self._pin_btn = self._btn("", variant="soft", icon="pin")
         self._pin_btn.setFixedSize(_sc(30, sc, 24), _sc(30, sc, 24))
-        self._pin_btn.setToolTip("Pin note to top")
+        self._pin_btn.setToolTip("Pin note to top (Ctrl+P)")
         self._pin_btn.setEnabled(False)
         self._pin_btn.clicked.connect(self._toggle_pin)
         eh.addWidget(self._pin_btn)
-
-        self._done_btn = self._btn("DONE", variant="soft", icon="check", display=True, px=10)
-        self._done_btn.setFixedHeight(_sc(30, sc, 24))
-        self._done_btn.setEnabled(False)
-        self._done_btn.clicked.connect(self._toggle_done)
-        eh.addWidget(self._done_btn)
 
         self._del_btn = self._btn("", variant="danger", icon="trash")
         self._del_btn.setFixedSize(_sc(30, sc, 24), _sc(30, sc, 24))
@@ -1596,131 +1678,159 @@ class NotesDialog(P5FluidPanel):
         eh.addWidget(self._del_btn)
         el.addLayout(eh)
 
-        # Category chips (1-click) + Reminder toggle + word count
+        # Row 2: Editor actions (PREVIEW, → TASK bridge, ARCHIVE) + reading stats
+        act = QHBoxLayout()
+        act.setSpacing(_sc(5, sc, 4))
+        self._prev_btn = self._btn("PREVIEW", variant="soft", display=True, px=9)
+        self._prev_btn.setFixedHeight(_sc(26, sc, 22))
+        self._prev_btn.setToolTip("Toggle Markdown Preview / Edit (Ctrl+E)")
+        self._prev_btn.clicked.connect(self._toggle_preview)
+        act.addWidget(self._prev_btn)
+
+        self._to_task_btn = self._btn("→ TASK", variant="gold", display=True, px=9)
+        self._to_task_btn.setFixedHeight(_sc(26, sc, 22))
+        self._to_task_btn.setToolTip("Promote selected text (or note title) into a Task in Tasks")
+        self._to_task_btn.clicked.connect(self._promote_to_task)
+        act.addWidget(self._to_task_btn)
+
+        self._arch_btn = self._btn("ARCHIVE", variant="soft", display=True, px=9)
+        self._arch_btn.setFixedHeight(_sc(26, sc, 22))
+        self._arch_btn.setToolTip("Archive / Restore note without deleting")
+        self._arch_btn.setEnabled(False)
+        self._arch_btn.clicked.connect(self._toggle_archive)
+        act.addWidget(self._arch_btn)
+
+        act.addStretch(1)
+        self._words_lbl = QLabel("0 words")
+        self._words_lbl.setObjectName("tip")
+        act.addWidget(self._words_lbl)
+        el.addLayout(act)
+
+        # Row 3: Notebook chips (1-click)
         meta = QHBoxLayout()
-        meta.setSpacing(5)
+        meta.setSpacing(4)
         self._cat_btns: dict[str, P5FluidButton] = {}
         for cat in NOTE_CATEGORIES:
             cb = self._btn(cat.upper(), variant="soft", display=True, px=9)
-            cb.setFixedHeight(_sc(24, sc, 20))
+            cb.setFixedHeight(_sc(23, sc, 20))
             cb.clicked.connect(lambda _c=False, c=cat: self._set_category(c))
             self._cat_btns[cat] = cb
             meta.addWidget(cb)
         self._sync_category_ui()
-
-        self._rem_btn = self._btn("REMINDER", variant="soft", icon="clock", display=True, px=9)
-        self._rem_btn.setFixedHeight(_sc(24, sc, 20))
-        self._rem_btn.clicked.connect(self._toggle_reminder_bar)
-        meta.addWidget(self._rem_btn)
         meta.addStretch(1)
-
-        self._words_lbl = QLabel("0 words")
-        self._words_lbl.setObjectName("tip")
-        meta.addWidget(self._words_lbl)
         el.addLayout(meta)
 
-        # Collapsible inline reminder card
-        self.deadline_box = _make_card("subcard")
-        db = QVBoxLayout(self.deadline_box)
-        db.setContentsMargins(10, 8, 10, 8)
-        db.setSpacing(6)
-        r1 = QHBoxLayout()
-        r1.setSpacing(6)
-        self.deadline_check = P5CheckBox("Remind me", scale=sc)
-        self.deadline_check.toggled.connect(self._on_deadline_toggled)
-        r1.addWidget(self.deadline_check)
-        self.deadline_edit = QDateTimeEdit()
-        self.deadline_edit.setCalendarPopup(True)
-        self.deadline_edit.setDisplayFormat("dd MMM yyyy HH:mm")
-        self.deadline_edit.setDateTime(self._default_deadline())
-        self.deadline_edit.setMinimumHeight(_sc(28, sc, 24))
-        self.deadline_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.deadline_edit.dateTimeChanged.connect(self._on_deadline_changed)
-        r1.addWidget(self.deadline_edit, 1)
-        self.deadline_hint = QLabel("")
-        self.deadline_hint.setObjectName("tip")
-        self.deadline_hint.setMinimumWidth(0)
-        r1.addWidget(self.deadline_hint)
-        db.addLayout(r1)
+        # Detected #tags indicator row
+        self._note_tags_lbl = QLabel("Tip: type #tag anywhere in your note to organize & filter.")
+        self._note_tags_lbl.setObjectName("tip")
+        el.addWidget(self._note_tags_lbl)
 
-        r2 = QHBoxLayout()
-        r2.setSpacing(_sc(5, sc, 4))
-        for text, kind in (("+30m", "30m"), ("+1h", "1h"), ("+3h", "3h"), ("23:59", "eod"), ("Tomorrow 9:00", "tomorrow")):
-            pb = self._btn(text, variant="gold" if kind == "eod" else "soft", px=10)
-            pb.setFixedHeight(_sc(24, sc, 21))
-            if kind == "eod":
-                pb.setToolTip("Set deadline to 23:59 today (or tomorrow if past 23:59)")
-            pb.clicked.connect(lambda _c=False, k=kind: self._apply_preset(k))
-            r2.addWidget(pb)
-        r2.addStretch(1)
-        db.addLayout(r2)
-        self.deadline_box.setVisible(False)
-        el.addWidget(self.deadline_box)
+        # Gentle legacy-deadline migration banner (only shown for older v1.1/v1.2 notes that had deadlines)
+        self._legacy_bar = _make_card("subcard")
+        lgl = QHBoxLayout(self._legacy_bar)
+        lgl.setContentsMargins(10, 6, 10, 6)
+        lgl.setSpacing(6)
+        self._legacy_lbl = QLabel("")
+        self._legacy_lbl.setStyleSheet(f"color: #FAD02C; font-size: {_sc(12, sc, 10)}px; font-weight: bold;")
+        lgl.addWidget(self._legacy_lbl, 1)
+        mv_btn = self._btn("MOVE TO TASKS", variant="primary", display=True, px=9)
+        mv_btn.setFixedHeight(_sc(24, sc, 20))
+        mv_btn.clicked.connect(self._migrate_legacy_deadline)
+        lgl.addWidget(mv_btn)
+        clr_btn = self._btn("CLEAR", variant="soft", display=True, px=9)
+        clr_btn.setFixedHeight(_sc(24, sc, 20))
+        clr_btn.clicked.connect(self._clear_legacy_deadline)
+        lgl.addWidget(clr_btn)
+        self._legacy_bar.setVisible(False)
+        el.addWidget(self._legacy_bar)
 
-        # Spacious note body editor
+        # Spacious Markdown note editor & toggleable rich preview
         self.content_edit = QTextEdit()
         self.content_edit.setObjectName("noteBody")
         self.content_edit.setAcceptRichText(False)
-        self.content_edit.setPlaceholderText("Write notes, ideas, or reminders here... (auto-saves as you type)")
+        self.content_edit.setPlaceholderText(
+            "Start writing... Supports Markdown (**bold**, ## headings, - lists, `code`) and #tags.\n"
+            "Highlight any action item and click '→ TASK' to send it straight to Tasks."
+        )
         self.content_edit.textChanged.connect(self._on_content_changed)
         el.addWidget(self.content_edit, 1)
 
-        # Undo strip (hidden unless a note was deleted)
+        self.preview_view = QTextBrowser()
+        self.preview_view.setObjectName("notePreview")
+        self.preview_view.setOpenExternalLinks(True)
+        self.preview_view.setVisible(False)
+        el.addWidget(self.preview_view, 1)
+
+        # Undo strip
         self._undo = UndoBar(scale=sc)
         self._undo.undo_clicked.connect(self._undo_delete)
         el.addWidget(self._undo)
 
-        # Bottom quick-insert toolbar + live status + SAVE button
+        # Bottom Markdown formatting toolbar + true auto-save indicator + COPY MD
         bf = QHBoxLayout()
-        bf.setSpacing(8)
-        pill = _make_card("toolbarPill")
-        pl = QHBoxLayout(pill)
+        bf.setSpacing(6)
+        self._fmt_pill = _make_card("toolbarPill")
+        pl = QHBoxLayout(self._fmt_pill)
         pl.setContentsMargins(4, 3, 4, 3)
-        pl.setSpacing(2)
+        pl.setSpacing(1)
         for label, ic, tip, fn in (
-            ("•", "", "Insert bullet point", lambda: self._insert_snippet("• ")),
-            ("☐", "", "Insert checklist item", lambda: self._insert_snippet("[ ] ")),
-            ("—", "", "Insert divider", lambda: self._insert_snippet("\n---\n")),
-            ("", "clock", "Insert current timestamp", self._insert_timestamp),
+            ("H2", "", "Heading (## )", lambda: self._insert_line_prefix("## ")),
+            ("B",  "", "Bold (**text**, Ctrl+B)", lambda: self._wrap_selection("**", "**", "bold")),
+            ("I",  "", "Italic (*text*, Ctrl+I)", lambda: self._wrap_selection("*", "*", "italic")),
+            ("<>", "", "Inline code (`code`)", lambda: self._wrap_selection("`", "`", "code")),
+            ("•",  "", "Bullet list (- )", lambda: self._insert_line_prefix("- ")),
+            ("☐",  "", "Checklist (- [ ] )", lambda: self._insert_line_prefix("- [ ] ")),
+            ("”",  "", "Blockquote (> )", lambda: self._insert_line_prefix("> ")),
+            ("—",  "", "Section divider", lambda: self._insert_snippet("\n---\n")),
+            ("",   "clock", "Insert timestamp", self._insert_timestamp),
         ):
-            tb_btn = self._btn(label, variant="ghost", icon=ic, px=12)
-            tb_btn.setFixedSize(_sc(30, sc, 24), _sc(26, sc, 22))
+            tb_btn = self._btn(label, variant="ghost", icon=ic, px=10)
+            tb_btn.setFixedSize(_sc(25, sc, 21), _sc(25, sc, 21))
             tb_btn.setToolTip(tip)
             tb_btn.clicked.connect(lambda _c=False, f=fn: f())
             pl.addWidget(tb_btn)
-        bf.addWidget(pill)
+        bf.addWidget(self._fmt_pill)
 
-        self.status = QLabel("")
+        self.status = QLabel("Auto-saves as you type")
         self.status.setObjectName("tip")
         bf.addWidget(self.status, 1)
 
-        save_btn = self._btn("SAVE", variant="primary", display=True, px=11)
-        save_btn.setMinimumWidth(_sc(82, sc, 68))
-        save_btn.clicked.connect(self._save)
-        bf.addWidget(save_btn)
+        copy_btn = self._btn("COPY MD", variant="soft", display=True, px=10)
+        copy_btn.setFixedHeight(_sc(28, sc, 24))
+        copy_btn.setToolTip("Copy note title & Markdown body to clipboard")
+        copy_btn.clicked.connect(self._copy_markdown)
+        bf.addWidget(copy_btn)
         el.addLayout(bf)
 
-        cols.addWidget(editor_card, 66)
+        cols.addWidget(editor_card, 65)
         self.body.addLayout(cols, 1)
 
-        # Keyboard shortcuts
+        # Keyboard shortcuts (familiar desktop note app ergonomics)
         QShortcut(QKeySequence("Ctrl+S"), self).activated.connect(self._save)
-        QShortcut(QKeySequence("Ctrl+N"), self).activated.connect(self._new)
+        QShortcut(QKeySequence("Ctrl+N"), self).activated.connect(lambda: self._new())
         QShortcut(QKeySequence("Ctrl+F"), self).activated.connect(self.search_edit.setFocus)
+        QShortcut(QKeySequence("Ctrl+E"), self).activated.connect(self._toggle_preview)
+        QShortcut(QKeySequence("Ctrl+P"), self).activated.connect(self._toggle_pin)
+        QShortcut(QKeySequence("Ctrl+B"), self).activated.connect(lambda: self._wrap_selection("**", "**", "bold"))
+        QShortcut(QKeySequence("Ctrl+I"), self).activated.connect(lambda: self._wrap_selection("*", "*", "italic"))
         QShortcut(QKeySequence("Ctrl+,"), self).activated.connect(lambda: self.open_settings.emit())
 
-        # Debounced autosave (800 ms after typing stops)
+        # Fast debounced auto-save (650 ms after typing stops)
         self._autosave_timer = QTimer(self)
         self._autosave_timer.setSingleShot(True)
-        self._autosave_timer.setInterval(800)
+        self._autosave_timer.setInterval(650)
         self._autosave_timer.timeout.connect(self._debounced_autosave)
 
     # -- panel hooks -------------------------------------------------------------
     def on_shown(self) -> None:
         if self._current_id is None:
-            notes = self.store.all()
-            if notes:
-                self._load(notes[0])
+            active = [n for n in self.store.all() if not n.get("archived")]
+            if active:
+                active.sort(key=lambda n: (0 if n.get("pinned") else 1, n.get("updated", "")), reverse=False)
+                # Pinned first, then most recently updated
+                active.sort(key=lambda n: n.get("updated", ""), reverse=True)
+                active.sort(key=lambda n: 0 if n.get("pinned") else 1)
+                self._load(active[0])
                 self.refresh()
             else:
                 QTimer.singleShot(20, self.title_edit.setFocus)
@@ -1731,20 +1841,39 @@ class NotesDialog(P5FluidPanel):
             self._save(silent=True)
         self.refresh()
 
-    # -- helpers -----------------------------------------------------------------
-    @staticmethod
-    def _default_deadline() -> QDateTime:
-        return _to_qdt(datetime.now() + timedelta(hours=1))
+    # -- public helper for Choice Prompts / Templates ----------------------------
+    def create_from_template(self, template_key: str) -> None:
+        """Open a fresh note pre-filled from `NOTE_TEMPLATES[template_key]`."""
+        self._new(template_key=template_key)
 
+    def _open_template_menu(self) -> None:
+        m = QMenu(self)
+        m.setStyleSheet(menu_qss(self._ui_scale))
+        for key, label in (
+            ("blank",   "BLANK NOTE"),
+            ("meeting", "MEETING NOTES"),
+            ("study",   "STUDY SUMMARY"),
+            ("idea",    "IDEA SKETCH"),
+            ("journal", "DAILY JOURNAL"),
+        ):
+            m.addAction(label, lambda k=key: self._new(template_key=k))
+        pos = self._tmpl_btn.mapToGlobal(QPoint(0, self._tmpl_btn.height() + 4))
+        m.exec(pos)
+
+    # -- filters, tags & sort ----------------------------------------------------
     def _set_filter(self, key: str) -> None:
         self._filter = key
         for k, btn in self._fchips.items():
             btn.set_active(k == key)
         self.refresh()
 
-    def _toggle_sort(self) -> None:
-        self._sort_recent = not self._sort_recent
-        self._sort_btn.setText("RECENT" if self._sort_recent else "DEADLINES")
+    def _set_tag_filter(self, tag: str) -> None:
+        self._active_tag = "" if self._active_tag == tag else tag
+        self.refresh()
+
+    def _cycle_sort(self) -> None:
+        self._sort_idx = (self._sort_idx + 1) % len(self.SORT_MODES)
+        self._sort_btn.setText(self.SORT_MODES[self._sort_idx][1])
         self.refresh()
 
     def _set_category(self, cat: str) -> None:
@@ -1756,32 +1885,125 @@ class NotesDialog(P5FluidPanel):
         for cat, btn in self._cat_btns.items():
             btn.set_active(cat == self._category, active_variant="primary")
 
-    def _toggle_reminder_bar(self) -> None:
-        show = not self.deadline_box.isVisible()
-        self.deadline_box.setVisible(show)
-        if show and not self.deadline_check.isChecked():
-            self.deadline_check.setChecked(True)
+    def _rebuild_tag_bar(self) -> None:
+        _clear_layout(self._tags_lay)
+        tags = self.store.all_tags(include_archived=(self._filter == "archived"))[:10]
+        if self._active_tag and all(t != self._active_tag for t, _ in tags):
+            self._active_tag = ""
+        if not tags:
+            self._tags_scroll.setVisible(False)
+            return
+        sc = self._ui_scale
+        for tag, _cnt in tags:
+            tb = self._btn(f"#{tag}", variant="soft", display=True, px=9)
+            tb.setFixedHeight(_sc(21, sc, 18))
+            tb.setMinimumWidth(tb.sizeHint().width() + _sc(4, sc, 2))
+            tb.set_active(tag == self._active_tag, active_variant="gold")
+            tb.clicked.connect(lambda _c=False, t=tag: self._set_tag_filter(t))
+            self._tags_lay.addWidget(tb)
+        self._tags_lay.addStretch(1)
+        self._tags_scroll.setVisible(True)
+
+    # -- Markdown formatting & preview -------------------------------------------
+    def _set_preview_mode(self, on: bool) -> None:
+        self._preview_mode = bool(on)
+        self.content_edit.setVisible(not self._preview_mode)
+        self.preview_view.setVisible(self._preview_mode)
+        self._fmt_pill.setEnabled(not self._preview_mode)
+        self._prev_btn.set_active(self._preview_mode, active_variant="primary")
+        self._prev_btn.setText("EDIT" if self._preview_mode else "PREVIEW")
+        if self._preview_mode:
+            self._render_preview()
+
+    def _toggle_preview(self) -> None:
+        self._set_preview_mode(not self._preview_mode)
+
+    def _render_preview(self) -> None:
+        raw = self.content_edit.toPlainText()
+        title = self.title_edit.text().strip() or "(Untitled)"
+        # Convert simple checkboxes to clean unicode glyphs before Qt Markdown rendering
+        md_lines = []
+        for ln in raw.splitlines():
+            s = ln.lstrip()
+            indent = ln[:len(ln) - len(s)]
+            if s.startswith("- [ ] ") or s.startswith("[ ] "):
+                body = s.split("] ", 1)[1]
+                md_lines.append(f"{indent}- ☐ {body}")
+            elif s.lower().startswith("- [x] ") or s.lower().startswith("[x] "):
+                body = s.split("] ", 1)[1]
+                md_lines.append(f"{indent}- ☑ ~~{body}~~")
+            else:
+                md_lines.append(ln)
+        doc_md = f"# {title}\n\n" + ("\n".join(md_lines) if md_lines else "*Empty note — click EDIT to start writing.*")
+        self.preview_view.document().setDefaultStyleSheet(
+            "body { color: #EAEAF2; line-height: 1.45; }"
+            "h1 { color: #FFFFFF; font-size: 20px; border-bottom: 1px solid #3A1A22; padding-bottom: 4px; }"
+            "h2 { color: #FAD02C; font-size: 16px; margin-top: 10px; }"
+            "h3 { color: #FF5E6B; font-size: 14px; }"
+            "code { background-color: #20202C; color: #FAD02C; padding: 1px 4px; }"
+            "pre { background-color: #1A1A24; color: #EAEAF2; padding: 8px; }"
+            "blockquote { color: #C0C0D4; border-left: 3px solid #E60012; margin-left: 4px; padding-left: 8px; }"
+            "a { color: #FAD02C; }"
+        )
+        self.preview_view.setMarkdown(doc_md)
 
     def _insert_snippet(self, snippet: str) -> None:
+        if self._preview_mode:
+            self._set_preview_mode(False)
         cur = self.content_edit.textCursor()
-        if snippet in ("• ", "[ ] ") and cur.positionInBlock() > 0:
-            cur.movePosition(QTextCursor.MoveOperation.StartOfBlock)
         cur.insertText(snippet)
+        self.content_edit.setFocus()
+
+    def _insert_line_prefix(self, prefix: str) -> None:
+        if self._preview_mode:
+            self._set_preview_mode(False)
+        cur = self.content_edit.textCursor()
+        cur.movePosition(QTextCursor.MoveOperation.StartOfBlock)
+        cur.insertText(prefix)
+        self.content_edit.setFocus()
+
+    def _wrap_selection(self, left: str, right: str, placeholder: str) -> None:
+        if self._preview_mode:
+            self._set_preview_mode(False)
+        cur = self.content_edit.textCursor()
+        sel = cur.selectedText()
+        if sel:
+            cur.insertText(f"{left}{sel}{right}")
+        else:
+            pos = cur.position()
+            cur.insertText(f"{left}{placeholder}{right}")
+            cur.setPosition(pos + len(left))
+            cur.setPosition(pos + len(left) + len(placeholder), QTextCursor.MoveMode.KeepAnchor)
+            self.content_edit.setTextCursor(cur)
         self.content_edit.setFocus()
 
     def _insert_timestamp(self) -> None:
         self._insert_snippet(f"[{datetime.now():%d %b %H:%M}] ")
 
+    def _update_word_and_tag_meta(self) -> None:
+        txt = self.content_edit.toPlainText()
+        n = len(txt.split())
+        read_m = max(1, (n + 199) // 200) if n else 0
+        read_s = f" · ~{read_m}m read" if n >= 40 else ""
+        self._words_lbl.setText(f"{n} {'word' if n == 1 else 'words'}{read_s}")
+
+        tags = self.store.note_tags({"title": self.title_edit.text(), "content": txt})
+        if tags:
+            self._note_tags_lbl.setText("Tags: " + "  ".join(f"#{t}" for t in tags[:8]))
+            self._note_tags_lbl.setStyleSheet("color: #FAD02C;")
+        else:
+            self._note_tags_lbl.setText("Tip: type #tag anywhere in your note to organize & filter.")
+            self._note_tags_lbl.setStyleSheet("")
+
     def _on_content_changed(self) -> None:
-        n = len(self.content_edit.toPlainText().split())
-        self._words_lbl.setText(f"{n} {'word' if n == 1 else 'words'}")
+        self._update_word_and_tag_meta()
         self._on_edited()
 
     def _on_edited(self, *_args) -> None:
         if self._loading:
             return
         self._dirty = True
-        self.status.setText("Editing...")
+        self.status.setText("Saving...")
         self._autosave_timer.start()
 
     def _debounced_autosave(self) -> None:
@@ -1790,119 +2012,151 @@ class NotesDialog(P5FluidPanel):
         if self.title_edit.text().strip() or self.content_edit.toPlainText().strip():
             if self._save(silent=True):
                 self.refresh()
-                self.status.setText("Auto-saved")
+                self.status.setText(f"Auto-saved · {datetime.now():%H:%M}")
 
-    def _on_deadline_toggled(self, _on: bool) -> None:
-        self._update_hint()
-        self._on_edited()
-
-    def _on_deadline_changed(self, *_args) -> None:
-        self._update_hint()
-        self._on_edited()
-
-    def _update_hint(self) -> None:
-        if not self.deadline_check.isChecked():
-            self.deadline_hint.setText("Off")
-            self._rem_btn.set_variant("soft")
-            self._rem_btn.setText("REMINDER")
+    # -- Notes -> Tasks bridge & Clipboard --------------------------------------
+    def _promote_to_task(self) -> None:
+        """Convert highlighted text (or current note title) into a real Task in Tasks."""
+        sel = self.content_edit.textCursor().selectedText().replace("\u2029", " ").strip()
+        if sel:
+            # Strip leading markdown list/checkbox markers cleanly
+            for prefix in ("- [ ] ", "[ ] ", "- ", "• ", "* "):
+                if sel.startswith(prefix):
+                    sel = sel[len(prefix):].strip()
+                    break
+            title = sel[:120]
+        else:
+            title = self.title_edit.text().strip()
+            if not title:
+                first_line = (self.content_edit.toPlainText().strip().splitlines() or [""])[0].strip()
+                title = first_line[:120]
+        if not title:
+            self.status.setText("Write or highlight something first to send to Tasks.")
             return
-        dt = _from_qdt(self.deadline_edit.dateTime())
-        delta = dt - datetime.now()
-        if delta.total_seconds() > 0:
-            self.deadline_hint.setText(f"In {human_delta(delta)}")
-            self._rem_btn.set_variant("gold")
-            self._rem_btn.setText(f"DUE {dt:%d %b %H:%M}".upper())
-        else:
-            self.deadline_hint.setText("Past due")
-            self._rem_btn.set_variant("danger")
-            self._rem_btn.setText("OVERDUE")
+        if self._dirty:
+            self._save(silent=True)
+        self.send_to_task.emit(title, None)
+        self.status.setText(f"Sent to Tasks: '{title[:34]}'")
 
-    def _apply_preset(self, kind: str) -> None:
-        now = datetime.now()
-        if kind == "30m":
-            target = now + timedelta(minutes=30)
-        elif kind == "1h":
-            target = now + timedelta(hours=1)
-        elif kind == "3h":
-            target = now + timedelta(hours=3)
-        elif kind == "eod":
-            target = now.replace(hour=23, minute=59, second=0, microsecond=0)
-            if target <= now:
-                target += timedelta(days=1)
-        else:
-            target = (now + timedelta(days=1)).replace(hour=9, minute=0)
-        self.deadline_check.setChecked(True)
-        self.deadline_edit.setDateTime(_to_qdt(target))
+    def _migrate_legacy_deadline(self) -> None:
+        if not self._legacy_dl_note_id:
+            return
+        note = self.store.get(self._legacy_dl_note_id)
+        if note is None:
+            self._legacy_bar.setVisible(False)
+            return
+        dl = parse_dt(note.get("deadline"))
+        title = note.get("title") or "Legacy Note Reminder"
+        self.store.clear_deadline(note["id"])
+        self._legacy_bar.setVisible(False)
+        self._legacy_dl_note_id = None
+        self.send_to_task.emit(title, dl)
+        self.notes_changed.emit()
+        self.refresh()
+        self.status.setText("Moved legacy deadline to Tasks!")
+
+    def _clear_legacy_deadline(self) -> None:
+        if not self._legacy_dl_note_id:
+            return
+        self.store.clear_deadline(self._legacy_dl_note_id)
+        self._legacy_bar.setVisible(False)
+        self._legacy_dl_note_id = None
+        self.notes_changed.emit()
+        self.refresh()
+        self.status.setText("Cleared legacy deadline.")
+
+    def _copy_markdown(self) -> None:
+        title = self.title_edit.text().strip()
+        body = self.content_edit.toPlainText().strip()
+        payload = f"# {title}\n\n{body}".strip() if title else body
+        if not payload:
+            self.status.setText("Nothing to copy yet.")
+            return
+        cb = QApplication.clipboard()
+        if cb is not None:
+            cb.setText(payload)
+            self.status.setText("Copied Markdown to clipboard!")
 
     # -- note list ---------------------------------------------------------------
-    @staticmethod
-    def _card_meta(note: dict) -> tuple[str, str, str]:
-        preview = " ".join((note.get("content") or "").split())[:95] or "Empty note"
+    def _card_meta(self, note: dict) -> tuple[str, str, str, list[str]]:
+        raw = note.get("content") or ""
+        # Strip basic markdown prefixes for crisp 2-line preview
+        clean_lines = [ln.lstrip("#>-•* ").strip() for ln in raw.splitlines() if ln.strip()]
+        preview = " ".join(clean_lines)[:95] or "Empty note"
         date_txt = _fmt_short_date(note.get("updated") or note.get("created"))
-        if note.get("done"):
-            return preview, "DONE", date_txt
-        dl = parse_dt(note.get("deadline"))
-        if dl is not None:
-            delta = dl - datetime.now()
-            if delta.total_seconds() > 0:
-                return preview, f"IN {human_delta(delta).upper()}", f"{dl:%d %b %H:%M}"
-            return preview, "OVERDUE", f"{dl:%d %b %H:%M}"
-        return preview, "", date_txt
+        tags = self.store.note_tags(note)
+        badge = ""
+        if note.get("archived"):
+            badge = "ARCHIVED"
+        elif note.get("deadline") and not note.get("done"):
+            badge = "LEGACY DUE"
+        return preview, badge, date_txt, tags
 
     def refresh(self) -> None:
-        far = datetime.max
+        self._rebuild_tag_bar()
         query = self.search_edit.text().strip().lower()
+        tag_filter = self._active_tag
 
         def matches(n: dict) -> bool:
-            if self._filter == "pinned" and not n.get("pinned"):
-                return False
-            if self._filter == "reminders" and (not n.get("deadline") or n.get("done")):
-                return False
-            if self._filter == "done" and not n.get("done"):
+            is_arch = bool(n.get("archived"))
+            if self._filter == "archived":
+                if not is_arch:
+                    return False
+            else:
+                if is_arch:
+                    return False
+                if self._filter == "pinned" and not n.get("pinned"):
+                    return False
+            ntags = self.store.note_tags(n)
+            if tag_filter and tag_filter not in ntags:
                 return False
             if query:
-                blob = f"{n.get('title', '')} {n.get('content', '')} {n.get('category', '')}".lower()
+                tag_blob = " ".join(f"#{t}" for t in ntags)
+                blob = f"{n.get('title', '')} {n.get('content', '')} {n.get('category', '')} {tag_blob}".lower()
                 return query in blob
             return True
 
         notes = [n for n in self.store.all() if matches(n)]
-        notes.sort(key=lambda n: n.get("updated", ""), reverse=True)
-        if self._sort_recent:
-            notes.sort(key=lambda n: (0 if n.get("pinned") else 1))
+        sort_key = self.SORT_MODES[self._sort_idx][0]
+        if sort_key == "alpha":
+            notes.sort(key=lambda n: (n.get("title") or "").lower())
+        elif sort_key == "created":
+            notes.sort(key=lambda n: n.get("created", ""), reverse=True)
         else:
-            def group(n: dict):
-                pin = 0 if (n.get("pinned") and not n.get("done")) else 1
-                if n.get("done"):
-                    return (2, 1, far)
-                dl = parse_dt(n.get("deadline"))
-                return (pin, 0, dl) if dl else (pin, 1, far)
-            notes.sort(key=group)
+            notes.sort(key=lambda n: n.get("updated", ""), reverse=True)
+        # Pinned notes always float cleanly to top
+        notes.sort(key=lambda n: 0 if n.get("pinned") else 1)
 
         n_cnt = len(notes)
         self.count_label.setText(f"{n_cnt} {'NOTE' if n_cnt == 1 else 'NOTES'}")
         self.list.blockSignals(True)
         self.list.clear()
         if not notes:
-            msg = ("No notes match this filter." if (query or self._filter != "all")
-                   else "No notes yet.\nClick NEW NOTE or start typing.")
+            if self._filter == "archived":
+                msg = "Archive is empty.\nArchive old notes anytime to keep your notebook tidy."
+            elif query or tag_filter or self._filter != "all":
+                msg = "No notes match this filter."
+            else:
+                msg = "No notes yet.\nStart writing on the right or pick a template!"
             self.list.addItem(_hint_item(msg))
         for n in notes:
-            preview, badge, date_txt = self._card_meta(n)
+            preview, badge, date_txt, tags = self._card_meta(n)
             item = QListWidgetItem(n.get("title") or "(Untitled)")
             item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
             item.setData(ROLE_ID, n["id"])
-            item.setData(ROLE_DONE, bool(n.get("done")))
+            item.setData(ROLE_DONE, bool(n.get("archived")))
             item.setData(ROLE_FLAG, bool(n.get("pinned")))
             item.setData(ROLE_PREVIEW, preview)
             item.setData(ROLE_BADGE, badge)
             item.setData(ROLE_DATE, date_txt)
             item.setData(ROLE_CAT, n.get("category") or "Personal")
+            item.setData(ROLE_TAGS, tags)
             self.list.addItem(item)
             if n["id"] == self._current_id:
                 self.list.setCurrentItem(item)
         self.list.blockSignals(False)
 
-    # -- selection, load, new, pin, done, save, delete + undo --------------------
+    # -- selection, load, new, pin, archive, save, delete + undo ----------------
     def _on_select(self) -> None:
         items = self.list.selectedItems()
         if not items:
@@ -1919,59 +2173,76 @@ class NotesDialog(P5FluidPanel):
             self._load(note)
         QTimer.singleShot(0, self.refresh)
 
-    def _sync_flags_ui(self, pinned: bool, done: bool) -> None:
+    def _sync_flags_ui(self, pinned: bool, archived: bool) -> None:
         self._pin_btn.set_variant("gold" if pinned else "soft")
-        self._done_btn.set_variant("mint" if done else "soft")
-        self._done_btn.setText("DONE" if done else "MARK DONE")
+        self._arch_btn.set_variant("gold" if archived else "soft")
+        self._arch_btn.setText("UNARCHIVE" if archived else "ARCHIVE")
 
     def _load(self, note: dict) -> None:
         self._loading = True
         self._autosave_timer.stop()
         self._current_id = note["id"]
-        self._category = note.get("category") if note.get("category") in NOTE_CATEGORIES else "Personal"
+        cat = note.get("category") or "Personal"
+        self._category = cat if cat in NOTE_CATEGORIES else "Personal"
         self._sync_category_ui()
         self.title_edit.setText(note.get("title", ""))
         self.title_edit.setCursorPosition(0)
         self.content_edit.setPlainText(note.get("content", ""))
-        n_words = len((note.get("content") or "").split())
-        self._words_lbl.setText(f"{n_words} {'word' if n_words == 1 else 'words'}")
+        self._update_word_and_tag_meta()
+
+        # Legacy deadline banner for smooth transition from v1.1/v1.2 notes
         dl = parse_dt(note.get("deadline"))
-        self.deadline_check.setChecked(dl is not None)
-        self.deadline_edit.setDateTime(_to_qdt(dl) if dl else self._default_deadline())
-        self.deadline_box.setVisible(False)
-        for btn in (self._pin_btn, self._done_btn, self._del_btn):
+        if dl is not None and not note.get("done"):
+            self._legacy_dl_note_id = note["id"]
+            self._legacy_lbl.setText(f"Legacy deadline ({dl:%d %b %H:%M}) — deadlines now live in Tasks:")
+            self._legacy_bar.setVisible(True)
+        else:
+            self._legacy_dl_note_id = None
+            self._legacy_bar.setVisible(False)
+
+        for btn in (self._pin_btn, self._arch_btn, self._del_btn):
             btn.setEnabled(True)
-        self._sync_flags_ui(bool(note.get("pinned")), bool(note.get("done")))
+        self._sync_flags_ui(bool(note.get("pinned")), bool(note.get("archived")))
         self._loading = False
         self._dirty = False
-        self._update_hint()
-        self.status.setText("")
+        if self._preview_mode:
+            self._render_preview()
+        upd = _fmt_short_date(note.get("updated") or note.get("created"))
+        self.status.setText(f"Updated {upd}" if upd else "Auto-saves as you type")
 
-    def _new(self) -> None:
+    def _new(self, template_key: str = "blank") -> None:
         self._autosave_timer.stop()
         if self._dirty:
             self._save(silent=True)
+        self._set_preview_mode(False)
         self._loading = True
         self._current_id = None
-        self._category = "Personal"
+        tmpl_title, tmpl_body, tmpl_cat = NOTE_TEMPLATES.get(template_key, NOTE_TEMPLATES["blank"])
+        date_str = datetime.now().strftime("%d %b %Y")
+        self._category = tmpl_cat if tmpl_cat in NOTE_CATEGORIES else "Personal"
         self._sync_category_ui()
-        self.title_edit.clear()
-        self.content_edit.clear()
-        self._words_lbl.setText("0 words")
-        want_rem = self._filter == "reminders"
-        self.deadline_check.setChecked(want_rem)
-        self.deadline_edit.setDateTime(self._default_deadline())
-        self.deadline_box.setVisible(want_rem)
-        for btn in (self._pin_btn, self._done_btn, self._del_btn):
+        self.title_edit.setText(tmpl_title.format(date=date_str) if tmpl_title else "")
+        self.content_edit.setPlainText(tmpl_body)
+        self._update_word_and_tag_meta()
+        self._legacy_dl_note_id = None
+        self._legacy_bar.setVisible(False)
+        for btn in (self._pin_btn, self._arch_btn, self._del_btn):
             btn.setEnabled(False)
         self._sync_flags_ui(False, False)
         self._loading = False
-        self._dirty = False
-        self._update_hint()
+        self._dirty = bool(tmpl_title or tmpl_body)
         self.list.clearSelection()
-        self.refresh()
-        self.status.setText("")
-        self.title_edit.setFocus()
+        if self._filter == "archived":
+            self._set_filter("all")
+        else:
+            self.refresh()
+        self.status.setText("New note — auto-saves as you type")
+        if tmpl_body:
+            self._save(silent=True)
+            self.refresh()
+            self.content_edit.setFocus()
+        else:
+            self.title_edit.setFocus()
 
     def _toggle_pin(self) -> None:
         if not self._current_id:
@@ -1981,22 +2252,21 @@ class NotesDialog(P5FluidPanel):
             return
         pinned = not bool(note.get("pinned"))
         self.store.set_pinned(self._current_id, pinned)
-        self._sync_flags_ui(pinned, bool(note.get("done")))
+        self._sync_flags_ui(pinned, bool(note.get("archived")))
         self.refresh()
 
-    def _toggle_done(self) -> None:
+    def _toggle_archive(self) -> None:
         if not self._current_id:
             return
         note = self.store.get(self._current_id)
         if note is None:
             return
-        done = not bool(note.get("done"))
-        self.store.set_done(self._current_id, done)
-        self._sync_flags_ui(bool(note.get("pinned")), done)
+        arch = not bool(note.get("archived"))
+        self.store.set_archived(self._current_id, arch)
+        self._sync_flags_ui(bool(note.get("pinned")), arch)
         self.refresh()
-        if done:
-            self.note_completed.emit(self._current_id)
         self.notes_changed.emit()
+        self.status.setText("Moved to Archive." if arch else "Restored from Archive.")
 
     def _save(self, silent: bool = False) -> bool:
         silent = silent is True
@@ -2008,28 +2278,28 @@ class NotesDialog(P5FluidPanel):
                 self.status.setText("Add a title or content first.")
             return False
         if not title:
-            title = content.splitlines()[0][:40]
-        deadline = _from_qdt(self.deadline_edit.dateTime()) if self.deadline_check.isChecked() else None
+            first = (content.splitlines() or ["Untitled"])[0].lstrip("#>-•* ").strip()
+            title = first[:44] or "Untitled"
         if self._current_id and self.store.get(self._current_id):
-            note = self.store.update(self._current_id, title, content, deadline, self._category)
+            note = self.store.update(
+                self._current_id, title, content, category=self._category, preserve_deadline=True,
+            )
         else:
-            note = self.store.add(title, content, deadline, self._category)
+            note = self.store.add(title, content, deadline=None, category=self._category)
         self._current_id = note["id"] if note else None
         self._dirty = False
-        for btn in (self._pin_btn, self._done_btn, self._del_btn):
+        for btn in (self._pin_btn, self._arch_btn, self._del_btn):
             btn.setEnabled(self._current_id is not None)
         if note:
-            self._sync_flags_ui(bool(note.get("pinned")), bool(note.get("done")))
+            self._sync_flags_ui(bool(note.get("pinned")), bool(note.get("archived")))
         self.notes_changed.emit()
         if silent:
             return True
         self.refresh()
         if self.store.last_error:
             self.status.setText("Save failed: " + self.store.last_error)
-        elif deadline:
-            self.status.setText(f"Saved · reminder set for {deadline:%d %b %H:%M}")
         else:
-            self.status.setText("Saved")
+            self.status.setText(f"Saved · {datetime.now():%H:%M}")
         return True
 
     def _delete(self) -> None:
@@ -2175,16 +2445,41 @@ class SettingsDialog(P5FluidPanel):
         self.ui_scale_spin.setSuffix("%")
         self._row(l3, "UI size", self.ui_scale_spin)
         self.briefing_check = P5CheckBox("Show Daily Briefing & Confidant Summary once a day", scale=sc)
-        self.auto_reward_check = P5CheckBox("Auto-reward Social Stats from tasks, notes & focus", scale=sc)
+        self.auto_reward_check = P5CheckBox("Auto-reward Social Stats from tasks, habits & focus", scale=sc)
+        self.auto_open_stats_check = P5CheckBox("Auto-open Social Stats star animation on rewards", scale=sc)
         self.on_top_check = P5CheckBox("Keep Morgana always on top", scale=sc)
         self.autostart_check = P5CheckBox("Start Morgana automatically on boot", scale=sc)
         l3.addWidget(self.briefing_check)
         l3.addWidget(self.auto_reward_check)
+        l3.addWidget(self.auto_open_stats_check)
         l3.addWidget(self.on_top_check)
         l3.addWidget(self.autostart_check)
         cards_lay.addWidget(c3)
 
-        # Card 5: Radial menu tabs (enable/disable individual tabs)
+        # Card 5: Awareness, Screen Time & Interactive Personality
+        c_aw = _make_card()
+        law = QVBoxLayout(c_aw)
+        law.setContentsMargins(pad_x, pad_y, pad_x, pad_y)
+        law.setSpacing(row_gap)
+        haw = QLabel("AWARENESS, SCREEN TIME & EFFECTS")
+        haw.setObjectName("section")
+        law.addWidget(haw)
+        self.awareness_check = P5CheckBox("Active App / Window Awareness (100% local)", scale=sc)
+        self.screen_time_check = P5CheckBox("Track daily Screen Time & suggest healthy breaks", scale=sc)
+        self.break_nudge_spin = QSpinBox()
+        self.break_nudge_spin.setRange(15, 240)
+        self.break_nudge_spin.setSingleStep(5)
+        self.break_nudge_spin.setSuffix(" min")
+        self.particles_check = P5CheckBox("Micro-particles (music notes, stars, hearts, Zzz)", scale=sc)
+        self.spontaneous_check = P5CheckBox("Occasional interactive choice conversations", scale=sc)
+        law.addWidget(self.awareness_check)
+        law.addWidget(self.screen_time_check)
+        self._row(law, "Nudge break after nonstop", self.break_nudge_spin)
+        law.addWidget(self.particles_check)
+        law.addWidget(self.spontaneous_check)
+        cards_lay.addWidget(c_aw)
+
+        # Card 6: Radial menu tabs (enable/disable individual tabs)
         c4 = _make_card()
         l4 = QVBoxLayout(c4)
         l4.setContentsMargins(pad_x, pad_y, pad_x, pad_y)
@@ -2201,18 +2496,25 @@ class SettingsDialog(P5FluidPanel):
             "events": "Events (7-Day)",
             "tasks": "Tasks (To-Do)",
             "timer": "Timer & Focus",
-            "notes": "Quick Notes",
+            "notes": "Notes (Notebook)",
+            "talk": "Talk (Choice Chat)",
             "stats": "Social Stats",
             "system": "System Menu",
         }
-        # Mirror radial menu layout: Left column (Events, Timer, System), Right column (Tasks, Notes, Stats)
-        left_keys = ("events", "timer", "system")
+        # Mirror radial menu layout: Left column (Events, Timer, Talk, System), Right column (Tasks, Notes, Stats)
+        left_keys = ("events", "timer", "talk", "system")
         right_keys = ("tasks", "notes", "stats")
-        for r_idx, (lk, rk) in enumerate(zip(left_keys, right_keys)):
-            for c_idx, key in enumerate((lk, rk)):
-                cb = P5CheckBox(tab_short.get(key, key.title()), scale=sc)
-                self.tab_checks[key] = cb
-                tabs_grid.addWidget(cb, r_idx, c_idx)
+        for r_idx in range(max(len(left_keys), len(right_keys))):
+            if r_idx < len(left_keys):
+                lk = left_keys[r_idx]
+                cb = P5CheckBox(tab_short.get(lk, lk.title()), scale=sc)
+                self.tab_checks[lk] = cb
+                tabs_grid.addWidget(cb, r_idx, 0)
+            if r_idx < len(right_keys):
+                rk = right_keys[r_idx]
+                cb = P5CheckBox(tab_short.get(rk, rk.title()), scale=sc)
+                self.tab_checks[rk] = cb
+                tabs_grid.addWidget(cb, r_idx, 1)
         l4.addLayout(tabs_grid)
         tab_tip = QLabel("Choose which tabs show in Morgana's radial menu. Right-click Morgana anytime for Settings.")
         tab_tip.setObjectName("tip")
@@ -2351,6 +2653,12 @@ class SettingsDialog(P5FluidPanel):
             self.sfx_slider.setEnabled(sound_on)
             self.briefing_check.setChecked(bool(values.get("morning_briefing", SETTINGS_DEFAULTS["morning_briefing"])))
             self.auto_reward_check.setChecked(bool(values.get("auto_stat_rewards", SETTINGS_DEFAULTS["auto_stat_rewards"])))
+            self.auto_open_stats_check.setChecked(bool(values.get("auto_open_stats_on_reward", SETTINGS_DEFAULTS["auto_open_stats_on_reward"])))
+            self.awareness_check.setChecked(bool(values.get("app_awareness_enabled", SETTINGS_DEFAULTS["app_awareness_enabled"])))
+            self.screen_time_check.setChecked(bool(values.get("screen_time_enabled", SETTINGS_DEFAULTS["screen_time_enabled"])))
+            self.break_nudge_spin.setValue(int(values.get("break_nudge_min", SETTINGS_DEFAULTS["break_nudge_min"])))
+            self.particles_check.setChecked(bool(values.get("particles_enabled", SETTINGS_DEFAULTS["particles_enabled"])))
+            self.spontaneous_check.setChecked(bool(values.get("spontaneous_choices_enabled", SETTINGS_DEFAULTS["spontaneous_choices_enabled"])))
             enabled = set(values.get("enabled_tabs", RADIAL_TAB_KEYS))
             for key, cb in self.tab_checks.items():
                 cb.setChecked(key in enabled)
@@ -2376,7 +2684,7 @@ class SettingsDialog(P5FluidPanel):
         try:
             for w in (self.bed_edit, self.wake_edit, self.curfew_interval,
                       self.event_window, self.event_interval, self.focus_spin,
-                      self.rest_spin, self.ui_scale_spin):
+                      self.rest_spin, self.ui_scale_spin, self.break_nudge_spin):
                 w.interpretText()
             chosen_tabs = [k for k in RADIAL_TAB_KEYS if self.tab_checks[k].isChecked()]
             if not chosen_tabs:
@@ -2401,6 +2709,12 @@ class SettingsDialog(P5FluidPanel):
                 sfx_volume=s_vol,
                 morning_briefing=self.briefing_check.isChecked(),
                 auto_stat_rewards=self.auto_reward_check.isChecked(),
+                auto_open_stats_on_reward=self.auto_open_stats_check.isChecked(),
+                app_awareness_enabled=self.awareness_check.isChecked(),
+                screen_time_enabled=self.screen_time_check.isChecked(),
+                break_nudge_min=self.break_nudge_spin.value(),
+                particles_enabled=self.particles_check.isChecked(),
+                spontaneous_choices_enabled=self.spontaneous_check.isChecked(),
                 enabled_tabs=chosen_tabs,
             )
             self.saved.emit()
@@ -3118,7 +3432,7 @@ class EventsDialog(P5FluidPanel):
 # SOCIAL STATS DIALOG (Persona 5 Royal 5-stat pentagon + daily time blocks)
 # ---------------------------------------------------------------------------
 class SocialPentagonWidget(QWidget):
-    """Persona 5 Royal style 5-point radar star chart for Knowledge/Charm/Kindness/Proficiency/Guts."""
+    """Persona 5 Royal 5-point golden star chart with music-note & Rank Up particle animations."""
 
     stat_clicked = pyqtSignal(str)
 
@@ -3126,14 +3440,24 @@ class SocialPentagonWidget(QWidget):
         super().__init__(parent)
         self._scale = scale
         self._totals: dict[str, int] = {k: 0 for k in SOCIAL_STAT_KEYS}
-        self._anim_pts: dict[str, Spring] = {k: Spring(0.0, 120.0, 14.0) for k in SOCIAL_STAT_KEYS}
-        self._pulse = Spring(0.0, 180.0, 11.0)
-        self._rank_flash = Spring(0.0, 140.0, 11.0)
+        self._anim_pts: dict[str, Spring] = {k: Spring(0.0, 105.0, 12.5) for k in SOCIAL_STAT_KEYS}
+        self._pulse = Spring(0.0, 170.0, 11.0)
+        self._rank_flash = Spring(0.0, 125.0, 10.5)
+        self._banner_spring = Spring(0.0, 260.0, 16.0)
         self._selected = "knowledge"
+        self._gain_stat = ""
         self._vertex_pts: dict[str, QPointF] = {}
+        self._tip_pts: dict[str, QPointF] = {}
+        self._particles: list[Particle] = []
+        self._banner_mode = ""        # "gain" | "rank_up" | ""
+        self._banner_title = ""
+        self._banner_sub = ""
+        self._banner_timer = 0.0
+        self._banner_duration = 1.8
+        self._clock = 0.0
         self._ticker = FrameTicker(self._frame, self)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setMinimumHeight(_sc(240, scale, 195))
+        self.setMinimumHeight(_sc(256, scale, 206))
 
     def set_data(self, totals: dict[str, int], selected: str, animate: bool = False) -> None:
         self._totals = dict(totals)
@@ -3150,16 +3474,186 @@ class SocialPentagonWidget(QWidget):
             self._ticker.start()
         self.update()
 
-    def trigger_rank_up_flash(self) -> None:
+    def _geometry_metrics(self) -> tuple[float, float, float, list[float]]:
+        sc = self._scale
+        rect = QRectF(self.rect()).adjusted(1.0, 1.0, -1.0, -1.0)
+        cx = rect.center().x()
+        cy = rect.center().y() + 7.0 * sc
+        radius = min(rect.width() * 0.258, rect.height() * 0.315)
+        angles = [-math.pi / 2.0 + i * (2.0 * math.pi / 5.0) for i in range(5)]
+        return cx, cy, radius, angles
+
+    def _stat_tip_pos(self, stat: str) -> QPointF:
+        if stat in self._tip_pts:
+            return self._tip_pts[stat]
+        cx, cy, radius, angles = self._geometry_metrics()
+        if stat in SOCIAL_STAT_KEYS:
+            idx = SOCIAL_STAT_KEYS.index(stat)
+            frac = stat_pentagon_fraction(self._totals.get(stat, 0))
+            a = angles[idx]
+            return QPointF(cx + math.cos(a) * radius * frac, cy + math.sin(a) * radius * frac)
+        return QPointF(cx, cy)
+
+    def trigger_point_gain(self, stat: str = "", points: int = 2, activity: str = "") -> None:
+        """Spawn Persona 5 golden music notes (♪/♫) & star sparkles from the gained stat vertex."""
+        sc = self._scale
+        key = stat if stat in SOCIAL_STATS else self._selected
+        self._selected = key
+        self._gain_stat = key
+        tip = self._stat_tip_pos(key)
+        note_cnt = 3 if points >= 4 else (2 if points >= 2 else 1)
+
+        for i in range(note_cnt):
+            spread = (i - (note_cnt - 1) / 2.0) * 26.0 * sc
+            self._particles.append(Particle(
+                kind="note2" if (points >= 3 and i == note_cnt - 1) else "note",
+                x=tip.x() + spread + random.uniform(-4, 4) * sc,
+                y=tip.y() + random.uniform(-6, 4) * sc,
+                vx=spread * 0.5 + random.uniform(-10, 10) * sc,
+                vy=-58.0 * sc - random.uniform(6, 18) * sc,
+                size=(21.0 if points >= 3 else 18.0) * sc,
+                max_life=1.35,
+                rot=random.uniform(-14, 14),
+                vrot=random.uniform(-18, 18),
+                wave_amp=6.5 * sc,
+                wave_freq=6.0,
+                phase=i * 1.4,
+                delay=i * 0.12,
+                color=P5_NOTE_GOLD,
+                outline=BLACK,
+            ))
+
+        for i in range(7 if points >= 3 else 5):
+            ang = random.uniform(0.0, 2.0 * math.pi)
+            spd = random.uniform(35, 92) * sc
+            self._particles.append(Particle(
+                kind="star" if i % 2 == 0 else "sparkle",
+                x=tip.x(),
+                y=tip.y(),
+                vx=math.cos(ang) * spd,
+                vy=math.sin(ang) * spd - 14.0 * sc,
+                size=random.uniform(10, 16) * sc,
+                max_life=random.uniform(0.85, 1.2),
+                rot=random.uniform(0, 360),
+                vrot=random.uniform(-180, 180),
+                drag=1.3,
+                delay=0.04 + i * 0.04,
+                color=P5_STAR_COLORS[i % len(P5_STAR_COLORS)],
+                outline=BLACK,
+            ))
+
+        label = SOCIAL_STATS.get(key, {}).get("label", key.title()).upper()
+        notes_glyph = "♪" * min(3, max(1, note_cnt))
+        self._banner_mode = "gain"
+        self._banner_title = f"+{points} {label} {notes_glyph}"
+        self._banner_sub = (activity[:30] + "…") if len(activity) > 31 else activity
+        self._banner_timer = 0.0
+        self._banner_duration = 1.85
+        self._banner_spring.snap(0.0)
+        self._banner_spring.target = 1.0
+        self._pulse.value = 1.0
+        self._pulse.target = 0.0
+        self._ticker.start()
+
+    def trigger_rank_up(self, stat: str = "", old_lv: int = 0, new_lv: int = 0,
+                        rank_title: str = "") -> None:
+        """Full Persona 5 Royal Rank Up golden star shockwave + music notes + banner."""
+        sc = self._scale
+        key = stat if stat in SOCIAL_STATS else self._selected
+        self._selected = key
+        self._gain_stat = key
+        cx, cy, radius, _angles = self._geometry_metrics()
+        tip = self._stat_tip_pos(key)
+
         self._rank_flash.value = 1.0
         self._rank_flash.velocity = 0.0
         self._rank_flash.target = 0.0
+
+        # Twin expanding golden starburst shockwaves
+        self._particles.append(Particle(
+            kind="ring", x=cx, y=cy, vx=0.0, vy=0.0,
+            size=radius * 0.92, max_life=0.85, rot=0.0, vrot=36.0,
+            color=GOLD, outline=WHITE,
+        ))
+        self._particles.append(Particle(
+            kind="ring", x=tip.x(), y=tip.y(), vx=0.0, vy=0.0,
+            size=radius * 0.55, max_life=0.72, rot=18.0, vrot=-48.0,
+            delay=0.10, color=WHITE, outline=GOLD,
+        ))
+
+        # 18 vibrant Persona 5 gold & colored stars bursting across the chart
+        for i in range(18):
+            ang = (2.0 * math.pi * i / 18.0) + random.uniform(-0.14, 0.14)
+            spd = random.uniform(68, 155) * sc
+            ox = cx if i % 2 == 0 else tip.x()
+            oy = cy if i % 2 == 0 else tip.y()
+            self._particles.append(Particle(
+                kind="star" if i % 3 != 2 else "sparkle",
+                x=ox, y=oy,
+                vx=math.cos(ang) * spd,
+                vy=math.sin(ang) * spd - 20.0 * sc,
+                size=random.uniform(12, 22) * sc,
+                max_life=random.uniform(1.15, 1.75),
+                rot=random.uniform(0, 360),
+                vrot=random.uniform(-240, 240),
+                gravity=55.0 * sc,
+                drag=1.35,
+                delay=random.uniform(0.0, 0.18),
+                color=P5_STAR_COLORS[i % len(P5_STAR_COLORS)],
+                outline=BLACK,
+            ))
+
+        # 5 celebratory golden music notes rising across the star
+        for i in range(5):
+            sx = cx + (i - 2) * 34.0 * sc
+            self._particles.append(Particle(
+                kind="note2" if i % 2 == 1 else "note",
+                x=sx, y=cy + 14.0 * sc,
+                vx=(i - 2) * 14.0 * sc,
+                vy=-74.0 * sc - (i % 3) * 10.0 * sc,
+                size=22.0 * sc,
+                max_life=1.75,
+                rot=random.uniform(-12, 12),
+                vrot=random.uniform(-16, 16),
+                wave_amp=8.0 * sc,
+                wave_freq=6.2,
+                phase=i * 1.1,
+                delay=0.05 + i * 0.10,
+                color=P5_NOTE_GOLD,
+                outline=BLACK,
+            ))
+
+        label = SOCIAL_STATS.get(key, {}).get("label", key.title()).upper()
+        lv_now = new_lv or stat_level(self._totals.get(key, 0))
+        lv_prev = old_lv or max(1, lv_now - 1)
+        rtitle = (rank_title or stat_rank_title(key, lv_now)).upper()
+        self._banner_mode = "rank_up"
+        self._banner_title = "RANK UP!"
+        self._banner_sub = f"{label}  LV {lv_prev} → LV {lv_now} · {rtitle}"
+        self._banner_timer = 0.0
+        self._banner_duration = 2.85
+        self._banner_spring.snap(0.0)
+        self._banner_spring.target = 1.0
         self._ticker.start()
 
+    def trigger_rank_up_flash(self) -> None:
+        self.trigger_rank_up(self._selected)
+
     def _frame(self, dt: float) -> bool:
-        moving = self._pulse.step(dt) | self._rank_flash.step(dt)
+        self._clock += dt
+        moving = self._pulse.step(dt) | self._rank_flash.step(dt) | self._banner_spring.step(dt)
         for sp in self._anim_pts.values():
             moving |= sp.step(dt)
+        if self._particles:
+            self._particles = [pt for pt in self._particles if pt.step(dt)]
+            if self._particles:
+                moving = True
+        if self._banner_mode:
+            self._banner_timer += dt
+            if self._banner_timer >= self._banner_duration:
+                self._banner_mode = ""
+            else:
+                moving = True
         self.update()
         return moving
 
@@ -3183,7 +3677,7 @@ class SocialPentagonWidget(QWidget):
         sc = self._scale
         rect = QRectF(self.rect()).adjusted(1.0, 1.0, -1.0, -1.0)
 
-        # Obsidian P5 card background + subtle slanted crimson motif
+        # Obsidian P5 card background + diagonal Persona crimson slash & subtle radial glow
         p.setPen(QPen(P5_BORDER, 1.2))
         p.setBrush(P5_CARD)
         p.drawRoundedRect(rect, 10.0, 10.0)
@@ -3192,65 +3686,111 @@ class SocialPentagonWidget(QWidget):
         clip.addRoundedRect(rect, 10.0, 10.0)
         p.setClipPath(clip)
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(230, 0, 18, 22))
+        p.setBrush(QColor(230, 0, 18, 28))
         p.drawPolygon(QPolygonF([
-            QPointF(rect.left() + rect.width() * 0.62, rect.top()),
+            QPointF(rect.left() + rect.width() * 0.58, rect.top()),
             QPointF(rect.right(), rect.top()),
             QPointF(rect.right(), rect.bottom()),
-            QPointF(rect.left() + rect.width() * 0.34, rect.bottom()),
+            QPointF(rect.left() + rect.width() * 0.30, rect.bottom()),
         ]))
-        p.setClipping(False)
 
-        cx = rect.center().x()
-        cy = rect.center().y() + 6.0 * sc
-        radius = min(rect.width() * 0.255, rect.height() * 0.31)
-        angles = [-math.pi / 2.0 + i * (2.0 * math.pi / 5.0) for i in range(5)]
+        cx, cy, radius, angles = self._geometry_metrics()
+        burst = clamp(self._rank_flash.value)
+        pulse = clamp(self._pulse.value)
 
-        # 5 concentric pentagon guide rings (representing Lv 1..5 scale)
+        # Subtle golden aura behind the Persona 5 star
+        aura = QRadialGradient(QPointF(cx, cy), radius * (1.28 + 0.25 * burst))
+        aura.setColorAt(0.0, QColor(255, 214, 48, int(42 + 88 * burst)))
+        aura.setColorAt(0.6, QColor(230, 0, 18, int(18 + 38 * burst)))
+        aura.setColorAt(1.0, QColor(0, 0, 0, 0))
+        p.setBrush(aura)
+        p.drawEllipse(QPointF(cx, cy), radius * 1.35, radius * 1.35)
+
+        # Outer pentagon frame + 5 concentric Persona 5 5-pointed star guide rings
+        outer_pent = QPolygonF([
+            QPointF(cx + math.cos(a) * radius, cy + math.sin(a) * radius)
+            for a in angles
+        ])
+        p.setPen(QPen(QColor("#3E3E50"), 1.2, Qt.PenStyle.DashLine))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPolygon(outer_pent)
+
         for ring in range(1, 6):
             frac = ring / 5.0
-            poly = QPolygonF([
-                QPointF(cx + math.cos(a) * radius * frac, cy + math.sin(a) * radius * frac)
-                for a in angles
-            ])
-            p.setPen(QPen(P5_BORDER_HI if ring == 5 else P5_BORDER, 1.4 if ring == 5 else 1.0))
+            r_out = radius * frac
+            r_in = r_out * 0.45
+            guide_star = star_polygon(cx, cy, r_out, r_in, 5)
+            p.setPen(QPen(QColor("#5C4D1E") if ring == 5 else QColor("#2E2E3C"),
+                          1.5 if ring == 5 else 1.0))
             p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawPolygon(poly)
+            p.drawPolygon(guide_star)
 
-        # Spokes
-        p.setPen(QPen(P5_BORDER, 1.0))
+        # Radial spokes from center to the 5 stat tips
+        p.setPen(QPen(QColor("#2E2E3C"), 1.0))
         for a in angles:
             p.drawLine(QPointF(cx, cy), QPointF(cx + math.cos(a) * radius, cy + math.sin(a) * radius))
 
-        # Filled stat polygon mapped directly to Persona 5 Ranks 1..5 rings
-        pulse = clamp(self._pulse.value)
-        burst = clamp(self._rank_flash.value)
-        data_pts: list[QPointF] = []
+        # Build the dynamic Persona 5 GOLD 5-POINTED STAR polygon
+        fracs: list[float] = []
+        tip_pts: list[QPointF] = []
         self._vertex_pts.clear()
+        self._tip_pts.clear()
         for i, key in enumerate(SOCIAL_STAT_KEYS):
             a = angles[i]
             pts = max(0.0, self._anim_pts[key].value)
             frac = stat_pentagon_fraction(pts)
             if key == self._selected and pulse > 0.01:
-                frac = min(1.05, frac + 0.05 * pulse)
-            data_pts.append(QPointF(cx + math.cos(a) * radius * frac, cy + math.sin(a) * radius * frac))
+                frac = min(1.06, frac + 0.06 * pulse)
+            fracs.append(frac)
+            tpt = QPointF(cx + math.cos(a) * radius * frac, cy + math.sin(a) * radius * frac)
+            tip_pts.append(tpt)
+            self._tip_pts[key] = tpt
             self._vertex_pts[key] = QPointF(cx + math.cos(a) * radius * 1.15, cy + math.sin(a) * radius * 1.15)
 
+        star_verts: list[QPointF] = []
+        for i in range(5):
+            star_verts.append(tip_pts[i])
+            nxt_i = (i + 1) % 5
+            mid_a = angles[i] + math.pi / 5.0
+            valley_frac = max(0.14, 0.46 * 0.5 * (fracs[i] + fracs[nxt_i]))
+            star_verts.append(QPointF(
+                cx + math.cos(mid_a) * radius * valley_frac,
+                cy + math.sin(mid_a) * radius * valley_frac,
+            ))
+        gold_star = QPolygonF(star_verts)
+
+        # Crimson Persona drop shadow behind the golden star
+        p.save()
+        p.translate(3.2 * sc, 4.0 * sc)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(230, 0, 18, int(145 + 60 * pulse)))
+        p.drawPolygon(gold_star)
+        p.restore()
+
+        # Luminous Persona 5 Royal gold gradient fill
+        grad = QRadialGradient(QPointF(cx, cy - radius * 0.12), radius * 1.05)
+        grad.setColorAt(0.0, QColor(255, 250, 186, 245))
+        grad.setColorAt(0.42, QColor(255, 214, 38, 232))
+        grad.setColorAt(0.85, QColor(232, 162, 0, 224))
+        grad.setColorAt(1.0, QColor(200, 118, 0, 218))
+        p.setPen(QPen(WHITE if burst > 0.22 else QColor("#FFF2A6"), (2.4 + 1.4 * pulse) * sc))
+        p.setBrush(grad)
+        p.drawPolygon(gold_star)
+
+        # Crisp inner star facet lines from center to tips (gives faceted 3D Persona gold-star gleam)
+        p.setPen(QPen(QColor(255, 255, 230, 115), 1.1 * sc))
+        for tpt in tip_pts:
+            p.drawLine(QPointF(cx, cy), tpt)
+
+        # Expanding golden Rank Up starburst wave
         if burst > 0.02:
-            b_rad = radius * (0.45 + 0.72 * (1.0 - burst))
-            b_poly = QPolygonF([
-                QPointF(cx + math.cos(a) * b_rad, cy + math.sin(a) * b_rad)
-                for a in angles
-            ])
-            p.setPen(QPen(QColor(245, 196, 0, int(230 * burst)), 3.2 * sc))
-            p.setBrush(QColor(245, 196, 0, int(55 * burst)))
-            p.drawPolygon(b_poly)
+            b_rad = radius * (0.48 + 0.78 * (1.0 - burst))
+            b_star = star_polygon(cx, cy, b_rad, b_rad * 0.46, 5)
+            p.setPen(QPen(QColor(255, 232, 96, int(240 * burst)), 3.4 * sc))
+            p.setBrush(QColor(255, 220, 64, int(68 * burst)))
+            p.drawPolygon(b_star)
 
-        p.setPen(QPen(WHITE if burst > 0.25 else GOLD, 2.2 + 1.2 * pulse))
-        p.setBrush(QColor(230, 0, 18, int(128 + 65 * pulse)))
-        p.drawPolygon(QPolygonF(data_pts))
-
-        # Vertex dots & crisp Persona 5 labels around pentagon
+        # Vertex gold stars & crisp Persona 5 stat labels
         lbl_font = p5_font(_sc(13, sc, 10), italic=False)
         lv_font = p5_font(_sc(11, sc, 9), italic=False)
         fm_l = QFontMetrics(lbl_font)
@@ -3258,16 +3798,25 @@ class SocialPentagonWidget(QWidget):
 
         for i, key in enumerate(SOCIAL_STAT_KEYS):
             a = angles[i]
-            dpt = data_pts[i]
+            dpt = tip_pts[i]
             is_sel = key == self._selected
             lv = stat_level(self._totals.get(key, 0))
             is_mastery = lv > len(STAT_RANK_THRESHOLDS)
-            p.setPen(QPen(WHITE if is_sel else GOLD, 2.0 if is_sel else 1.4))
-            p.setBrush(GOLD if is_mastery else (RED if is_sel else BLACK))
-            dot_r = (5.0 if is_sel else 3.8) * sc
-            p.drawEllipse(dpt, dot_r, dot_r)
 
-            # Label placement around vertex
+            # Halo glow on the active/gained vertex
+            if is_sel and (pulse > 0.04 or burst > 0.04):
+                glow_r = (13.0 + 9.0 * max(pulse, burst)) * sc
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor(255, 224, 66, int(130 * max(pulse, burst))))
+                p.drawEllipse(dpt, glow_r, glow_r)
+
+            # Mini golden 5-point star marker at each stat tip
+            star_r = (8.2 if (is_sel or is_mastery) else 6.0) * sc
+            p.setPen(QPen(BLACK, 1.5 * sc))
+            p.setBrush(WHITE if (is_sel and pulse > 0.35) else (QColor("#FFE852") if (is_sel or is_mastery) else GOLD))
+            p.drawPolygon(star_polygon(dpt.x(), dpt.y(), star_r, star_r * 0.45, 5))
+
+            # Label placement around outer ring
             meta = SOCIAL_STATS[key]
             name = meta["label"].upper()
             lv_txt = f"LV {lv} ★" if is_mastery else f"LV {lv}"
@@ -3290,7 +3839,7 @@ class SocialPentagonWidget(QWidget):
 
             if i == 0:
                 p.setFont(lbl_font)
-                p.setPen(WHITE if is_sel else P5_TEXT)
+                p.setPen(GOLD if is_sel else P5_TEXT)
                 p.drawText(QRectF(bx, by, nw + 4, lh), Qt.AlignmentFlag.AlignLeft.value | Qt.AlignmentFlag.AlignVCenter.value, name)
                 pill = QRectF(bx + nw + 5 * sc, by + 1, vw, lh - 1)
                 p.setPen(QPen(WHITE, 1.1) if is_sel else Qt.PenStyle.NoPen)
@@ -3303,7 +3852,7 @@ class SocialPentagonWidget(QWidget):
                 align = Qt.AlignmentFlag.AlignLeft.value if i in (1, 2) else Qt.AlignmentFlag.AlignRight.value
                 box_w = max(nw, vw) + 4
                 p.setFont(lbl_font)
-                p.setPen(WHITE if is_sel else P5_TEXT)
+                p.setPen(GOLD if is_sel else P5_TEXT)
                 p.drawText(QRectF(bx, by, box_w, lh), align | Qt.AlignmentFlag.AlignVCenter.value, name)
                 px_lv = bx if i in (1, 2) else (bx + box_w - vw)
                 pill = QRectF(px_lv, by + lh + 1 * sc, vw, fm_v.height() + 2)
@@ -3313,7 +3862,93 @@ class SocialPentagonWidget(QWidget):
                 p.setFont(lv_font)
                 p.setPen(WHITE if is_sel else P5_GOLD_FG)
                 p.drawText(pill, Qt.AlignmentFlag.AlignCenter.value, lv_txt)
+
+        # In-widget Persona 5 music notes & golden star particles
+        for pt in self._particles:
+            draw_particle(p, pt)
+
+        # Comic Persona 5 floating toast (`+2 PROFICIENCY ♪♪` or `RANK UP!`)
+        if self._banner_mode:
+            self._paint_banner(p, rect)
+
+        p.setClipping(False)
         p.end()
+
+    def _paint_banner(self, p: QPainter, rect: QRectF) -> None:
+        sc = self._scale
+        sv = max(0.0, self._banner_spring.value)
+        rem = self._banner_duration - self._banner_timer
+        fade = clamp(rem / 0.42) if rem < 0.42 else 1.0
+        alpha = clamp(sv * 1.4) * fade
+        if alpha <= 0.02:
+            return
+
+        is_rank = self._banner_mode == "rank_up"
+        p.save()
+        p.setOpacity(alpha)
+        bx_c = rect.center().x()
+        # Center neatly over the star heart so KNOWLEDGE (top) and GUTS/CHARM (sides) stay visible
+        by_c = rect.center().y() + (6.0 * sc if is_rank else 10.0 * sc)
+        p.translate(bx_c, by_c)
+        p.rotate(-4.0 if is_rank else -2.5)
+        scale_f = 0.68 + 0.32 * sv
+        p.scale(scale_f, scale_f)
+
+        tf = p5_font(_sc(22 if is_rank else 15, sc, 12), italic=False)
+        sf = p5_font(_sc(11 if is_rank else 10, sc, 8), italic=False)
+        tfm = QFontMetrics(tf)
+        sfm = QFontMetrics(sf)
+        max_w = rect.width() * (0.68 if is_rank else 0.62)
+        inner_pad = (44.0 if is_rank else 26.0) * sc
+        sub_txt = sfm.elidedText(self._banner_sub, Qt.TextElideMode.ElideRight, int(max(60.0, max_w - inner_pad))) if self._banner_sub else ""
+        tw = max(tfm.horizontalAdvance(self._banner_title),
+                 sfm.horizontalAdvance(sub_txt) if sub_txt else 0)
+        bw = min(max_w, tw + inner_pad)
+        bh = (tfm.height() + (sfm.height() + 12.0 if sub_txt else 10.0) * sc)
+
+        skew = 9.0 * sc
+        poly = QPolygonF([
+            QPointF(-bw * 0.5 + skew, -bh * 0.5),
+            QPointF(bw * 0.5, -bh * 0.5),
+            QPointF(bw * 0.5 - skew, bh * 0.5),
+            QPointF(-bw * 0.5, bh * 0.5),
+        ])
+        # Shadow ribbon
+        p.save()
+        p.translate(4.0 * sc, 4.5 * sc)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(RED if is_rank else GOLD)
+        p.drawPolygon(poly)
+        p.restore()
+
+        p.setPen(QPen(GOLD if is_rank else WHITE, 2.2 * sc))
+        p.setBrush(BLACK)
+        p.drawPolygon(poly)
+
+        # Spinning gold stars flanking RANK UP!
+        if is_rank:
+            for side in (-1.0, 1.0):
+                p.save()
+                p.translate(side * (bw * 0.5 - 10.0 * sc), -bh * 0.28)
+                p.rotate(self._clock * 140.0 * side)
+                p.setPen(QPen(BLACK, 1.4 * sc))
+                p.setBrush(P5_NOTE_GOLD)
+                p.drawPolygon(star_polygon(0.0, 0.0, 10.0 * sc, 4.5 * sc, 5))
+                p.restore()
+
+        p.setFont(tf)
+        p.setPen(P5_NOTE_GOLD)
+        if sub_txt:
+            p.drawText(QRectF(-bw * 0.5, -bh * 0.5 + 3 * sc, bw, tfm.height()),
+                       Qt.AlignmentFlag.AlignCenter.value, self._banner_title)
+            p.setFont(sf)
+            p.setPen(WHITE)
+            p.drawText(QRectF(-bw * 0.5, -bh * 0.5 + tfm.height() + 2 * sc, bw, sfm.height() + 4),
+                       Qt.AlignmentFlag.AlignCenter.value, sub_txt)
+        else:
+            p.drawText(QRectF(-bw * 0.5, -bh * 0.5, bw, bh),
+                       Qt.AlignmentFlag.AlignCenter.value, self._banner_title)
+        p.restore()
 
 
 class StatLogDelegate(QStyledItemDelegate):
@@ -3594,7 +4229,10 @@ class SocialStatsDialog(P5FluidPanel):
 
         # Header bar
         self._blocks_hdr = QLabel("")
-        self._blocks_hdr.setObjectName("subhead")
+        self._blocks_hdr.setStyleSheet(
+            f'color: #FFE46B; font-family: "Barlow Condensed", "Anton", sans-serif; '
+            f'font-size: {_sc(12, sc, 10)}px; font-weight: 800; letter-spacing: 0.6px;'
+        )
         self.header_bar.addWidget(self._blocks_hdr)
 
         brief_btn = self._btn("BRIEFING", variant="gold", display=True, px=10)
@@ -3784,7 +4422,7 @@ class SocialStatsDialog(P5FluidPanel):
 
         hf_foot = QHBoxLayout()
         hf_foot.setSpacing(6)
-        htip = QLabel("Resets daily · Auto-awards Social Stats · Space: check")
+        htip = QLabel("Resets daily · Auto-rewards Stats · Space")
         htip.setObjectName("tip")
         hf_foot.addWidget(htip, 1)
         hdel_btn = self._btn("DELETE", variant="danger", display=True, px=10)
@@ -4127,14 +4765,37 @@ class SocialStatsDialog(P5FluidPanel):
         self._refresh_log()
         self.stat_logged.emit(entry["stat"], entry["activity"], entry["points"], old_lv, new_lv)
 
-    def animate_point_gain(self) -> None:
-        """Called in sync with `social stats add point animation.wav` to swell the pentagon."""
-        self._refresh_visuals(animate=True)
+    def prepare_reward_animation(self, stat: str, prev_totals: dict[str, int] | None = None) -> None:
+        """Select `stat` and hold the gold star at `prev_totals` so growth animates dramatically."""
+        if stat in SOCIAL_STATS:
+            self._selected_stat = stat
+            for k, b in self._stat_btns.items():
+                b.set_active(k == stat)
+            meta = SOCIAL_STATS[stat]
+            self._rule_hint.setText(f"{meta['label']} — {meta['examples']}")
+            self._act_input.setPlaceholderText(meta["placeholder"])
+        if prev_totals is not None:
+            self._pentagon.set_data(prev_totals, self._selected_stat, animate=False)
+        self._refresh_habits()
+        self._refresh_log()
 
-    def animate_rank_up(self) -> None:
-        """Called in sync with `social stats level up animation.wav` to flash a golden burst."""
-        self._pentagon.trigger_rank_up_flash()
+    def animate_point_gain(self, stat: str = "", points: int = 0, activity: str = "") -> None:
+        """Called in sync with `social stats add point animation.wav` to grow the gold star & emit music notes."""
+        if stat in SOCIAL_STATS:
+            self._selected_stat = stat
         self._refresh_visuals(animate=True)
+        self._refresh_habits()
+        self._refresh_log()
+        if points > 0 or stat:
+            self._pentagon.trigger_point_gain(stat or self._selected_stat, max(1, int(points or 2)), activity)
+
+    def animate_rank_up(self, stat: str = "", old_lv: int = 0, new_lv: int = 0) -> None:
+        """Called in sync with `social stats level up animation.wav` for golden star & music note Rank Up."""
+        key = stat if stat in SOCIAL_STATS else self._selected_stat
+        self._selected_stat = key
+        self._refresh_visuals(animate=True)
+        lv_now = new_lv or stat_level(self.store.totals().get(key, 0))
+        self._pentagon.trigger_rank_up(key, old_lv or max(1, lv_now - 1), lv_now, stat_rank_title(key, lv_now))
 
     def _delete_selected(self) -> None:
         item = self._log_list.currentItem()
@@ -4191,7 +4852,11 @@ class SocialStatsDialog(P5FluidPanel):
             title = stat_rank_title(key, lv)
             is_sel = key == self._selected_stat
             row_f.setStyleSheet(
-                "QFrame#subcard { background-color: #2A0C11; border: 1.5px solid #E60012; border-radius: 8px; }"
+                "QFrame#subcard { background-color: #2B2009; border: 1.5px solid #F5C400; border-radius: 8px; }"
+                if is_sel else ""
+            )
+            bar.setStyleSheet(
+                "QProgressBar::chunk { background-color: #F5C400; border-radius: 3px; }"
                 if is_sel else ""
             )
             rank_lbl.setText(f"LV {lv} · {title.upper()}")
@@ -4210,7 +4875,7 @@ class SocialStatsDialog(P5FluidPanel):
                    else f"No {SOCIAL_STATS[self._log_filter]['label']} entries yet.")
             self._log_list.addItem(_hint_item(msg))
             return
-        src_labels = {"habit": "HABIT", "task": "TASK", "focus": "FOCUS", "note": "NOTE"}
+        src_labels = {"habit": "HABIT", "task": "TASK", "focus": "FOCUS", "note": "NOTE", "chat": "CHAT"}
         for e in entries:
             stat = e.get("stat", "knowledge")
             meta = SOCIAL_STATS.get(stat, {})
@@ -4407,6 +5072,29 @@ class BriefingDialog(P5FluidPanel):
             stl.addLayout(row)
             self._stat_summary_rows[key] = (rlbl, plbl, bar)
         s_lay.addWidget(st_card)
+
+        # Screen Time & App Activity card
+        scr_card = _make_card()
+        scrl = QVBoxLayout(scr_card)
+        scrl.setContentsMargins(_sc(11, sc, 8), _sc(9, sc, 7), _sc(11, sc, 8), _sc(9, sc, 7))
+        scrl.setSpacing(_sc(5, sc, 4))
+        scr_top = QHBoxLayout()
+        scr_hdr = QLabel("SCREEN TIME & ACTIVITY")
+        scr_hdr.setObjectName("section")
+        scr_top.addWidget(scr_hdr)
+        scr_top.addStretch(1)
+        self._scr_total_lbl = QLabel("0m TODAY · 0m SESSION")
+        self._scr_total_lbl.setStyleSheet(
+            f'color: #FAD02C; font-family: "Barlow Condensed", sans-serif; '
+            f'font-size: {_sc(11, sc, 9)}px; font-weight: 800;'
+        )
+        scr_top.addWidget(self._scr_total_lbl)
+        scrl.addLayout(scr_top)
+        self._scr_cats_lbl = QLabel("Tracking active screen time locally (pauses when AFK).")
+        self._scr_cats_lbl.setObjectName("tip")
+        self._scr_cats_lbl.setWordWrap(True)
+        scrl.addWidget(self._scr_cats_lbl)
+        s_lay.addWidget(scr_card)
         s_lay.addStretch(1)
 
         scroll.setWidget(s_body)
@@ -4526,6 +5214,19 @@ class BriefingDialog(P5FluidPanel):
             bar.setRange(0, max(1, span))
             bar.setValue(into)
 
+        # Screen Time summary
+        scr = payload.get("screen_time") or {}
+        act_txt = scr.get("active_text", "0m")
+        cont_txt = scr.get("continuous_text", "0m")
+        brks = int(scr.get("breaks", 0))
+        self._scr_total_lbl.setText(f"{act_txt.upper()} TODAY · {cont_txt.upper()} NONSTOP · {brks} BREAKS")
+        top_cats = scr.get("top_categories") or []
+        if top_cats:
+            parts = [f"{lbl}: {dur}" for _k, lbl, _s, dur in top_cats[:3]]
+            self._scr_cats_lbl.setText("Top activity — " + "  ·  ".join(parts))
+        else:
+            self._scr_cats_lbl.setText("Active screen time updates locally while you work (pauses when AFK).")
+
 
 # ---------------------------------------------------------------------------
 # TIMER DIALOG (Persona 5 redesigned Focus Mode + Manual Timers)
@@ -4632,12 +5333,13 @@ class TimerDialog(P5FluidPanel):
     focus_stop_requested = pyqtSignal()
     manual_add_requested = pyqtSignal(int, str)       # total_seconds, label
     manual_cancel_requested = pyqtSignal(str)         # timer_id
+    break_requested = pyqtSignal(int)                 # break_minutes
     open_settings = pyqtSignal()
 
     PRESETS = ((5, "5M"), (10, "10M"), (15, "15M"), (30, "30M"), (60, "1H"))
 
     def __init__(self, settings: SettingsStore, on_top: bool = True, ui_scale: float = 1.0) -> None:
-        super().__init__("TIMER", QSize(560, 650), on_top=on_top, ui_scale=ui_scale)
+        super().__init__("TIMER", QSize(565, 690), on_top=on_top, ui_scale=ui_scale)
         sc = self._ui_scale
         self.settings = settings
         self._focus_running = False
@@ -4712,6 +5414,27 @@ class TimerDialog(P5FluidPanel):
         ctrl.addWidget(self._focus_btn)
         fl.addLayout(ctrl)
         self.body.addWidget(fc)
+
+        # -- SCREEN TIME LIVE STRIP ---------------------------------------------
+        scr_strip = _make_card("subcard")
+        ssl = QHBoxLayout(scr_strip)
+        ssl.setContentsMargins(_sc(11, sc, 8), _sc(6, sc, 4), _sc(11, sc, 8), _sc(6, sc, 4))
+        ssl.setSpacing(_sc(8, sc, 5))
+        scr_tag = QLabel("SCREEN TIME")
+        scr_tag.setStyleSheet(
+            f'color: #FF4B55; font-family: "Barlow Condensed", sans-serif; '
+            f'font-size: {_sc(12, sc, 10)}px; font-weight: 800;'
+        )
+        ssl.addWidget(scr_tag)
+        self._screen_time_lbl = QLabel("0m today · 0m nonstop")
+        self._screen_time_lbl.setStyleSheet(f'color: #F4F4F8; font-size: {_sc(12, sc, 10)}px; font-weight: bold;')
+        ssl.addWidget(self._screen_time_lbl, 1)
+        brk_btn = self._btn("5M BREAK", variant="mint", display=True, px=9)
+        brk_btn.setFixedHeight(_sc(24, sc, 20))
+        brk_btn.setToolTip("Start a 5-minute break timer and reset continuous screen-time counter")
+        brk_btn.clicked.connect(lambda _c=False: self.break_requested.emit(5))
+        ssl.addWidget(brk_btn)
+        self.body.addWidget(scr_strip)
 
         # -- CARD 2: MANUAL TIMERS ----------------------------------------------
         mc = _make_card()
@@ -5008,3 +5731,11 @@ class TimerDialog(P5FluidPanel):
             self._timer_rows[tid] = (row_f, clk, bar)
 
         self._m_list_lay.addStretch(1)
+
+    def update_screen_time(self, summary: dict) -> None:
+        if not summary:
+            return
+        act = summary.get("active_text", "0m")
+        cont = summary.get("continuous_text", "0m")
+        brks = int(summary.get("breaks", 0))
+        self._screen_time_lbl.setText(f"{act} today · {cont} nonstop · {brks} breaks")
