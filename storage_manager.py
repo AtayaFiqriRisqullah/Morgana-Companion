@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import tempfile
 import uuid
 from datetime import date, datetime, timedelta
@@ -217,18 +218,52 @@ class TaskStore(JsonListStore):
         return removed
 
 
-class NoteStore(JsonListStore):
-    """Catatan: {"id", "title", "content", "deadline", "done", "notified", "rewarded", "created", "updated"}.
+_TAG_RE = re.compile(r"(?<![\w/#])#([A-Za-z][A-Za-z0-9_-]{0,23})")
 
-    `deadline` berupa string ISO waktu lokal atau None. `done` = ditandai selesai (tidak lagi
-    diingatkan). `notified` menandai pengingat "deadline sudah tiba" sudah dibunyikan.
+
+def extract_tags(text: str) -> list[str]:
+    """Extract unique lowercase `#tags` from note text (preserving order, ignoring Markdown headings)."""
+    seen: list[str] = []
+    for line in (text or "").splitlines():
+        # Skip Markdown heading markers like `## Title`
+        stripped = line.lstrip()
+        if stripped.startswith("#") and (len(stripped) == 1 or stripped[1] in ("#", " ", "\t")):
+            continue
+        for m in _TAG_RE.finditer(line):
+            tag = m.group(1).lower()
+            if tag not in seen:
+                seen.append(tag)
+    return seen
+
+
+def _merge_tags(title: str, content: str, extra: list[str] | None = None) -> list[str]:
+    tags: list[str] = []
+    for raw in (extra or []):
+        clean = str(raw).strip().lstrip("#").lower()
+        if clean and clean not in tags:
+            tags.append(clean)
+    for t in extract_tags(f"{title}\n{content}"):
+        if t not in tags:
+            tags.append(t)
+    return tags[:12]
+
+
+class NoteStore(JsonListStore):
+    """True note-taking store: {"id", "title", "content", "category", "tags", "pinned", "archived", "created", "updated"}.
+
+    Retains optional legacy `deadline` / `done` / `notified` / `rewarded` fields for seamless
+    backward compatibility with older `notes.json` files without losing user data.
     """
 
-    def add(self, title: str, content: str, deadline: datetime | None,
-            category: str = "Personal") -> dict:
+    def add(self, title: str, content: str, deadline: datetime | None = None,
+            category: str = "Personal", tags: list[str] | None = None) -> dict:
         stamp = now_iso()
-        note = {"id": uuid.uuid4().hex[:12], "title": title.strip(), "content": content.strip(),
-                "category": (category or "Personal").strip() or "Personal", "pinned": False,
+        clean_title = title.strip()
+        clean_content = content.strip()
+        note = {"id": uuid.uuid4().hex[:12], "title": clean_title, "content": clean_content,
+                "category": (category or "Personal").strip() or "Personal",
+                "tags": _merge_tags(clean_title, clean_content, tags),
+                "pinned": False, "archived": False,
                 "deadline": deadline.isoformat(timespec="minutes") if deadline else None,
                 "done": False, "notified": False, "rewarded": False,
                 "created": stamp, "updated": stamp}
@@ -237,20 +272,65 @@ class NoteStore(JsonListStore):
         return note
 
     def update(self, note_id: str, title: str, content: str,
-               deadline: datetime | None, category: str | None = None) -> dict | None:
+               deadline: datetime | None = None, category: str | None = None,
+               tags: list[str] | None = None, *, preserve_deadline: bool = False) -> dict | None:
         note = self.get(note_id)
         if note is None:
             return None
-        new_deadline = deadline.isoformat(timespec="minutes") if deadline else None
-        if new_deadline != note.get("deadline"):
-            note["notified"] = False          # deadline baru -> boleh diingatkan lagi
-        patch = dict(title=title.strip(), content=content.strip(),
+        clean_title = title.strip()
+        clean_content = content.strip()
+        if preserve_deadline:
+            new_deadline = note.get("deadline")
+        else:
+            new_deadline = deadline.isoformat(timespec="minutes") if deadline else None
+            if new_deadline != note.get("deadline"):
+                note["notified"] = False          # deadline baru -> boleh diingatkan lagi
+        patch = dict(title=clean_title, content=clean_content,
+                     tags=_merge_tags(clean_title, clean_content, tags),
                      deadline=new_deadline, updated=now_iso())
         if category is not None:
             patch["category"] = category.strip() or "Personal"
         note.update(patch)
         self.save()
         return note
+
+    def set_archived(self, note_id: str, archived: bool) -> bool:
+        note = self.get(note_id)
+        if note is None:
+            return False
+        note["archived"] = bool(archived)
+        if archived:
+            note["pinned"] = False
+        note["updated"] = now_iso()
+        self.save()
+        return True
+
+    def clear_deadline(self, note_id: str) -> bool:
+        """Clear a legacy deadline field (e.g. after promoting it into a real Task)."""
+        note = self.get(note_id)
+        if note is None:
+            return False
+        note["deadline"] = None
+        note["notified"] = False
+        note["updated"] = now_iso()
+        self.save()
+        return True
+
+    def note_tags(self, note: dict) -> list[str]:
+        stored = note.get("tags")
+        if isinstance(stored, list) and stored:
+            return [str(t).strip().lstrip("#").lower() for t in stored if str(t).strip()]
+        return extract_tags(f"{note.get('title', '')}\n{note.get('content', '')}")
+
+    def all_tags(self, include_archived: bool = False) -> list[tuple[str, int]]:
+        """Return `[(tag, count), ...]` sorted by frequency then alphabetically."""
+        counts: dict[str, int] = {}
+        for n in self._items:
+            if not include_archived and n.get("archived"):
+                continue
+            for t in self.note_tags(n):
+                counts[t] = counts.get(t, 0) + 1
+        return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
 
     def set_done(self, note_id: str, done: bool) -> bool:
         note = self.get(note_id)
@@ -272,6 +352,8 @@ class NoteStore(JsonListStore):
         if note is None:
             return False
         note["pinned"] = bool(pinned)
+        if pinned:
+            note["archived"] = False
         self.save()
         return True
 
@@ -286,8 +368,8 @@ class NoteStore(JsonListStore):
         return None
 
     def with_deadline(self) -> list[dict]:
-        """Catatan aktif (belum selesai) yang punya deadline."""
-        return [n for n in self._items if n.get("deadline") and not n.get("done")]
+        """Catatan aktif (belum selesai/diarsip) yang masih punya legacy deadline."""
+        return [n for n in self._items if n.get("deadline") and not n.get("done") and not n.get("archived")]
 
     def due(self, now: datetime | None = None) -> list[dict]:
         """Catatan aktif yang deadline-nya sudah tiba dan belum diingatkan."""
@@ -772,11 +854,13 @@ RADIAL_TABS: tuple[tuple[str, str], ...] = (
     ("events", "Events (7-Day Calendar)"),
     ("tasks",  "Tasks (To-Do List)"),
     ("timer",  "Timer (Focus & Manual)"),
-    ("notes",  "Notes (Quick Notes)"),
+    ("notes",  "Notes (Knowledge Base)"),
+    ("talk",   "Talk (Choice Chat)"),
     ("stats",  "Social Stats"),
     ("system", "System Menu"),
 )
 RADIAL_TAB_KEYS: tuple[str, ...] = tuple(k for k, _ in RADIAL_TABS)
+_LEGACY_6_TABS = frozenset({"events", "tasks", "timer", "notes", "stats", "system"})
 
 SETTINGS_DEFAULTS = {
     "bedtime": "23:30",                 # bedtime reminder start
@@ -794,6 +878,12 @@ SETTINGS_DEFAULTS = {
     "sfx_volume": 75,                   # UI & Social Stats SFX volume percentage (0-100)
     "morning_briefing": True,           # Show Daily Briefing & Confidant Summary once daily
     "auto_stat_rewards": True,          # Auto-award Social Stats from tasks, notes & focus
+    "auto_open_stats_on_reward": True,  # Auto-open Social Stats star animation on activity rewards
+    "app_awareness_enabled": True,      # Local-only active app/window awareness remarks
+    "screen_time_enabled": True,        # Daily active screen-time tracking & break nudges
+    "break_nudge_min": 60,              # Continuous active minutes before Morgana nudges a break
+    "particles_enabled": True,          # Persona 5 micro-particles around Morgana
+    "spontaneous_choices_enabled": True,  # Occasional interactive choice prompts while idle
     "last_briefing_date": "",           # YYYY-MM-DD of last auto-delivered Daily Briefing
     "enabled_tabs": list(RADIAL_TAB_KEYS),  # Active tabs shown in Morgana's radial menu
 }
@@ -807,8 +897,19 @@ _INT_RANGES = {
     "sound_volume": (0, 100),
     "voice_volume": (0, 100),
     "sfx_volume": (0, 100),
+    "break_nudge_min": (15, 240),
 }
-_BOOL_KEYS = ("curfew_enabled", "sound_enabled", "morning_briefing", "auto_stat_rewards")
+_BOOL_KEYS = (
+    "curfew_enabled",
+    "sound_enabled",
+    "morning_briefing",
+    "auto_stat_rewards",
+    "auto_open_stats_on_reward",
+    "app_awareness_enabled",
+    "screen_time_enabled",
+    "particles_enabled",
+    "spontaneous_choices_enabled",
+)
 
 
 def _valid_hhmm(value) -> bool:
@@ -876,6 +977,10 @@ class SettingsStore:
                     patch["voice_volume"] = int(old_v)
                 if "sfx_volume" not in raw:
                     patch["sfx_volume"] = int(old_v)
+        # Upgrade default 6-tab configs cleanly to include the new `talk` tab on first v1.3 load
+        if "app_awareness_enabled" not in raw and isinstance(patch.get("enabled_tabs"), list):
+            if set(str(x).lower() for x in patch["enabled_tabs"]) == _LEGACY_6_TABS:
+                patch["enabled_tabs"] = list(RADIAL_TAB_KEYS)
         self.set(save=False, **patch)
 
     def set(self, save: bool = True, **values) -> None:

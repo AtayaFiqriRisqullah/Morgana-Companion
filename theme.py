@@ -356,6 +356,17 @@ QTextEdit#noteBody {{
 QTextEdit#noteBody:focus {{
     border: 1px solid #4A1921;
 }}
+QTextBrowser#notePreview {{
+    background-color: #121217;
+    border: 1px solid #2C2C3A;
+    border-radius: 8px;
+    padding: 10px 14px;
+    font-size: {inp}px;
+    color: #EAEAF2;
+    font-family: "Arsenal", "Optima", "Segoe UI", sans-serif;
+    selection-background-color: #E60012;
+    selection-color: #FFFFFF;
+}}
 QListWidget {{
     background-color: transparent;
     border: none;
