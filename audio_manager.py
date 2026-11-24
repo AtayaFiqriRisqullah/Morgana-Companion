@@ -347,8 +347,10 @@ class AudioManager(QObject):
                     ordered.append(fname)
         return ordered
 
+    _MAX_CONCURRENT_DECODERS = 3
+
     def _decode_all_async(self) -> None:
-        """Decode all 16 audio files concurrently into RAM (~250-300 ms, non-blocking)."""
+        """Decode all audio files into RAM via a lean 2-slot queue (prevents 48-thread FFmpeg burst)."""
         for old in self._decoders:
             try:
                 old.stop()
@@ -356,8 +358,12 @@ class AudioManager(QObject):
             except Exception:
                 pass
         self._decoders.clear()
+        self._decode_queue: list[str] = list(self._unique_files())
+        self._pump_decode_queue()
 
-        for fname in self._unique_files():
+    def _pump_decode_queue(self) -> None:
+        while self._decode_queue and len(self._decoders) < self._MAX_CONCURRENT_DECODERS:
+            fname = self._decode_queue.pop(0)
             path = resolve_audio(fname)
             if path is None:
                 continue
@@ -372,13 +378,24 @@ class AudioManager(QObject):
                     if ab.isValid() and ab.byteCount() > 0:
                         b.extend(ab.constData().asstring(ab.byteCount()))
 
+            def _cleanup(d=dec) -> None:
+                if d in self._decoders:
+                    self._decoders.remove(d)
+                try:
+                    d.bufferReady.disconnect()
+                    d.finished.disconnect()
+                    d.error.disconnect()
+                except Exception:
+                    pass
+                d.deleteLater()
+                self._pump_decode_queue()
+
             def _finish(d=dec, b=buf, name=fname) -> None:
                 _drain(d, b)
                 if b:
                     self._pcm[name] = bytes(b)
-                if d in self._decoders:
-                    self._decoders.remove(d)
-                d.deleteLater()
+                b.clear()
+                _cleanup(d)
                 pending = self._pending_by_file.pop(name, None)
                 if pending is not None and name in self._pcm:
                     kind, key = pending
@@ -389,11 +406,10 @@ class AudioManager(QObject):
                     elif kind == "stat":
                         self.play_stat(key)
 
-            def _error(err, d=dec, name=fname) -> None:
+            def _error(err, d=dec, b=buf, name=fname) -> None:
                 log.debug("Audio decode error for %s: %s", name, err)
-                if d in self._decoders:
-                    self._decoders.remove(d)
-                d.deleteLater()
+                b.clear()
+                _cleanup(d)
 
             dec.bufferReady.connect(_drain)
             dec.finished.connect(_finish)

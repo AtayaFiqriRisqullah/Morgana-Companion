@@ -38,9 +38,33 @@ _PRESETS: dict[str, tuple[int, int, int, int]] = {
 _WM_HOTKEY = 0x0312
 _MOD_NOREPEAT = 0x4000
 
+# Define Win32 MSG + POINTER type ONCE at module level.
+# Creating ctypes.Structure + ctypes.POINTER inside nativeEventFilter() leaks
+# every single Windows message forever into ctypes._pointer_type_cache (~700 MB/min)!
+if sys.platform.startswith("win"):
+    from ctypes import wintypes as _wintypes
+
+    class _WIN_MSG(ctypes.Structure):
+        _fields_ = [
+            ("hwnd", _wintypes.HWND),
+            ("message", _wintypes.UINT),
+            ("wParam", _wintypes.WPARAM),
+            ("lParam", _wintypes.LPARAM),
+            ("time", _wintypes.DWORD),
+            ("pt_x", _wintypes.LONG),
+            ("pt_y", _wintypes.LONG),
+        ]
+
+    _LP_WIN_MSG = ctypes.POINTER(_WIN_MSG)
+else:
+    _WIN_MSG = None
+    _LP_WIN_MSG = None
+
+_X11_ERR_CB = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+
 
 class _WinHotkeyFilter(QAbstractNativeEventFilter):
-    """Qt native event filter catching Win32 WM_HOTKEY messages."""
+    """Zero-allocation Qt native event filter catching Win32 WM_HOTKEY messages."""
 
     def __init__(self, hotkey_id: int, on_trigger) -> None:
         super().__init__()
@@ -48,22 +72,11 @@ class _WinHotkeyFilter(QAbstractNativeEventFilter):
         self._on_trigger = on_trigger
 
     def nativeEventFilter(self, event_type, message):
+        if _LP_WIN_MSG is None:
+            return False, 0
         try:
-            if event_type in (b"windows_generic_MSG", b"windows_dispatcher_MSG"):
-                from ctypes import wintypes
-
-                class _MSG(ctypes.Structure):
-                    _fields_ = [
-                        ("hwnd", wintypes.HWND),
-                        ("message", wintypes.UINT),
-                        ("wParam", wintypes.WPARAM),
-                        ("lParam", wintypes.LPARAM),
-                        ("time", wintypes.DWORD),
-                        ("pt_x", wintypes.LONG),
-                        ("pt_y", wintypes.LONG),
-                    ]
-
-                msg = ctypes.cast(int(message), ctypes.POINTER(_MSG)).contents
+            if event_type == b"windows_generic_MSG" or event_type == b"windows_dispatcher_MSG":
+                msg = ctypes.cast(int(message), _LP_WIN_MSG).contents
                 if msg.message == _WM_HOTKEY and int(msg.wParam) == self._hotkey_id:
                     self._on_trigger()
                     return True, 0
@@ -200,14 +213,13 @@ class GlobalHotkeyManager(QObject):
         x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
 
         err_flag = {"bad": False}
-        ERR_CB = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
 
         def _err_handler(_dpy, _ev):
             err_flag["bad"] = True
             return 0
 
-        cb_ref = ERR_CB(_err_handler)
-        x11.XSetErrorHandler.argtypes = [ERR_CB]
+        cb_ref = _X11_ERR_CB(_err_handler)
+        x11.XSetErrorHandler.argtypes = [_X11_ERR_CB]
         x11.XSetErrorHandler.restype = ctypes.c_void_p
 
         dpy = x11.XOpenDisplay(None)
@@ -228,7 +240,7 @@ class GlobalHotkeyManager(QObject):
         for lm in lock_masks:
             x11.XGrabKey(dpy, keycode, mods | lm, root, 0, 1, 1)
         x11.XSync(dpy, 0)
-        x11.XSetErrorHandler(ctypes.cast(prev_handler, ERR_CB) if prev_handler else ERR_CB(0))
+        x11.XSetErrorHandler(ctypes.cast(prev_handler, _X11_ERR_CB) if prev_handler else _X11_ERR_CB(0))
 
         if err_flag["bad"]:
             for lm in lock_masks:

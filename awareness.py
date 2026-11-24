@@ -357,9 +357,32 @@ _WIN32_SHELL_CLASSES = frozenset({
     "progman", "workerw", "shell_traywnd", "shell_secondarytraywnd", "windows.ui.core.corewindow",
 })
 
+if sys.platform.startswith("win"):
+    import ctypes as _ctypes
+    from ctypes import wintypes as _wintypes
+
+    class _WIN_MONITORINFO(_ctypes.Structure):
+        _fields_ = [
+            ("cbSize", _wintypes.DWORD),
+            ("rcMonitor", _wintypes.RECT),
+            ("rcWork", _wintypes.RECT),
+            ("dwFlags", _wintypes.DWORD),
+        ]
+
+    class _WIN_LASTINPUTINFO(_ctypes.Structure):
+        _fields_ = [
+            ("cbSize", _wintypes.UINT),
+            ("dwTime", _wintypes.DWORD),
+        ]
+else:
+    _WIN_MONITORINFO = None
+    _WIN_LASTINPUTINFO = None
+
 
 def _win32_is_fullscreen(user32, hwnd) -> bool:
     """Return True if `hwnd` covers its full monitor or Windows reports Presentation/Fullscreen state."""
+    if _WIN_MONITORINFO is None:
+        return False
     import ctypes
     from ctypes import wintypes
 
@@ -389,16 +412,8 @@ def _win32_is_fullscreen(user32, hwnd) -> bool:
         if not hmon:
             return False
 
-        class MONITORINFO(ctypes.Structure):
-            _fields_ = [
-                ("cbSize", wintypes.DWORD),
-                ("rcMonitor", wintypes.RECT),
-                ("rcWork", wintypes.RECT),
-                ("dwFlags", wintypes.DWORD),
-            ]
-
-        mi = MONITORINFO()
-        mi.cbSize = ctypes.sizeof(MONITORINFO)
+        mi = _WIN_MONITORINFO()
+        mi.cbSize = ctypes.sizeof(_WIN_MONITORINFO)
         if not user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
             return False
         m = mi.rcMonitor
@@ -503,15 +518,13 @@ def get_active_window() -> ActiveWindowInfo | None:
 
 
 def _win32_idle_seconds() -> float | None:
+    if _WIN_LASTINPUTINFO is None:
+        return None
     try:
         import ctypes
-        from ctypes import wintypes
 
-        class LASTINPUTINFO(ctypes.Structure):
-            _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
-
-        lii = LASTINPUTINFO()
-        lii.cbSize = ctypes.sizeof(LASTINPUTINFO)
+        lii = _WIN_LASTINPUTINFO()
+        lii.cbSize = ctypes.sizeof(_WIN_LASTINPUTINFO)
         if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
             return None
         tick = ctypes.windll.kernel32.GetTickCount() & 0xFFFFFFFF
