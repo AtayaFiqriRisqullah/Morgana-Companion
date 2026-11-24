@@ -953,6 +953,7 @@ QUICK_HOTKEY_PRESETS: tuple[str, ...] = (
     "Alt+Space",
     "Off",
 )
+AI_PROVIDER_PRESETS: tuple[str, ...] = ("gemini", "openai")
 
 SETTINGS_DEFAULTS = {
     "bedtime": "23:30",                 # bedtime reminder start
@@ -982,10 +983,13 @@ SETTINGS_DEFAULTS = {
     "auto_dnd_fullscreen": True,        # Auto-DND during fullscreen apps, games & presentations
     "manual_dnd": False,                # Manual Do Not Disturb mode
     "quick_hotkey": "Ctrl+Shift+M",     # Global shortcut for Quick Command & Capture
-    "ai_enabled": False,                # Opt-in OpenAI-compatible AI fallback for free-form chat
+    "ai_enabled": False,                # Opt-in AI companion (Google Gemini or OpenAI-compatible)
+    "ai_provider": "gemini",            # "gemini" (Google AI Studio) or "openai" (Ollama/OpenAI)
     "ai_endpoint": "http://localhost:11434/v1/chat/completions",
-    "ai_model": "llama3.2",
+    "ai_model": "gemini-2.5-flash",
     "ai_api_key": "",
+    "ai_call_user": "Joker",            # How Morgana addresses you in AI conversations
+    "ai_dialogue_enabled": True,        # Use AI for Talk / Choice Prompts & live app reactions
     "last_briefing_date": "",           # YYYY-MM-DD of last auto-delivered Daily Briefing
     "last_wrapup_date": "",             # YYYY-MM-DD of last auto-delivered Evening Wrap-up
     "enabled_tabs": list(RADIAL_TAB_KEYS),  # Active tabs shown in Morgana's radial menu
@@ -1017,8 +1021,9 @@ _BOOL_KEYS = (
     "auto_dnd_fullscreen",
     "manual_dnd",
     "ai_enabled",
+    "ai_dialogue_enabled",
 )
-_STR_KEYS = ("ai_endpoint", "ai_model", "ai_api_key")
+_STR_KEYS = ("ai_endpoint", "ai_model", "ai_api_key", "ai_call_user")
 
 
 def _valid_hhmm(value) -> bool:
@@ -1090,6 +1095,13 @@ class SettingsStore:
         if "app_awareness_enabled" not in raw and isinstance(patch.get("enabled_tabs"), list):
             if set(str(x).lower() for x in patch["enabled_tabs"]) == _LEGACY_6_TABS:
                 patch["enabled_tabs"] = list(RADIAL_TAB_KEYS)
+        # Smooth upgrade from v1.4.0 (Ollama-only defaults) -> v1.4.1 (Gemini-first defaults)
+        if "ai_provider" not in raw:
+            if bool(raw.get("ai_enabled")):
+                patch["ai_provider"] = "openai"
+            elif str(raw.get("ai_model") or "").strip().lower() == "llama3.2":
+                patch["ai_provider"] = "gemini"
+                patch["ai_model"] = "gemini-2.5-flash"
         self.set(save=False, **patch)
 
     def set(self, save: bool = True, **values) -> None:
@@ -1113,6 +1125,9 @@ class SettingsStore:
             elif key == "quick_hotkey":
                 if isinstance(value, str) and value.strip() in QUICK_HOTKEY_PRESETS:
                     self.data[key] = value.strip()
+            elif key == "ai_provider":
+                if isinstance(value, str) and value.strip().lower() in AI_PROVIDER_PRESETS:
+                    self.data[key] = value.strip().lower()
             elif key in _STR_KEYS:
                 if isinstance(value, str):
                     self.data[key] = value.strip()[:512]

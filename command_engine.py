@@ -328,8 +328,8 @@ def _local_chat_reply(raw: str, ctx: dict) -> CommandResult:
                 "Did you just call me a cat?! Watch it! I'm a dignified partner who keeps your whole schedule running!",
             ]),
             emotion="angry",
-            voice="not_a_cat",
-            particle="alert",
+            voice="hoi",
+            particle="anger",
             badge="NOT A CAT",
         )
 
@@ -343,8 +343,8 @@ def _local_chat_reply(raw: str, ctx: dict) -> CommandResult:
                 f"and grab some {drink}. Type 'break 5' if you want me to time it!"
             ),
             emotion="worried",
-            voice="care",
-            particle="hearts",
+            voice="naa",
+            particle="heart",
             badge="TAKE A BREATHER",
             action_label="5M BREAK",
             action_target="break_5",
@@ -360,8 +360,8 @@ def _local_chat_reply(raw: str, ctx: dict) -> CommandResult:
             kind="chat",
             reply=f"Deep breath—I've got your back. {focus_tip}",
             emotion="worried",
-            voice="care",
-            particle="hearts",
+            voice="naa",
+            particle="heart",
             badge="ONE STEP AT A TIME",
             action_label="EVENING WRAP-UP" if hour >= 19 else "OPEN TASKS",
             action_target="wrapup" if hour >= 19 else "tasks",
@@ -377,7 +377,7 @@ def _local_chat_reply(raw: str, ctx: dict) -> CommandResult:
                 "just to break the ice! Type 'focus 10' and let's roll."
             ),
             emotion="smug",
-            voice="lets_go",
+            voice="dousuru",
             particle="sparkle",
             badge="QUICK SPARK",
             action_label="FOCUS 10M",
@@ -392,8 +392,8 @@ def _local_chat_reply(raw: str, ctx: dict) -> CommandResult:
                 "Ooh, look at you go! That's the spirit—make sure you log it in Tasks or save a quick win in your Journal!",
                 "Nice work!! I knew you had it in you. Keep that momentum—or reward yourself with a short breather!",
             ]),
-            emotion="sparkle",
-            voice="nice",
+            emotion="excited",
+            voice="oh_excited",
             particle="music",
             badge="AWESOME!",
             action_label="OPEN STATS",
@@ -405,9 +405,9 @@ def _local_chat_reply(raw: str, ctx: dict) -> CommandResult:
         return CommandResult(
             kind="chat",
             reply=f"Fuel check! Step away from the screen for a real snack and some {drink}—your brain runs way better refueled!",
-            emotion="happy",
+            emotion="wink",
             voice="hmm",
-            particle="hearts",
+            particle="heart",
             badge="FUEL CHECK",
         )
 
@@ -420,8 +420,8 @@ def _local_chat_reply(raw: str, ctx: dict) -> CommandResult:
                 "Don't mention it! We make a pretty unstoppable team, huh?",
             ]),
             emotion="smug",
-            voice="happy",
-            particle="hearts",
+            voice="oh_excited",
+            particle="heart",
             badge="ANYTIME",
         )
 
@@ -431,8 +431,8 @@ def _local_chat_reply(raw: str, ctx: dict) -> CommandResult:
             return CommandResult(
                 kind="chat",
                 reply="Winding down for the night? Let's do a quick Evening Wrap-up so tomorrow starts stress-free!",
-                emotion="sleepy",
-                voice="sleepy",
+                emotion="sad",
+                voice="yareyare",
                 particle="zzz",
                 badge="GOOD NIGHT",
                 action_label="EVENING WRAP-UP",
@@ -448,8 +448,8 @@ def _local_chat_reply(raw: str, ctx: dict) -> CommandResult:
         return CommandResult(
             kind="chat",
             reply=greet + tail,
-            emotion="happy",
-            voice="hello",
+            emotion="wink",
+            voice="hoi",
             particle="sparkle",
             badge="HEY THERE",
         )
@@ -461,7 +461,7 @@ def _local_chat_reply(raw: str, ctx: dict) -> CommandResult:
                 kind="chat",
                 reply=f"Start with '{top_task[:42]}'—kick off a 25-minute Focus sprint ('focus 25') and knock it out cleanly!",
                 emotion="smug",
-                voice="lets_go",
+                voice="dousuru",
                 particle="sparkle",
                 badge="NEXT MOVE",
                 action_label="START FOCUS",
@@ -470,7 +470,7 @@ def _local_chat_reply(raw: str, ctx: dict) -> CommandResult:
         return CommandResult(
             kind="chat",
             reply="Your task list is wide open! Type 'task <goal>' to add one, or 'note <thought>' to capture an idea.",
-            emotion="happy",
+            emotion="wink",
             voice="hmm",
             badge="OPEN SLATE",
         )
@@ -494,7 +494,7 @@ def _local_chat_reply(raw: str, ctx: dict) -> CommandResult:
     return CommandResult(
         kind="chat",
         reply=reply,
-        emotion="happy",
+        emotion="wink",
         voice="hmm",
         badge="MORGANA",
     )
@@ -515,18 +515,26 @@ def parse_and_plan(raw_text: str, ctx: dict | None = None,
         )
     low = text.lower().strip()
 
-    # 1) Help cheatsheet
+    # 1) Help cheatsheet & chat reset
     if low in ("help", "/help", "?", "commands"):
         return CommandResult(
             kind="help",
             reply=(
                 "Quick commands: 'task <title> [at 15:00 / tomorrow / in 30m]' · "
                 "'note <text> [#tag]' · 'event <title> at 16:00' · 'focus 25' · 'break 5' · "
-                "'timer 10m tea' · 'dnd on/off' · 'status' · 'briefing' · 'wrapup' · or just talk!"
+                "'timer 10m tea' · 'dnd on/off' · 'status' · 'briefing' · 'wrapup' · 'clear chat' · or just talk!"
             ),
-            emotion="happy",
+            emotion="wink",
             voice="hmm",
             badge="COMMANDS",
+        )
+    if low in ("clear chat", "/clear", "reset chat", "new chat"):
+        return CommandResult(
+            kind="clear_chat",
+            reply="Fresh slate! What's our next move?",
+            emotion="wink",
+            voice="hmm",
+            badge="CHAT CLEARED",
         )
 
     # 2) Quick Task / Reminder
@@ -544,8 +552,8 @@ def parse_and_plan(raw_text: str, ctx: dict | None = None,
         return CommandResult(
             kind="add_task",
             reply=f"Added to Tasks: '{title[:52]}'{when_s}!",
-            emotion="happy",
-            voice="nice",
+            emotion="wink",
+            voice="oh_excited",
             particle="sparkle",
             badge="TASK ADDED",
             action_label="OPEN TASKS",
@@ -563,8 +571,8 @@ def parse_and_plan(raw_text: str, ctx: dict | None = None,
         return CommandResult(
             kind="add_note",
             reply=f"Jotted down in {cat} Notes: '{title}'!",
-            emotion="happy",
-            voice="nice",
+            emotion="wink",
+            voice="oh_excited",
             particle="sparkle",
             badge="NOTE SAVED",
             action_label="OPEN NOTES",
@@ -584,8 +592,8 @@ def parse_and_plan(raw_text: str, ctx: dict | None = None,
         return CommandResult(
             kind="add_event",
             reply=f"Scheduled '{title[:48]}' for {dt:%a %d %b at %H:%M}!",
-            emotion="happy",
-            voice="nice",
+            emotion="wink",
+            voice="oh_excited",
             particle="sparkle",
             badge="EVENT ADDED",
             action_label="OPEN EVENTS",
@@ -610,8 +618,8 @@ def parse_and_plan(raw_text: str, ctx: dict | None = None,
         return CommandResult(
             kind="start_focus",
             reply=f"Locking in! Starting {lbl} Focus sprint right now!",
-            emotion="sparkle",
-            voice="lets_go",
+            emotion="excited",
+            voice="uwooh",
             particle="sparkle",
             badge="FOCUS STARTED",
             action_label="OPEN TIMER",
@@ -626,9 +634,9 @@ def parse_and_plan(raw_text: str, ctx: dict | None = None,
         return CommandResult(
             kind="start_break",
             reply=f"{mins}-minute break timer started! Step back, stretch, and hydrate!",
-            emotion="happy",
-            voice="happy",
-            particle="hearts",
+            emotion="wink",
+            voice="hmm",
+            particle="heart",
             badge=f"{mins}M BREAK",
             payload={"minutes": mins},
         )
@@ -647,8 +655,8 @@ def parse_and_plan(raw_text: str, ctx: dict | None = None,
         return CommandResult(
             kind="start_timer",
             reply=f"Countdown set for '{label[:36]}'!",
-            emotion="happy",
-            voice="nice",
+            emotion="smug",
+            voice="oh_excited",
             particle="sparkle",
             badge="TIMER SET",
             payload={"seconds": secs, "label": label[:60]},
@@ -665,7 +673,7 @@ def parse_and_plan(raw_text: str, ctx: dict | None = None,
                 "Do Not Disturb is ON. I'll stay completely quiet until you turn it off."
                 if state else "Do Not Disturb is OFF. I'm back online!"
             ),
-            emotion="neutral" if state else "happy",
+            emotion="neutral" if state else "wink",
             badge="DND ON" if state else ("DND OFF" if state is False else "DND"),
             payload={"state": state},
         )
@@ -673,21 +681,21 @@ def parse_and_plan(raw_text: str, ctx: dict | None = None,
     if low in ("mute", "sound off", "quiet sound", "bisu"):
         return CommandResult(kind="toggle_sound", reply="Sounds muted!", badge="MUTED", payload={"state": False})
     if low in ("unmute", "sound on"):
-        return CommandResult(kind="toggle_sound", reply="Sounds back on!", emotion="happy", badge="SOUND ON", payload={"state": True})
+        return CommandResult(kind="toggle_sound", reply="Sounds back on!", emotion="wink", badge="SOUND ON", payload={"state": True})
     if low in ("sleep", "sleep mode", "nap"):
-        return CommandResult(kind="toggle_sleep", reply="Toggling Sleep Mode.", emotion="sleepy", badge="SLEEP", payload={"state": True})
+        return CommandResult(kind="toggle_sleep", reply="Toggling Sleep Mode.", emotion="sad", badge="SLEEP", payload={"state": True})
     if low in ("wake", "wake up"):
-        return CommandResult(kind="toggle_sleep", reply="I'm wide awake!", emotion="sparkle", badge="AWAKE", payload={"state": False})
+        return CommandResult(kind="toggle_sleep", reply="I'm wide awake!", emotion="excited", badge="AWAKE", payload={"state": False})
     if low in ("hide", "hide morgana", "tray"):
         return CommandResult(kind="toggle_visibility", reply="Hiding to the system tray—summon me anytime!", badge="IN TRAY", payload={"visible": False})
     if low in ("show", "show morgana", "summon"):
-        return CommandResult(kind="toggle_visibility", reply="Reporting for duty!", emotion="sparkle", badge="VISIBLE", payload={"visible": True})
+        return CommandResult(kind="toggle_visibility", reply="Reporting for duty!", emotion="excited", badge="VISIBLE", payload={"visible": True})
 
     # 7) Direct Panel Navigation (`open notes`, `wrapup`, `briefing`, `tasks`, ...)
     nav_clean = re.sub(r"^(?:open|show|go\s+to|buka)\s+", "", low).lstrip("/").strip()
     if nav_clean in _NAV_MAP:
         target, reply, badge = _NAV_MAP[nav_clean]
-        return CommandResult(kind="open_panel", reply=reply, emotion="happy", badge=badge, payload={"target": target})
+        return CommandResult(kind="open_panel", reply=reply, emotion="wink", badge=badge, payload={"target": target})
 
     # 8) Live Workspace Status Queries
     if any(k in low for k in (
@@ -696,7 +704,7 @@ def parse_and_plan(raw_text: str, ctx: dict | None = None,
     )):
         return _status_reply(ctx)
 
-    # 9) Free-form companion chat (local engine, or opt-in AI with instant local fallback)
+    # 9) Free-form companion chat (local engine, or opt-in Gemini/OpenAI with instant local fallback)
     local = _local_chat_reply(text, ctx)
     if ai_enabled:
         return CommandResult(
@@ -705,7 +713,7 @@ def parse_and_plan(raw_text: str, ctx: dict | None = None,
             emotion=local.emotion,
             voice=local.voice,
             particle=local.particle,
-            badge="AI · MORGANA",
+            badge="GEMINI · MORGANA",
             action_label=local.action_label,
             action_target=local.action_target,
             payload={"prompt": text, "fallback": local},
@@ -714,54 +722,20 @@ def parse_and_plan(raw_text: str, ctx: dict | None = None,
 
 
 # ---------------------------------------------------------------------------
-# Strictly Opt-In OpenAI-Compatible AI Client (Ollama / LM Studio / OpenAI)
+# Backwards-compatible wrapper delegating to `gemini_ai.py`
 # ---------------------------------------------------------------------------
 def query_ai_endpoint(prompt: str, ctx: dict, endpoint: str, model: str,
-                      api_key: str = "", timeout: float = 12.0) -> tuple[bool, str]:
-    """Call an OpenAI-compatible `/v1/chat/completions` endpoint using stdlib `urllib`.
+                      api_key: str = "", timeout: float = 14.0,
+                      provider: str = "openai", call_user: str = "Joker") -> tuple[bool, str]:
+    """Backwards-compatible wrapper around `gemini_ai.ask_morgana_chat`."""
+    from gemini_ai import AIConfig, ask_morgana_chat
 
-    Must ONLY be invoked from a background thread when `settings['ai_enabled']` is True.
-    """
-    url = (endpoint or "").strip()
-    if not (url.startswith("http://") or url.startswith("https://")):
-        return False, "Invalid endpoint URL"
-    mdl = (model or "llama3.2").strip() or "llama3.2"
-
-    sys_lines = [
-        "You are Morgana, a witty, supportive, concise desktop productivity companion.",
-        "Reply in natural English in 1 to 3 short sentences (under 240 characters when possible).",
-        "Stay in a warm everyday-companion tone; avoid spoilers or unrelated fictional lore.",
-        f"Live user context: pending_tasks={ctx.get('pending_tasks', 0)}, "
-        f"overdue={ctx.get('overdue_count', 0)}, screen_time={ctx.get('screen_time_text', '0m')}, "
-        f"active_app={ctx.get('active_app_name') or 'desktop'}, hour={ctx.get('hour', 12)}.",
-    ]
-    body = json.dumps({
-        "model": mdl,
-        "messages": [
-            {"role": "system", "content": " ".join(sys_lines)},
-            {"role": "user", "content": (prompt or "").strip()[:600]},
-        ],
-        "max_tokens": 140,
-        "temperature": 0.7,
-    }).encode("utf-8")
-
-    headers = {"Content-Type": "application/json"}
-    if (api_key or "").strip():
-        headers["Authorization"] = f"Bearer {api_key.strip()}"
-
-    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8", errors="replace"))
-        choices = data.get("choices") or []
-        if choices:
-            msg = choices[0].get("message") or {}
-            content = str(msg.get("content") or "").strip()
-            if content:
-                # Strip markdown/thinking tags if local reasoning models include them
-                content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
-                if content:
-                    return True, content[:360]
-        return False, "Empty AI response"
-    except (urllib.error.URLError, TimeoutError, OSError, ValueError, KeyError) as exc:
-        return False, str(exc)
+    cfg = AIConfig(
+        provider=provider,
+        api_key=api_key,
+        model=model,
+        endpoint=endpoint,
+        call_user=call_user,
+    )
+    res = ask_morgana_chat(prompt, ctx, cfg, timeout=timeout)
+    return (True, res.text) if res.ok else (False, res.error or "AI request failed")
