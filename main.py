@@ -53,21 +53,24 @@ from PyQt6.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QWidget
 import app_paths
 import autostart
 from audio_manager import init_audio, play_ui
-from calendar_service import (CalendarEvent, CalendarResult, CalendarService, format_agenda,
-                              human_delta, merge_note_deadlines, note_deadline_events)
+from calendar_service import (CalendarEvent, CalendarResult, CalendarService, events_by_day,
+                              format_agenda, human_delta, local_calendar_events,
+                              merge_companion_items, note_deadline_events, task_deadline_events)
 from emotions import EXPRESSIONS, STATE_EXPRESSION, emotion_for_text, voice_for_dialogue
 from motion import FrameTicker, Spring, clamp
-from lines import ContextualDialogue, LineBag, greeting_pool, load_lines
+from lines import (ContextualDialogue, LineBag, build_daily_briefing, greeting_pool, load_lines)
 import sprites
 from sprites import EYE_CLOSED, EYE_HALF, EYE_OPEN, MOUTH_BASE, MorganaSprites
-from storage_manager import (RADIAL_TAB_KEYS, SOCIAL_STATS, NoteStore, SettingsStore,
-                             SocialStatsStore, TaskStore, parse_dt, stat_rank_title)
+from storage_manager import (RADIAL_TAB_KEYS, SOCIAL_STAT_KEYS, SOCIAL_STATS, HabitStore,
+                             LocalEventStore, NoteStore, SettingsStore, SocialStatsStore,
+                             TaskStore, overall_confidant_level, parse_dt, stat_level,
+                             stat_rank_title)
 from theme import (BLACK, BLACK_BURST_SHARDS, BLUE, GOLD, LIGHT_RED, MENU_QSS, P5_MINT_FG,
                    P5_SURFACE, RED, RED_BURST_SHARDS, UI_SCALE_PRESETS, WHITE, lerp_color,
                    load_fonts, menu_qss, p5_dialogue_font, p5_font, pen, scale_polygon,
                    star_polygon, tapered_wedge)
-from ui_dialogs import (EventsDialog, NotesDialog, SettingsDialog, SocialStatsDialog,
-                        TasksDialog, TimerDialog)
+from ui_dialogs import (BriefingDialog, EventsDialog, NotesDialog, SettingsDialog,
+                        SocialStatsDialog, TasksDialog, TimerDialog)
 
 try:
     import psutil
@@ -2109,6 +2112,8 @@ class PetController(QObject):
         self.tasks = TaskStore(APP_DIR / "tasks.json")
         self.notes = NoteStore(APP_DIR / "notes.json")
         self.social_stats = SocialStatsStore(APP_DIR / "social_stats.json")
+        self.local_events = LocalEventStore(APP_DIR / "local_events.json")
+        self.habits = HabitStore(APP_DIR / "habits.json")
         self.settings = SettingsStore(APP_DIR / "settings.json")
         if args.curfew is not None:               # CLI flags override for this session only
             self.settings.set(save=False, bedtime=args.curfew.strftime("%H:%M"))
@@ -2133,6 +2138,7 @@ class PetController(QObject):
         self.stats_dialog: SocialStatsDialog | None = None
         self.timer_dialog: TimerDialog | None = None
         self.settings_dialog: SettingsDialog | None = None
+        self.briefing_dialog: BriefingDialog | None = None
         self._cal_events: list[CalendarEvent] = []
         self._last_cal_result: CalendarResult | None = None
         self._remind_last: dict[str, float] = {}    # kunci acara -> waktu (monotonic) pengingat terakhir
@@ -2140,6 +2146,7 @@ class PetController(QObject):
         self._agenda_wanted = False            # pengguna menunggu hasil EVENTS
         self._rebuilding_ui = False            # suppress open/close chatter during UI scale/tab sync
         self._last_bump_t = 0.0
+        self._pending_task_reward_note = ""
         self._menu_hover_action: dict[int, object] = {}
 
         # state karakter
@@ -2155,6 +2162,8 @@ class PetController(QObject):
             self,
             enabled=bool(self.settings["sound_enabled"]),
             volume_pct=int(self.settings["sound_volume"]),
+            voice_volume_pct=int(self.settings["voice_volume"]),
+            sfx_volume_pct=int(self.settings["sfx_volume"]),
         )
         self.pet.set_ui_scale(self.ui_scale)
         self.bubble.set_ui_scale(self.ui_scale)
@@ -2261,15 +2270,20 @@ class PetController(QObject):
 
         notes_all = self.notes.all()
         due_notes = self.notes.with_deadline()
+        h_done, h_total = self.habits.today_summary()
 
         manual = self.manual_timers.snapshot()
         nearest = manual[0] if manual else None
 
-        # Calendar + Note deadlines snapshot (live events or cached weekly sample)
+        # Calendar + Local Events + Note & Task deadlines snapshot
         base_cal = self._cal_events or (self._last_cal_result.events if self._last_cal_result else [])
-        cal_list = list(base_cal) + note_deadline_events(notes_all, now=aware_now)
+        cal_list = (list(base_cal)
+                    + local_calendar_events(self.local_events.all(), now=aware_now)
+                    + note_deadline_events(notes_all, now=aware_now)
+                    + task_deadline_events(all_tasks, now=aware_now))
         timed = sorted((e for e in cal_list if not e.all_day), key=lambda e: e.start)
-        ongoing = next((e for e in timed if e.source != "note" and e.start <= aware_now and (e.end is None or e.end > aware_now)), None)
+        ongoing = next((e for e in timed if e.source not in ("note", "task")
+                        and e.start <= aware_now and (e.end is None or e.end > aware_now)), None)
         next_ev = next((e for e in timed if e.start > aware_now), None)
         next_title, next_delta = "", ""
         if next_ev is not None and (next_ev.start - aware_now) <= timedelta(hours=8):
@@ -2287,6 +2301,8 @@ class PetController(QObject):
             "top_task": top_task,
             "notes_count": len(notes_all),
             "due_notes": len(due_notes),
+            "habits_done": h_done,
+            "habits_total": h_total,
             "today_blocks": len(self.social_stats.today_entries()),
             "focus_running": self.pomodoro.running,
             "focus_phase": self.pomodoro.phase,
@@ -2309,10 +2325,100 @@ class PetController(QObject):
             self.say(self._bag_general.next())
         self._schedule_chatter()
 
-    # -- startup: ringkasan tugas ---------------------------------------------
+    # -- Daily Morning Briefing & Confidant Summary ---------------------------
+    def _build_briefing_payload(self) -> dict:
+        now = datetime.now()
+        aware_now = now.astimezone()
+        today = now.date()
+
+        combined = self._combined_events_result()
+        grouped = events_by_day(combined.events, now=aware_now, days=1)
+        today_items = grouped[0][1] if grouped else []
+
+        agenda_rows: list[tuple[str, str, str]] = []
+        today_events: list[str] = []
+        overdue_titles: list[str] = []
+        due_today_count = 0
+
+        for ev in today_items:
+            is_dl = ev.source in ("note", "task")
+            is_ov = is_dl and ev.start <= aware_now
+            if is_ov:
+                overdue_titles.append(ev.title)
+                t_s = f"{ev.start:%H:%M}" if ev.start.date() == today else f"{ev.start:%d %b}"
+                agenda_rows.append(("OVERDUE", t_s, ev.title))
+            elif is_dl:
+                due_today_count += 1
+                tag = "TASK" if ev.source == "task" else "NOTE"
+                agenda_rows.append((tag, f"{ev.start:%H:%M}", ev.title))
+            else:
+                today_events.append(ev.title)
+                tag = "LOCAL" if ev.source == "local" else "EVENT"
+                t_s = "ALL DAY" if ev.all_day else f"{ev.start:%H:%M}"
+                agenda_rows.append((tag, t_s, ev.title))
+
+        pending = self.tasks.pending()
+        high_pending = [t for t in pending if t.get("priority") == "high"]
+        h_done, h_total = self.habits.today_summary()
+        totals = self.social_stats.totals()
+        conf_lv, conf_max = overall_confidant_level(totals)
+        streak = self.social_stats.streak_days()
+
+        # Find lowest & highest social stat for personalized Confidant advice
+        lowest_k = min(SOCIAL_STAT_KEYS, key=lambda k: totals.get(k, 0))
+        top_k = max(SOCIAL_STAT_KEYS, key=lambda k: totals.get(k, 0))
+
+        return {
+            "hour": now.hour,
+            "date_banner": f"{now:%a %d %b}".upper(),
+            "today_events": today_events,
+            "overdue_count": len(overdue_titles),
+            "overdue_top": overdue_titles[0] if overdue_titles else "",
+            "due_today_count": due_today_count,
+            "pending_tasks": len(pending),
+            "high_tasks": len(high_pending),
+            "habits_done": h_done,
+            "habits_total": h_total,
+            "streak_days": streak,
+            "lowest_stat_label": SOCIAL_STATS[lowest_k]["label"],
+            "top_stat_label": SOCIAL_STATS[top_k]["label"],
+            "confidant_lv": conf_lv,
+            "confidant_max": conf_max,
+            "stat_totals": totals,
+            "today_points": self.social_stats.today_points(),
+            "agenda_rows": agenda_rows,
+        }
+
+    def _sync_briefing_view(self) -> None:
+        if self.briefing_dialog is not None and self.briefing_dialog.isVisible():
+            self.briefing_dialog.set_data(self._build_briefing_payload())
+
+    def _open_briefing(self, announce: bool = True) -> None:
+        was_open = self.briefing_dialog is not None and self.briefing_dialog.isVisible()
+        if self.briefing_dialog is None:
+            self.briefing_dialog = BriefingDialog(on_top=self.on_top, ui_scale=self.ui_scale)
+            self.briefing_dialog.open_events.connect(self._open_events)
+            self.briefing_dialog.open_tasks.connect(self._open_tasks)
+            self.briefing_dialog.open_stats.connect(self._open_stats)
+            self.briefing_dialog.closed.connect(lambda: self._on_dialog_closed("briefing"))
+        payload = self._build_briefing_payload()
+        self.briefing_dialog.set_data(payload)
+        self._sync_dialog_links()
+        self.briefing_dialog.show_near(self.pet.geometry())
+        if announce and not was_open and not self._rebuilding_ui:
+            brief = build_daily_briefing(payload)
+            self.say(brief["spoken"], "talking", ms=7500, emotion=brief["emotion"], voice=brief["voice"])
+
+    # -- startup: Daily Morning Briefing (once/day) atau ringkasan singkat ----
     def _startup_report(self) -> None:
         if self.curfew_active:                  # pengingat tidur lebih penting
             return
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        if bool(self.settings["morning_briefing"]) and self.settings["last_briefing_date"] != today_str:
+            self.settings.set(last_briefing_date=today_str)
+            self._open_briefing(announce=True)
+            return
+
         pending = self.tasks.pending()
         greeting = random.choice(greeting_pool(self._greetings, datetime.now().hour))
         if not pending or "tasks" not in self.settings["enabled_tabs"]:
@@ -2325,6 +2431,55 @@ class PetController(QObject):
         word = "task" if len(pending) == 1 else "tasks"
         self.say(f"{greeting}\n\nYou have {len(pending)} pending {word} today:\n" + "\n".join(lines),
                  "talking", ms=13000, context="startup")
+
+    # -- Auto-reward Social Stats helper -------------------------------------
+    def _award_auto_stat(self, stat: str, activity: str, points: int,
+                         source: str, ref_id: str = "",
+                         announce: bool = True) -> tuple[int, int, int]:
+        """Award Social Stat points automatically (if enabled), triggering P5R fanfare on Rank Up."""
+        if not bool(self.settings["auto_stat_rewards"]):
+            return 0, 1, 1
+        entry, old_lv, new_lv = self.social_stats.add(
+            stat=stat, activity=activity, points=points, source=source, ref_id=ref_id
+        )
+        if entry is None:
+            return 0, 1, 1
+        leveled_up = new_lv > old_lv
+        label = SOCIAL_STATS.get(stat, {}).get("label", stat.title())
+
+        def _on_point_anim() -> None:
+            if self.stats_dialog is not None:
+                self.stats_dialog.refresh()
+                self.stats_dialog.animate_point_gain()
+            self._sync_briefing_view()
+            if announce and not leveled_up:
+                self.pet.bump(0.8)
+                self.say(f"Auto-reward: +{points} {label} ({clip(activity, 34)})!",
+                         "talking", ms=4800, context="stat_log")
+
+        def _on_level_up() -> None:
+            rank = stat_rank_title(stat, new_lv)
+            if self.stats_dialog is not None:
+                self.stats_dialog.refresh()
+                self.stats_dialog.animate_rank_up()
+            self._sync_briefing_view()
+            self.pet.bump(1.3)
+            self.say(f"RANK UP! Your {label} leveled up to Lv {new_lv} ({rank})! "
+                     "All that consistency is really paying off!", "action", ms=7500, context="rank_up")
+
+        if leveled_up or announce:
+            self.audio.play_stats_sequence(
+                points=points,
+                leveled_up=leveled_up,
+                on_point_anim=_on_point_anim,
+                on_level_up=_on_level_up if leveled_up else None,
+            )
+        else:
+            if self.stats_dialog is not None:
+                self.stats_dialog.refresh()
+                self.stats_dialog.animate_point_gain()
+            self._sync_briefing_view()
+        return points, old_lv, new_lv
 
     # -- interaksi pet ---------------------------------------------------------
     def _on_pet_clicked(self) -> None:
@@ -2346,9 +2501,94 @@ class PetController(QObject):
         else:
             self.audio.play_voice("uwooh")
 
+    def _on_task_reward_eligible(self, task_id: str) -> None:
+        self._pending_task_reward_note = ""
+        task = self.tasks.get(task_id)
+        if task is None or task.get("rewarded"):
+            return
+        if not bool(self.settings["auto_stat_rewards"]):
+            return
+        dl = parse_dt(task.get("deadline"))
+        on_time = dl is not None and dl >= datetime.now()
+        pts = 2 if (task.get("priority") == "high" or on_time) else 1
+        self.tasks.mark_rewarded(task_id)
+        awarded, old_lv, new_lv = self._award_auto_stat(
+            stat="proficiency",
+            activity=f"Task: {task.get('title', 'Task')}",
+            points=pts,
+            source="task",
+            ref_id=task_id,
+            announce=False,
+        )
+        if awarded > 0 and new_lv <= old_lv:
+            self._pending_task_reward_note = f"+{awarded} Proficiency"
+        elif new_lv > old_lv:
+            # Rank Up celebration takes over speech cleanly
+            self._pending_task_reward_note = "__RANK_UP__"
+
     def _on_task_completed(self, title: str, remaining: int) -> None:
         self.pet.bump(0.75)
-        self._say_tuple(self.dialogue.task_completed(title, remaining), ms=4200)
+        note = self._pending_task_reward_note
+        self._pending_task_reward_note = ""
+        if note == "__RANK_UP__":
+            return
+        self._say_tuple(self.dialogue.task_completed(title, remaining, reward_note=note), ms=4600)
+
+    def _on_note_completed(self, note_id: str) -> None:
+        note = self.notes.get(note_id)
+        if note is None or note.get("rewarded") or not note.get("deadline"):
+            return
+        if not bool(self.settings["auto_stat_rewards"]):
+            return
+        dl = parse_dt(note.get("deadline"))
+        pts = 2 if (dl is not None and dl >= datetime.now()) else 1
+        self.notes.mark_rewarded(note_id)
+        self._award_auto_stat(
+            stat="knowledge",
+            activity=f"Note: {note.get('title', 'Note')}",
+            points=pts,
+            source="note",
+            ref_id=note_id,
+            announce=True,
+        )
+
+    def _on_habit_toggled(self, habit_id: str, now_done: bool, entry, old_lv: int, new_lv: int) -> None:
+        self._sync_briefing_view()
+        if not now_done or entry is None:
+            return
+        habit = self.habits.get(habit_id)
+        title = habit.get("title", "Daily Habit") if habit else entry.get("activity", "Daily Habit")
+        stat = entry.get("stat", "knowledge")
+        pts = int(entry.get("points", 2))
+        label = SOCIAL_STATS.get(stat, {}).get("label", stat.title())
+        streak = self.habits.streak(habit) if habit else 1
+        done_today, total_habits = self.habits.today_summary()
+        leveled_up = new_lv > old_lv
+
+        def _on_point_anim() -> None:
+            if self.stats_dialog is not None:
+                self.stats_dialog.animate_point_gain()
+            if not leveled_up:
+                self.pet.bump(0.85)
+                self._say_tuple(
+                    self.dialogue.habit_completed(title, label, pts, streak, done_today, total_habits),
+                    ms=5000,
+                )
+
+        def _on_level_up() -> None:
+            rank = stat_rank_title(stat, new_lv)
+            if self.stats_dialog is not None:
+                self.stats_dialog.animate_rank_up()
+            self.pet.bump(1.3)
+            self.say(f"RANK UP! Your {label} leveled up to Lv {new_lv} ({rank}) from '{clip(title, 26)}'!",
+                     "action", ms=7500, context="rank_up")
+
+        self.audio.play_stats_sequence(
+            points=pts,
+            leveled_up=leveled_up,
+            on_point_anim=_on_point_anim,
+            on_level_up=_on_level_up if leveled_up else None,
+        )
 
     def _on_dialog_closed(self, kind: str) -> None:
         if self._rebuilding_ui:
@@ -2368,6 +2608,10 @@ class PetController(QObject):
         if self.events_dialog is not None:
             self.events_dialog._tasks_btn.setVisible("tasks" in enabled)
             self.events_dialog._notes_btn.setVisible("notes" in enabled)
+        if self.briefing_dialog is not None:
+            self.briefing_dialog._btn_ev.setVisible("events" in enabled)
+            self.briefing_dialog._btn_tk.setVisible("tasks" in enabled)
+            self.briefing_dialog._btn_st.setVisible("stats" in enabled)
 
     def _open_tasks(self) -> None:
         was_open = self.tasks_dialog is not None and self.tasks_dialog.isVisible()
@@ -2375,6 +2619,9 @@ class PetController(QObject):
             self.tasks_dialog = TasksDialog(self.tasks, on_top=self.on_top, ui_scale=self.ui_scale)
             self.tasks_dialog.open_settings.connect(self._open_settings_deferred)
             self.tasks_dialog.open_notes.connect(self._open_notes)
+            self.tasks_dialog.tasks_changed.connect(self._sync_events_view)
+            self.tasks_dialog.tasks_changed.connect(self._sync_briefing_view)
+            self.tasks_dialog.task_reward_eligible.connect(self._on_task_reward_eligible)
             self.tasks_dialog.task_completed.connect(self._on_task_completed)
             self.tasks_dialog.closed.connect(lambda: self._on_dialog_closed("tasks"))
         self._sync_dialog_links()
@@ -2389,6 +2636,8 @@ class PetController(QObject):
             self.notes_dialog.open_settings.connect(self._open_settings_deferred)
             self.notes_dialog.open_tasks.connect(self._open_tasks)
             self.notes_dialog.notes_changed.connect(self._sync_events_view)
+            self.notes_dialog.notes_changed.connect(self._sync_briefing_view)
+            self.notes_dialog.note_completed.connect(self._on_note_completed)
             self.notes_dialog.closed.connect(lambda: self._on_dialog_closed("notes"))
         self._sync_dialog_links()
         self.notes_dialog.show_near(self.pet.geometry())
@@ -2397,7 +2646,12 @@ class PetController(QObject):
 
     def _combined_events_result(self, base: CalendarResult | None = None) -> CalendarResult:
         src = base if base is not None else (self._last_cal_result or CalendarResult([], "ok"))
-        return merge_note_deadlines(src, self.notes.all())
+        return merge_companion_items(
+            src,
+            notes=self.notes.all(),
+            tasks=self.tasks.all(),
+            local_events=self.local_events.all(),
+        )
 
     def _sync_events_view(self) -> None:
         if self.events_dialog is not None:
@@ -2406,14 +2660,19 @@ class PetController(QObject):
     def _open_events(self) -> None:
         was_open = self.events_dialog is not None and self.events_dialog.isVisible()
         if self.events_dialog is None:
-            self.events_dialog = EventsDialog(on_top=self.on_top, ui_scale=self.ui_scale)
+            self.events_dialog = EventsDialog(local_events=self.local_events,
+                                              on_top=self.on_top, ui_scale=self.ui_scale)
             self.events_dialog.refresh_requested.connect(self._refresh_events)
+            self.events_dialog.local_events_changed.connect(self._sync_events_view)
+            self.events_dialog.local_events_changed.connect(self._sync_briefing_view)
             self.events_dialog.open_tasks.connect(self._open_tasks)
             self.events_dialog.open_notes.connect(self._open_notes)
             self.events_dialog.open_settings.connect(self._open_settings_deferred)
             self.events_dialog.closed.connect(lambda: self._on_dialog_closed("events"))
         self._sync_dialog_links()
-        if self._last_cal_result is not None or self.notes.with_deadline():
+        has_local_or_due = (self._last_cal_result is not None or self.notes.with_deadline()
+                            or self.tasks.with_deadline() or bool(self.local_events.all()))
+        if has_local_or_due:
             self.events_dialog.set_result(self._combined_events_result())
         self.events_dialog.show_near(self.pet.geometry())
         if not was_open and not self._rebuilding_ui:
@@ -2423,8 +2682,12 @@ class PetController(QObject):
     def _open_stats(self) -> None:
         was_open = self.stats_dialog is not None and self.stats_dialog.isVisible()
         if self.stats_dialog is None:
-            self.stats_dialog = SocialStatsDialog(self.social_stats, on_top=self.on_top, ui_scale=self.ui_scale)
+            self.stats_dialog = SocialStatsDialog(
+                self.social_stats, habits=self.habits, on_top=self.on_top, ui_scale=self.ui_scale
+            )
             self.stats_dialog.stat_logged.connect(self._on_stat_logged)
+            self.stats_dialog.habit_toggled.connect(self._on_habit_toggled)
+            self.stats_dialog.open_briefing.connect(lambda: self._open_briefing(announce=False))
             self.stats_dialog.open_settings.connect(self._open_settings_deferred)
             self.stats_dialog.closed.connect(lambda: self._on_dialog_closed("stats"))
         self.stats_dialog.show_near(self.pet.geometry())
@@ -2449,7 +2712,8 @@ class PetController(QObject):
     def _visible_dialog_rects(self) -> list[QRect]:
         rects: list[QRect] = []
         for dlg in (self.tasks_dialog, self.notes_dialog, self.events_dialog,
-                    self.stats_dialog, self.timer_dialog, self.settings_dialog):
+                    self.stats_dialog, self.timer_dialog, self.settings_dialog,
+                    self.briefing_dialog):
             if dlg is not None and dlg.isVisible():
                 rects.append(dlg.geometry())
         return rects
@@ -2475,7 +2739,7 @@ class PetController(QObject):
             self._say_tuple(self.dialogue.window_open("system", self._ctx()), ms=4200)
             self.system_menu.popup(anchor)
 
-    # -- EVENTS: 7-day Google Calendar + Note Deadlines ---------------------------
+    # -- EVENTS: 7-day Google + Local Events + Task & Note Deadlines --------------
     def _refresh_events(self, interactive: bool = True) -> None:
         if not self.calendar.is_configured():
             result = self.calendar.get_upcoming()
@@ -2484,9 +2748,11 @@ class PetController(QObject):
                 self._cal_events = result.events
             if self.events_dialog is not None:
                 self.events_dialog.set_result(self._combined_events_result(result))
+            self._sync_briefing_view()
             return
         self._agenda_wanted = interactive
-        if self.events_dialog is not None and self._last_cal_result is None and not self.notes.with_deadline():
+        has_local = bool(self.notes.with_deadline() or self.tasks.with_deadline() or self.local_events.all())
+        if self.events_dialog is not None and self._last_cal_result is None and not has_local:
             self.events_dialog.set_loading(True)
         if interactive and not self.calendar.has_token():
             self.say("Opening your browser to connect Google Calendar (one-time setup). "
@@ -2500,6 +2766,7 @@ class PetController(QObject):
             self._last_cal_result = result
             if self.args.demo_reminders:
                 self._cal_events = result.events
+            self._sync_briefing_view()
             return
         if self.calendar.has_token():
             self.fetcher.fetch(interactive=False)
@@ -2510,6 +2777,7 @@ class PetController(QObject):
             self._cal_events = result.events
         if self.events_dialog is not None:
             self.events_dialog.set_result(self._combined_events_result(result))
+        self._sync_briefing_view()
         if not self._agenda_wanted:
             return
         if result.status == "auth_needed":     # fetch latar gagal login -> ulangi interaktif
@@ -2522,6 +2790,7 @@ class PetController(QObject):
     def _on_stat_logged(self, stat: str, activity: str, pts: int, old_lv: int, new_lv: int) -> None:
         label = SOCIAL_STATS.get(stat, {}).get("label", stat.title())
         leveled_up = new_lv > old_lv
+        self._sync_briefing_view()
 
         def _on_point_anim() -> None:
             if self.stats_dialog is not None:
@@ -2546,7 +2815,7 @@ class PetController(QObject):
             on_level_up=_on_level_up if leveled_up else None,
         )
 
-    # -- pengingat: acara H-2 jam (jeda 10 menit) & deadline catatan -------------------
+    # -- pengingat: acara H-2 jam, acara lokal, deadline tugas & catatan ----------
     def _check_reminders(self) -> None:
         messages: list[str] = []
         now = datetime.now()
@@ -2556,24 +2825,38 @@ class PetController(QObject):
         for note in self.notes.due(now):
             self.notes.mark_notified(note["id"])
             title = note.get("title") or "Note"
-            line = f"DUE NOW: {title}"
+            line = f"NOTE DUE NOW: {title}"
             snippet = clip(note.get("content", ""), 70)
             if snippet and snippet != title:
                 line += f"\n{snippet}"
             messages.append(line)
 
-        # 2) hitung mundur: mulai H-<jendela>, ulangi tiap <interval> menit sampai acara dimulai
+        # 2) tugas yang deadline-nya sudah tiba
+        for task in self.tasks.due(now):
+            self.tasks.mark_notified(task["id"])
+            title = task.get("title") or "Task"
+            messages.append(f"TASK DUE NOW: {title}")
+
+        # 3) hitung mundur: mulai H-<jendela>, ulangi tiap <interval> menit sampai acara dimulai
         window = timedelta(minutes=self.settings["event_window_min"])
         interval_s = self.settings["event_interval_min"] * 60 - 15      # toleransi 15 dtk karena timer 30 dtk
         upcoming: list[tuple[str, str, datetime]] = []                  # (kunci, judul, waktu mulai)
         for ev in self._cal_events:
             if not ev.all_day:
                 upcoming.append((f"cal:{ev.id}@{ev.start.isoformat()}", ev.title, ev.start))
+        for lev in local_calendar_events(self.local_events.all(), now=aware_now, days=2):
+            if not lev.all_day:
+                upcoming.append((f"local:{lev.id}@{lev.start.isoformat()}", lev.title, lev.start))
         if NOTE_COUNTDOWN_REMINDERS:
             for n in self.notes.with_deadline():
                 dl = parse_dt(n.get("deadline"))
                 if dl is not None:
                     upcoming.append((f"note:{n['id']}@{n['deadline']}", n.get("title") or "Note",
+                                     dl.astimezone()))
+            for t in self.tasks.with_deadline():
+                dl = parse_dt(t.get("deadline"))
+                if dl is not None:
+                    upcoming.append((f"task:{t['id']}@{t['deadline']}", t.get("title") or "Task",
                                      dl.astimezone()))
         countdown: list[str] = []
         for key, title, start in upcoming:
@@ -2583,7 +2866,7 @@ class PetController(QObject):
                 if last is None or time.monotonic() - last >= interval_s:
                     self._remind_last[key] = time.monotonic()
                     countdown.append(f"{title} ({start:%H:%M}, in {human_delta(delta)})")
-            elif (key.startswith("cal:") and key not in self._remind_started
+            elif ((key.startswith("cal:") or key.startswith("local:")) and key not in self._remind_started
                   and -timedelta(seconds=EVENT_STARTED_GRACE_S) < delta <= timedelta(0)):
                 self._remind_started.add(key)
                 messages.append(f"STARTING NOW: {title} ({start:%H:%M})")
@@ -2603,6 +2886,7 @@ class PetController(QObject):
         m.setStyleSheet(menu_qss(self.ui_scale))
         self.system_menu = m
         self._attach_menu_sfx(m)
+        m.addAction("DAILY BRIEFING...", lambda: self._open_briefing(announce=True))
         self.act_sys_status = m.addAction("SYSTEM STATUS (CPU / RAM)", self._act_item)
         self.act_sys_pomo = m.addAction("TIMER & FOCUS...", self._open_timer)
         self.act_sys_sleep = m.addAction("SLEEP MODE", self._toggle_sleep_mode)
@@ -2669,7 +2953,7 @@ class PetController(QObject):
         # If any panel is open, center Settings over it so it's never buried
         shown = False
         for panel in (self.notes_dialog, self.tasks_dialog, self.events_dialog,
-                      self.stats_dialog, self.timer_dialog):
+                      self.stats_dialog, self.timer_dialog, self.briefing_dialog):
             if panel is not None and panel.isVisible():
                 self.settings_dialog.show_near(panel.geometry(), prefer_center=True)
                 shown = True
@@ -2687,7 +2971,10 @@ class PetController(QObject):
         self.act_curfew.blockSignals(False)
         sound_on = bool(self.settings["sound_enabled"])
         self.audio.set_enabled(sound_on)
-        self.audio.set_volume(int(self.settings["sound_volume"]))
+        self.audio.set_volumes(
+            int(self.settings["voice_volume"]),
+            int(self.settings["sfx_volume"]),
+        )
         self.act_sound.blockSignals(True)
         self.act_sound.setChecked(sound_on)
         self.act_sound.blockSignals(False)
@@ -2815,7 +3102,21 @@ class PetController(QObject):
             t = fmt_mmss(self.pomodoro.rest_s)
             self.pet.bump(1.2)
             play_beep()
-            self.say(random.choice(_FOCUS_REST).format(t=t))
+            focus_mins = max(1, int(round(self.pomodoro.focus_s / 60.0)))
+            pts = 3 if focus_mins >= 45 else 2
+            awarded, old_lv, new_lv = self._award_auto_stat(
+                stat="knowledge",
+                activity=f"Focus session ({focus_mins} min)",
+                points=pts,
+                source="focus",
+                announce=False,
+            )
+            if new_lv > old_lv:
+                return
+            msg = random.choice(_FOCUS_REST).format(t=t)
+            if awarded > 0:
+                msg += f" (+{awarded} Knowledge!)"
+            self.say(msg)
 
     def _on_pomo_finished(self) -> None:
         self._sync_timer_ui()
@@ -2891,6 +3192,9 @@ class PetController(QObject):
         m.setStyleSheet(menu_qss(self.ui_scale))
         self.context_menu = m
         self._attach_menu_sfx(m)
+
+        m.addAction("DAILY BRIEFING...", lambda: self._open_briefing(announce=True))
+        m.addSeparator()
 
         state_menu = m.addMenu("STATE")
         self._attach_menu_sfx(state_menu)
@@ -3050,6 +3354,7 @@ class PetController(QObject):
                 ("events_dialog", self._open_events, False),
                 ("stats_dialog", self._open_stats, False),
                 ("timer_dialog", self._open_timer, False),
+                ("briefing_dialog", lambda: self._open_briefing(announce=False), False),
             ):
                 dlg = getattr(self, attr)
                 if dlg is not None:
@@ -3090,7 +3395,8 @@ class PetController(QObject):
         if was_visible:
             self.pet.show()
         for dlg in (self.tasks_dialog, self.notes_dialog, self.events_dialog,
-                    self.stats_dialog, self.timer_dialog, self.settings_dialog):
+                    self.stats_dialog, self.timer_dialog, self.settings_dialog,
+                    self.briefing_dialog):
             if dlg is not None:
                 dlg.set_on_top(on)
 

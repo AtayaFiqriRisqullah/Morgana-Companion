@@ -23,17 +23,21 @@ from PyQt6.QtGui import (QColor, QFontMetrics, QGuiApplication, QKeySequence, QP
                          QPainterPath, QPen, QPixmap, QPolygonF, QShortcut, QTextCursor)
 from PyQt6.QtWidgets import (QAbstractItemView, QCheckBox, QDateTimeEdit, QFrame, QGridLayout,
                              QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-                             QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSpinBox, QStyle,
-                             QStyledItemDelegate, QTextEdit, QTimeEdit, QVBoxLayout, QWidget)
+                             QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSlider,
+                             QSpinBox, QStyle, QStyledItemDelegate, QTextEdit, QTimeEdit,
+                             QVBoxLayout, QWidget)
 
 import sprites
-from audio_manager import play_ui
+from audio_manager import audio, play_ui, play_voice
 from calendar_service import CalendarResult, events_by_day, human_delta, morgana_briefing
+from lines import build_daily_briefing
 from motion import FrameTicker, Spring, clamp
 from storage_manager import (DAILY_BLOCK_TARGET, DEFAULT_STAT_POINTS, QUICK_STAT_POINTS,
                              RADIAL_TAB_KEYS, SETTINGS_DEFAULTS, SOCIAL_STAT_KEYS, SOCIAL_STATS,
-                             TIME_BLOCKS, NoteStore, SettingsStore, SocialStatsStore, TaskStore,
-                             default_time_block, parse_dt, stat_level, stat_level_progress,
+                             STAT_MASTERY_STEP, STAT_RANK_THRESHOLDS, TIME_BLOCKS, HabitStore,
+                             LocalEventStore, NoteStore, SettingsStore, SocialStatsStore,
+                             TaskStore, default_time_block, overall_confidant_level, parse_dt,
+                             stat_level, stat_level_progress, stat_pentagon_fraction,
                              stat_rank_title)
 from theme import (BLACK, DEEP_RED, GOLD, LIGHT_RED, P5_BG, P5_BORDER, P5_BORDER_HI,
                    P5_CARD, P5_GOLD_BG, P5_GOLD_FG, P5_HOVER, P5_MINT_BG, P5_MINT_FG, P5_MUTED,
@@ -47,6 +51,8 @@ ROLE_BADGE = ROLE_ID + 3                      # status chip text ("IN 2H", "OVER
 ROLE_DATE = ROLE_ID + 4                       # date / time label
 ROLE_CAT = ROLE_ID + 5                        # category / tone
 ROLE_FLAG = ROLE_ID + 6                       # bool: high priority (tasks) or pinned (notes)
+ROLE_OVERDUE = ROLE_ID + 7                    # bool: task deadline overdue
+ROLE_STREAK = ROLE_ID + 8                     # str: habit streak badge text
 
 NOTE_CATEGORIES = ("Personal", "Work", "Study")
 _AVATAR_CACHE: dict[int, QPixmap] = {}
@@ -735,22 +741,26 @@ class TaskRowDelegate(QStyledItemDelegate):
         card = r.adjusted(2, 3, -4, -3)
         done = bool(index.data(ROLE_DONE))
         high = bool(index.data(ROLE_FLAG))
+        overdue = bool(index.data(ROLE_OVERDUE)) and not done
+        due_txt = index.data(ROLE_BADGE) or ""
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
         hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
 
         if selected:
             bg, border = P5_SELECTED, RED
+        elif overdue:
+            bg, border = (P5_HOVER if hovered else QColor("#210C10")), RED
         elif hovered:
             bg, border = P5_HOVER, P5_BORDER_HI
         else:
             bg, border = P5_SURFACE, P5_BORDER
 
-        painter.setPen(QPen(border, 1.2))
+        painter.setPen(QPen(border, 1.3 if (selected or overdue) else 1.2))
         painter.setBrush(bg)
         painter.drawRoundedRect(card, 8.0, 8.0)
 
-        # Left accent bar for high priority or selection
-        if high and not done:
+        # Left accent bar for overdue, high priority, or selection
+        if (high or overdue) and not done:
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(RED)
             painter.drawRoundedRect(QRectF(card.left(), card.top() + 5, 3.5, card.height() - 10), 1.5, 1.5)
@@ -774,7 +784,7 @@ class TaskRowDelegate(QStyledItemDelegate):
         painter.drawText(QPointF(tx, card.top() + 10 + fm.ascent()),
                          fm.elidedText(title, Qt.TextElideMode.ElideRight, int(tw)))
 
-        # Second line: optional HIGH chip + status chip + creation time
+        # Second line: optional HIGH chip + status chip + optional DUE/OVERDUE chip + creation time
         sc = self._sc
         ph = 16.0 * sc
         py = card.top() + 33.0 * sc
@@ -791,19 +801,30 @@ class TaskRowDelegate(QStyledItemDelegate):
             painter.drawText(pill, Qt.AlignmentFlag.AlignCenter.value, "HIGH")
             x_cur = pill.right() + 6
 
-        st_txt = "DONE" if done else "PENDING"
-        sw = pfm.horizontalAdvance(st_txt) + 14.0 * sc
-        spill = QRectF(x_cur, py, sw, ph)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(P5_MINT_BG if done else P5_GOLD_BG)
-        painter.drawRoundedRect(spill, 4.0, 4.0)
-        painter.setFont(self._pill_font)
-        painter.setPen(P5_MINT_FG if done else P5_GOLD_FG)
-        painter.drawText(spill, Qt.AlignmentFlag.AlignCenter.value, st_txt)
-        x_cur = spill.right() + 8
+        if due_txt and not done:
+            dw = pfm.horizontalAdvance(due_txt) + 14.0 * sc
+            dpill = QRectF(x_cur, py, dw, ph)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(RED if overdue else P5_GOLD_BG)
+            painter.drawRoundedRect(dpill, 4.0, 4.0)
+            painter.setFont(self._pill_font)
+            painter.setPen(WHITE if overdue else P5_GOLD_FG)
+            painter.drawText(dpill, Qt.AlignmentFlag.AlignCenter.value, due_txt)
+            x_cur = dpill.right() + 6
+        else:
+            st_txt = "DONE" if done else "PENDING"
+            sw = pfm.horizontalAdvance(st_txt) + 14.0 * sc
+            spill = QRectF(x_cur, py, sw, ph)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(P5_MINT_BG if done else P5_GOLD_BG)
+            painter.drawRoundedRect(spill, 4.0, 4.0)
+            painter.setFont(self._pill_font)
+            painter.setPen(P5_MINT_FG if done else P5_GOLD_FG)
+            painter.drawText(spill, Qt.AlignmentFlag.AlignCenter.value, st_txt)
+            x_cur = spill.right() + 8
 
         time_txt = index.data(ROLE_DATE) or ""
-        if time_txt:
+        if time_txt and card.right() - x_cur > 36:
             painter.setFont(self._time_font)
             painter.setPen(P5_MUTED)
             painter.drawText(QRectF(x_cur, py, max(0.0, card.right() - x_cur - 8), ph),
@@ -1000,18 +1021,20 @@ def _make_card(object_name: str = "card") -> QFrame:
 # TASKS DIALOG
 # ---------------------------------------------------------------------------
 class TasksDialog(P5FluidPanel):
-    FILTERS = (("ALL", "all"), ("PENDING", "todo"), ("HIGH", "high"), ("DONE", "done"))
+    FILTERS = (("ALL", "all"), ("PENDING", "todo"), ("DUE", "due"), ("HIGH", "high"), ("DONE", "done"))
     open_settings = pyqtSignal()
     open_notes = pyqtSignal()
     tasks_changed = pyqtSignal()
     task_completed = pyqtSignal(str, int)
+    task_reward_eligible = pyqtSignal(str)    # emits task_id when marked done
 
     def __init__(self, store: TaskStore, on_top: bool = True, ui_scale: float = 1.0) -> None:
-        super().__init__("TASKS", QSize(500, 610), on_top=on_top, ui_scale=ui_scale)
+        super().__init__("TASKS", QSize(535, 635), on_top=on_top, ui_scale=ui_scale)
         sc = self._ui_scale
         self.store = store
         self._filter = "all"
         self._new_high = False
+        self._new_due_on = False
         self._undo_items: list[dict] = []
 
         # Header quick actions
@@ -1036,13 +1059,18 @@ class TasksDialog(P5FluidPanel):
         self.progress.setFixedHeight(6)
         self.body.addWidget(self.progress)
 
-        # Quick-add bar + High-priority toggle
+        # Quick-add bar + High-priority + Deadline toggle
         add_row = QHBoxLayout()
         add_row.setSpacing(6)
         self.input = QLineEdit()
         self.input.setPlaceholderText("Add a task and press Enter...")
         self.input.returnPressed.connect(self._add)
         add_row.addWidget(self.input, 1)
+
+        self._due_btn = self._btn("DUE", variant="soft", icon="clock", display=True, px=10)
+        self._due_btn.setToolTip("Set a deadline for the new task or selected task(s)")
+        self._due_btn.clicked.connect(self._toggle_due_bar)
+        add_row.addWidget(self._due_btn)
 
         self._prio_btn = self._btn("HIGH", variant="soft", icon="bolt", display=True, px=10)
         self._prio_btn.setToolTip("Mark new task as high priority")
@@ -1054,12 +1082,59 @@ class TasksDialog(P5FluidPanel):
         add_row.addWidget(add_btn)
         self.body.addLayout(add_row)
 
+        # Collapsible inline deadline card (applies to new task OR selected task(s))
+        self._due_box = _make_card("subcard")
+        dl = QVBoxLayout(self._due_box)
+        dl.setContentsMargins(10, 8, 10, 8)
+        dl.setSpacing(6)
+
+        dr1 = QHBoxLayout()
+        dr1.setSpacing(6)
+        self._due_check = P5CheckBox("Attach to new task", scale=sc)
+        self._due_check.toggled.connect(self._on_due_check_toggled)
+        dr1.addWidget(self._due_check)
+
+        self._due_edit = QDateTimeEdit()
+        self._due_edit.setCalendarPopup(True)
+        self._due_edit.setDisplayFormat("dd MMM yyyy HH:mm")
+        self._due_edit.setDateTime(_to_qdt(self._default_due()))
+        self._due_edit.setMinimumHeight(_sc(28, sc, 24))
+        self._due_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        dr1.addWidget(self._due_edit, 1)
+
+        apply_sel = self._btn("SET SELECTED", variant="gold", display=True, px=9)
+        apply_sel.setFixedHeight(_sc(26, sc, 22))
+        apply_sel.setToolTip("Apply this deadline to currently selected task(s)")
+        apply_sel.clicked.connect(self._apply_due_to_selected)
+        dr1.addWidget(apply_sel)
+
+        clear_sel = self._btn("CLEAR", variant="soft", display=True, px=9)
+        clear_sel.setFixedHeight(_sc(26, sc, 22))
+        clear_sel.setToolTip("Clear deadline on selected task(s) and new task")
+        clear_sel.clicked.connect(self._clear_due_selected)
+        dr1.addWidget(clear_sel)
+        dl.addLayout(dr1)
+
+        dr2 = QHBoxLayout()
+        dr2.setSpacing(_sc(5, sc, 4))
+        for text, kind in (("+1h", "1h"), ("+3h", "3h"), ("23:59", "eod"), ("Tomorrow 9:00", "tomorrow")):
+            pb = self._btn(text, variant="gold" if kind == "eod" else "soft", px=10)
+            pb.setFixedHeight(_sc(24, sc, 21))
+            if kind == "eod":
+                pb.setToolTip("Set deadline to 23:59 today (or tomorrow if past 23:59)")
+            pb.clicked.connect(lambda _c=False, k=kind: self._apply_due_preset(k))
+            dr2.addWidget(pb)
+        dr2.addStretch(1)
+        dl.addLayout(dr2)
+        self._due_box.setVisible(False)
+        self.body.addWidget(self._due_box)
+
         # Filter chips + compact inline search
         bar = QHBoxLayout()
-        bar.setSpacing(5)
+        bar.setSpacing(4)
         self._chips: dict[str, P5FluidButton] = {}
         for label, key in self.FILTERS:
-            chip = self._btn(label, variant="soft", display=True, px=10)
+            chip = self._btn(label, variant="soft", display=True, px=9)
             chip.setFixedHeight(_sc(26, sc, 22))
             chip.clicked.connect(lambda _c=False, k=key: self._set_filter(k))
             self._chips[key] = chip
@@ -1070,7 +1145,7 @@ class TasksDialog(P5FluidPanel):
         self.search_edit.setObjectName("searchInput")
         self.search_edit.setPlaceholderText("Search...")
         self.search_edit.setClearButtonEnabled(True)
-        self.search_edit.setMaximumWidth(_sc(150, sc, 110))
+        self.search_edit.setMaximumWidth(_sc(138, sc, 100))
         self.search_edit.textChanged.connect(self.refresh)
         bar.addWidget(self.search_edit)
         self.body.addLayout(bar)
@@ -1105,18 +1180,24 @@ class TasksDialog(P5FluidPanel):
         tip.setObjectName("tip")
         foot.addWidget(tip, 1)
 
-        tog_prio = self._btn("PRIORITY", variant="gold", icon="bolt", display=True, px=10)
+        tog_due = self._btn("SET DUE", variant="soft", icon="clock", display=True, px=9)
+        tog_due.setFixedHeight(_sc(28, sc, 24))
+        tog_due.setToolTip("Open deadline bar to set or clear deadline on selected task(s)")
+        tog_due.clicked.connect(self._open_due_for_selected)
+        foot.addWidget(tog_due)
+
+        tog_prio = self._btn("PRIORITY", variant="gold", icon="bolt", display=True, px=9)
         tog_prio.setFixedHeight(_sc(28, sc, 24))
         tog_prio.setToolTip("Toggle High priority on selected task(s)")
         tog_prio.clicked.connect(self._toggle_selected_priority)
         foot.addWidget(tog_prio)
 
-        del_btn = self._btn("DELETE", variant="danger", display=True, px=10)
+        del_btn = self._btn("DELETE", variant="danger", display=True, px=9)
         del_btn.setFixedHeight(_sc(28, sc, 24))
         del_btn.clicked.connect(self._delete_selected)
         foot.addWidget(del_btn)
 
-        clear_btn = self._btn("CLEAR DONE", variant="soft", display=True, px=10)
+        clear_btn = self._btn("CLEAR DONE", variant="soft", display=True, px=9)
         clear_btn.setFixedHeight(_sc(28, sc, 24))
         clear_btn.clicked.connect(self._clear_done)
         foot.addWidget(clear_btn)
@@ -1130,12 +1211,79 @@ class TasksDialog(P5FluidPanel):
         self._resort_timer.setInterval(420)
         self._resort_timer.timeout.connect(self.refresh)
 
+    @staticmethod
+    def _default_due() -> datetime:
+        now = datetime.now().replace(second=0, microsecond=0)
+        target = now.replace(hour=23, minute=59)
+        return target if target > now else (now + timedelta(hours=2))
+
     def on_shown(self) -> None:
         QTimer.singleShot(20, self.input.setFocus)
 
     def _toggle_new_priority(self) -> None:
         self._new_high = not self._new_high
         self._prio_btn.set_active(self._new_high, active_variant="gold")
+
+    def _toggle_due_bar(self) -> None:
+        vis = not self._due_box.isVisible()
+        self._due_box.setVisible(vis)
+        if vis and not self._new_due_on:
+            self._due_edit.setDateTime(_to_qdt(self._default_due()))
+            self._due_check.setChecked(True)
+        self._sync_due_btn()
+
+    def _open_due_for_selected(self) -> None:
+        sel = [i.data(ROLE_ID) for i in self.list.selectedItems() if i.data(ROLE_ID)]
+        if sel:
+            task = self.store.get(sel[0])
+            dl = parse_dt(task.get("deadline")) if task else None
+            self._due_edit.setDateTime(_to_qdt(dl or self._default_due()))
+        self._due_box.setVisible(True)
+        self._sync_due_btn()
+
+    def _on_due_check_toggled(self, checked: bool) -> None:
+        self._new_due_on = bool(checked)
+        self._sync_due_btn()
+
+    def _sync_due_btn(self) -> None:
+        self._due_btn.set_active(self._new_due_on, active_variant="gold")
+
+    def _apply_due_preset(self, kind: str) -> None:
+        now = datetime.now().replace(second=0, microsecond=0)
+        if kind == "1h":
+            target = now + timedelta(hours=1)
+        elif kind == "3h":
+            target = now + timedelta(hours=3)
+        elif kind == "eod":
+            target = now.replace(hour=23, minute=59)
+            if target <= now:
+                target += timedelta(days=1)
+        else:
+            target = (now + timedelta(days=1)).replace(hour=9, minute=0)
+        self._due_edit.setDateTime(_to_qdt(target))
+        self._due_check.setChecked(True)
+
+    def _apply_due_to_selected(self) -> None:
+        dt = _from_qdt(self._due_edit.dateTime())
+        changed = False
+        for item in self.list.selectedItems():
+            tid = item.data(ROLE_ID)
+            if tid and self.store.set_deadline(tid, dt):
+                changed = True
+        if changed:
+            self.refresh()
+            self.tasks_changed.emit()
+
+    def _clear_due_selected(self) -> None:
+        self._due_check.setChecked(False)
+        changed = False
+        for item in self.list.selectedItems():
+            tid = item.data(ROLE_ID)
+            if tid and self.store.set_deadline(tid, None):
+                changed = True
+        if changed:
+            self.refresh()
+            self.tasks_changed.emit()
 
     def _set_filter(self, key: str) -> None:
         self._filter = key
@@ -1150,15 +1298,38 @@ class TasksDialog(P5FluidPanel):
         self.progress.setValue(done)
         self._count_lbl.setText(f"{len(tasks) - done} LEFT · {done} DONE")
 
+    @staticmethod
+    def _due_badge(task: dict, now: datetime) -> tuple[str, bool]:
+        dl = parse_dt(task.get("deadline"))
+        if dl is None or task.get("done"):
+            return "", False
+        if dl <= now:
+            when = f"{dl:%H:%M}" if dl.date() == now.date() else f"{dl:%d %b}"
+            return f"OVERDUE {when}".upper(), True
+        if dl.date() == now.date():
+            return f"DUE {dl:%H:%M}", False
+        return f"DUE {dl:%d %b %H:%M}".upper(), False
+
     def refresh(self) -> None:
+        now = datetime.now()
         query = self.search_edit.text().strip().lower()
         tasks = self.store.all()
         pending = [t for t in tasks if not t.get("done")]
-        pending.sort(key=lambda t: (0 if t.get("priority") == "high" else 1))
+
+        def _sort_key(t: dict):
+            dl = parse_dt(t.get("deadline"))
+            is_ov = 0 if (dl is not None and dl <= now) else 1
+            prio = 0 if t.get("priority") == "high" else 1
+            has_dl = 0 if dl is not None else 1
+            dl_ts = dl.timestamp() if dl is not None else float("inf")
+            return (is_ov, prio, has_dl, dl_ts)
+
+        pending.sort(key=_sort_key)
         finished = [t for t in tasks if t.get("done")]
         pools = {
             "all": pending + finished,
             "todo": pending,
+            "due": [t for t in pending if t.get("deadline")],
             "high": [t for t in pending if t.get("priority") == "high"],
             "done": finished,
         }
@@ -1175,30 +1346,42 @@ class TasksDialog(P5FluidPanel):
                 msg = "No tasks yet.\nType one above and press Enter."
             elif self._filter == "todo":
                 msg = "All tasks completed! Nice work."
+            elif self._filter == "due":
+                msg = "No tasks with deadlines.\nClick DUE above to attach one!"
             elif self._filter == "high":
                 msg = "No high-priority tasks right now."
             else:
                 msg = "No completed tasks yet."
             self.list.addItem(_hint_item(msg))
         for t in shown:
+            badge_txt, is_overdue = self._due_badge(t, now)
             item = QListWidgetItem(t.get("title", ""))
             item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
                           | Qt.ItemFlag.ItemIsEditable)
             item.setData(ROLE_ID, t["id"])
             item.setData(ROLE_DONE, bool(t.get("done")))
             item.setData(ROLE_FLAG, t.get("priority") == "high")
+            item.setData(ROLE_BADGE, badge_txt)
+            item.setData(ROLE_OVERDUE, is_overdue)
             item.setData(ROLE_DATE, _fmt_time_12h(t.get("created")))
             self.list.addItem(item)
         self.list.blockSignals(False)
         self._update_status()
 
     def _add(self) -> None:
-        task = self.store.add(self.input.text(), priority="high" if self._new_high else "normal")
+        dl = _from_qdt(self._due_edit.dateTime()) if self._new_due_on else None
+        task = self.store.add(
+            self.input.text(),
+            priority="high" if self._new_high else "normal",
+            deadline=dl,
+        )
         if task is None:
             return
         self.input.clear()
         if self._new_high:
             self._toggle_new_priority()
+        if self._new_due_on:
+            self._due_check.setChecked(False)
         if self._filter == "done":
             self._set_filter("all")
         else:
@@ -1223,6 +1406,7 @@ class TasksDialog(P5FluidPanel):
             if done:
                 play_ui("select")
                 self._delegate.start_check_anim(task_id)
+                self.task_reward_eligible.emit(task_id)
                 self.task_completed.emit(task["title"], len(self.store.pending()))
             else:
                 play_ui("cancel")
@@ -1290,6 +1474,7 @@ class NotesDialog(P5FluidPanel):
     open_tasks = pyqtSignal()
     tasks_changed = pyqtSignal()
     notes_changed = pyqtSignal()
+    note_completed = pyqtSignal(str)          # emits note_id when marked done
 
     def __init__(self, store: NoteStore, task_store: TaskStore | None = None,
                  on_top: bool = True, ui_scale: float = 1.0) -> None:
@@ -1809,6 +1994,8 @@ class NotesDialog(P5FluidPanel):
         self.store.set_done(self._current_id, done)
         self._sync_flags_ui(bool(note.get("pinned")), done)
         self.refresh()
+        if done:
+            self.note_completed.emit(self._current_id)
         self.notes_changed.emit()
 
     def _save(self, silent: bool = False) -> bool:
@@ -1881,12 +2068,13 @@ class SettingsDialog(P5FluidPanel):
 
     def __init__(self, store: SettingsStore, get_on_top=None, get_autostart=None,
                  on_top: bool = True, ui_scale: float = 1.0) -> None:
-        super().__init__("SETTINGS", QSize(480, 725), on_top=on_top, ui_scale=ui_scale)
+        super().__init__("SETTINGS", QSize(500, 740), on_top=on_top, ui_scale=ui_scale)
         sc = self._ui_scale
         self.store = store
         self._get_on_top = get_on_top
         self._get_autostart = get_autostart
         self._saving = False
+        self._filling = False
         self._add_close_button()
 
         # Scrollable cards container (prevents widget squeezing on compact screens or 130-150% UI scale)
@@ -1901,7 +2089,30 @@ class SettingsDialog(P5FluidPanel):
         pad_x, pad_y = _sc(14, sc, 10), _sc(11, sc, 8)
         row_gap = _sc(7, sc, 5)
 
-        # Card 1: Bedtime reminder
+        # Card 1: Audio & Separate Volume Controls
+        c_aud = _make_card()
+        la = QVBoxLayout(c_aud)
+        la.setContentsMargins(pad_x, pad_y, pad_x, pad_y)
+        la.setSpacing(row_gap)
+        ha = QLabel("AUDIO & VOLUME")
+        ha.setObjectName("section")
+        la.addWidget(ha)
+        self.sound_check = P5CheckBox("Enable audio (Morgana voice & UI SFX)", scale=sc)
+        self.sound_check.toggled.connect(self._on_sound_toggle_preview)
+        la.addWidget(self.sound_check)
+
+        self.voice_slider, self._voice_val_lbl = self._vol_row(
+            la, "Morgana Voice", "TEST", self._test_voice
+        )
+        self.voice_slider.valueChanged.connect(self._on_voice_slider)
+
+        self.sfx_slider, self._sfx_val_lbl = self._vol_row(
+            la, "UI & Stats SFX", "TEST", self._test_sfx
+        )
+        self.sfx_slider.valueChanged.connect(self._on_sfx_slider)
+        cards_lay.addWidget(c_aud)
+
+        # Card 2: Bedtime reminder
         c1 = _make_card()
         l1 = QVBoxLayout(c1)
         l1.setContentsMargins(pad_x, pad_y, pad_x, pad_y)
@@ -1924,12 +2135,12 @@ class SettingsDialog(P5FluidPanel):
         self._row(l1, "Morgana speaks every", self.curfew_interval)
         cards_lay.addWidget(c1)
 
-        # Card 2: Event & note reminders
+        # Card 3: Event, Task & Note reminders
         c2 = _make_card()
         l2 = QVBoxLayout(c2)
         l2.setContentsMargins(pad_x, pad_y, pad_x, pad_y)
         l2.setSpacing(row_gap)
-        h2 = QLabel("EVENT & NOTE REMINDERS")
+        h2 = QLabel("EVENT, TASK & NOTE REMINDERS")
         h2.setObjectName("section")
         l2.addWidget(h2)
         self.event_window = QSpinBox()
@@ -1942,12 +2153,12 @@ class SettingsDialog(P5FluidPanel):
         self._row(l2, "Repeat every", self.event_interval)
         cards_lay.addWidget(c2)
 
-        # Card 3: Focus timer, audio & behavior
+        # Card 4: Focus timer, Companion & Behavior
         c3 = _make_card()
         l3 = QVBoxLayout(c3)
         l3.setContentsMargins(pad_x, pad_y, pad_x, pad_y)
         l3.setSpacing(row_gap)
-        h3 = QLabel("FOCUS, AUDIO & APP")
+        h3 = QLabel("FOCUS, COMPANION & APP")
         h3.setObjectName("section")
         l3.addWidget(h3)
         self.focus_spin = QSpinBox()
@@ -1963,20 +2174,17 @@ class SettingsDialog(P5FluidPanel):
         self.ui_scale_spin.setSingleStep(5)
         self.ui_scale_spin.setSuffix("%")
         self._row(l3, "UI size", self.ui_scale_spin)
-        self.sound_vol_spin = QSpinBox()
-        self.sound_vol_spin.setRange(0, 100)
-        self.sound_vol_spin.setSingleStep(5)
-        self.sound_vol_spin.setSuffix("%")
-        self._row(l3, "Audio volume", self.sound_vol_spin)
-        self.sound_check = P5CheckBox("Enable sound effects & Morgana voice", scale=sc)
+        self.briefing_check = P5CheckBox("Show Daily Briefing & Confidant Summary once a day", scale=sc)
+        self.auto_reward_check = P5CheckBox("Auto-reward Social Stats from tasks, notes & focus", scale=sc)
         self.on_top_check = P5CheckBox("Keep Morgana always on top", scale=sc)
         self.autostart_check = P5CheckBox("Start Morgana automatically on boot", scale=sc)
-        l3.addWidget(self.sound_check)
+        l3.addWidget(self.briefing_check)
+        l3.addWidget(self.auto_reward_check)
         l3.addWidget(self.on_top_check)
         l3.addWidget(self.autostart_check)
         cards_lay.addWidget(c3)
 
-        # Card 4: Radial menu tabs (enable/disable individual tabs)
+        # Card 5: Radial menu tabs (enable/disable individual tabs)
         c4 = _make_card()
         l4 = QVBoxLayout(c4)
         l4.setContentsMargins(pad_x, pad_y, pad_x, pad_y)
@@ -2047,25 +2255,111 @@ class SettingsDialog(P5FluidPanel):
         row.addWidget(widget)
         layout.addLayout(row)
 
+    def _vol_row(self, layout: QVBoxLayout, text: str, btn_text: str,
+                 on_test) -> tuple[QSlider, QLabel]:
+        sc = self._ui_scale
+        row = QHBoxLayout()
+        row.setSpacing(_sc(8, sc, 5))
+        lbl = QLabel(text)
+        lbl.setMinimumWidth(_sc(108, sc, 86))
+        lbl.setStyleSheet(f"color: #D6D6E2; font-size: {_sc(14, sc, 11)}px;")
+        row.addWidget(lbl)
+
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(0, 100)
+        slider.setSingleStep(5)
+        slider.setPageStep(10)
+        row.addWidget(slider, 1)
+
+        val_lbl = QLabel("80%")
+        val_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        val_lbl.setFixedWidth(_sc(40, sc, 32))
+        val_lbl.setStyleSheet(
+            f'color: #FAD02C; font-family: "Barlow Condensed", sans-serif; '
+            f'font-size: {_sc(13, sc, 10)}px; font-weight: 800;'
+        )
+        row.addWidget(val_lbl)
+
+        test_btn = self._btn(btn_text, variant="soft", display=True, px=9, sfx_click="")
+        test_btn.setFixedHeight(_sc(24, sc, 20))
+        test_btn.setToolTip(f"Preview {text} volume")
+        test_btn.clicked.connect(on_test)
+        row.addWidget(test_btn)
+        layout.addLayout(row)
+        return slider, val_lbl
+
+    def _on_sound_toggle_preview(self, checked: bool) -> None:
+        self.voice_slider.setEnabled(checked)
+        self.sfx_slider.setEnabled(checked)
+        if not self._filling and audio() is not None:
+            audio().set_enabled(bool(checked))
+
+    def _on_voice_slider(self, value: int) -> None:
+        self._voice_val_lbl.setText(f"{int(value)}%")
+        if not self._filling and audio() is not None:
+            audio().set_voice_volume(int(value))
+
+    def _on_sfx_slider(self, value: int) -> None:
+        self._sfx_val_lbl.setText(f"{int(value)}%")
+        if not self._filling and audio() is not None:
+            audio().set_sfx_volume(int(value))
+
+    def _test_voice(self) -> None:
+        mgr = audio()
+        if mgr is None:
+            return
+        mgr.set_enabled(self.sound_check.isChecked())
+        mgr.set_voice_volume(self.voice_slider.value())
+        play_voice("hmm")
+
+    def _test_sfx(self) -> None:
+        mgr = audio()
+        if mgr is None:
+            return
+        mgr.set_enabled(self.sound_check.isChecked())
+        mgr.set_sfx_volume(self.sfx_slider.value())
+        play_ui("open_window")
+
+    def on_closing(self) -> None:
+        """Restore persisted audio volumes if the user closed Settings without saving."""
+        mgr = audio()
+        if mgr is not None:
+            mgr.set_enabled(bool(self.store["sound_enabled"]))
+            mgr.set_volumes(int(self.store["voice_volume"]), int(self.store["sfx_volume"]))
+
     def _fill(self, values: dict) -> None:
-        self.curfew_check.setChecked(bool(values["curfew_enabled"]))
-        self.bed_edit.setTime(QTime.fromString(values["bedtime"], "HH:mm"))
-        self.wake_edit.setTime(QTime.fromString(values["wake"], "HH:mm"))
-        self.curfew_interval.setValue(int(values.get("curfew_interval_sec", SETTINGS_DEFAULTS["curfew_interval_sec"])))
-        self.event_window.setValue(int(values["event_window_min"]))
-        self.event_interval.setValue(int(values["event_interval_min"]))
-        self.focus_spin.setValue(int(values.get("focus_min", SETTINGS_DEFAULTS["focus_min"])))
-        self.rest_spin.setValue(int(values.get("rest_min", SETTINGS_DEFAULTS["rest_min"])))
-        self.ui_scale_spin.setValue(int(values.get("ui_scale", SETTINGS_DEFAULTS["ui_scale"])))
-        self.sound_check.setChecked(bool(values.get("sound_enabled", SETTINGS_DEFAULTS["sound_enabled"])))
-        self.sound_vol_spin.setValue(int(values.get("sound_volume", SETTINGS_DEFAULTS["sound_volume"])))
-        enabled = set(values.get("enabled_tabs", RADIAL_TAB_KEYS))
-        for key, cb in self.tab_checks.items():
-            cb.setChecked(key in enabled)
-        if self._get_on_top is not None:
-            self.on_top_check.setChecked(bool(self._get_on_top()))
-        if self._get_autostart is not None:
-            self.autostart_check.setChecked(bool(self._get_autostart()))
+        self._filling = True
+        try:
+            self.curfew_check.setChecked(bool(values["curfew_enabled"]))
+            self.bed_edit.setTime(QTime.fromString(values["bedtime"], "HH:mm"))
+            self.wake_edit.setTime(QTime.fromString(values["wake"], "HH:mm"))
+            self.curfew_interval.setValue(int(values.get("curfew_interval_sec", SETTINGS_DEFAULTS["curfew_interval_sec"])))
+            self.event_window.setValue(int(values["event_window_min"]))
+            self.event_interval.setValue(int(values["event_interval_min"]))
+            self.focus_spin.setValue(int(values.get("focus_min", SETTINGS_DEFAULTS["focus_min"])))
+            self.rest_spin.setValue(int(values.get("rest_min", SETTINGS_DEFAULTS["rest_min"])))
+            self.ui_scale_spin.setValue(int(values.get("ui_scale", SETTINGS_DEFAULTS["ui_scale"])))
+            sound_on = bool(values.get("sound_enabled", SETTINGS_DEFAULTS["sound_enabled"]))
+            self.sound_check.setChecked(sound_on)
+            v_vol = int(values.get("voice_volume", SETTINGS_DEFAULTS["voice_volume"]))
+            s_vol = int(values.get("sfx_volume", SETTINGS_DEFAULTS["sfx_volume"]))
+            self.voice_slider.setValue(v_vol)
+            self.sfx_slider.setValue(s_vol)
+            self._voice_val_lbl.setText(f"{v_vol}%")
+            self._sfx_val_lbl.setText(f"{s_vol}%")
+            self.voice_slider.setEnabled(sound_on)
+            self.sfx_slider.setEnabled(sound_on)
+            self.briefing_check.setChecked(bool(values.get("morning_briefing", SETTINGS_DEFAULTS["morning_briefing"])))
+            self.auto_reward_check.setChecked(bool(values.get("auto_stat_rewards", SETTINGS_DEFAULTS["auto_stat_rewards"])))
+            enabled = set(values.get("enabled_tabs", RADIAL_TAB_KEYS))
+            for key, cb in self.tab_checks.items():
+                cb.setChecked(key in enabled)
+            if self._get_on_top is not None:
+                self.on_top_check.setChecked(bool(self._get_on_top()))
+            if self._get_autostart is not None:
+                self.autostart_check.setChecked(bool(self._get_autostart()))
+        finally:
+            self._filling = False
 
     def refresh(self) -> None:
         if self._saving:
@@ -2082,13 +2376,15 @@ class SettingsDialog(P5FluidPanel):
         try:
             for w in (self.bed_edit, self.wake_edit, self.curfew_interval,
                       self.event_window, self.event_interval, self.focus_spin,
-                      self.rest_spin, self.ui_scale_spin, self.sound_vol_spin):
+                      self.rest_spin, self.ui_scale_spin):
                 w.interpretText()
             chosen_tabs = [k for k in RADIAL_TAB_KEYS if self.tab_checks[k].isChecked()]
             if not chosen_tabs:
                 self.status.setText("Keep at least one radial menu tab enabled.")
                 return
             b, w = self.bed_edit.time(), self.wake_edit.time()
+            v_vol = int(self.voice_slider.value())
+            s_vol = int(self.sfx_slider.value())
             self.store.set(
                 bedtime=f"{b.hour():02d}:{b.minute():02d}",
                 wake=f"{w.hour():02d}:{w.minute():02d}",
@@ -2100,7 +2396,11 @@ class SettingsDialog(P5FluidPanel):
                 rest_min=self.rest_spin.value(),
                 ui_scale=self.ui_scale_spin.value(),
                 sound_enabled=self.sound_check.isChecked(),
-                sound_volume=self.sound_vol_spin.value(),
+                sound_volume=max(v_vol, s_vol),
+                voice_volume=v_vol,
+                sfx_volume=s_vol,
+                morning_briefing=self.briefing_check.isChecked(),
+                auto_stat_rewards=self.auto_reward_check.isChecked(),
                 enabled_tabs=chosen_tabs,
             )
             self.saved.emit()
@@ -2171,25 +2471,37 @@ def _clear_layout(layout) -> None:
 
 
 class EventsDialog(P5FluidPanel):
-    """7-day weekly calendar window with a dedicated Morgana next-event briefing card."""
+    """7-day weekly calendar window with local events, Google Calendar, task/note deadlines, and Morgana briefing."""
 
     refresh_requested = pyqtSignal(bool)     # True = allow interactive OAuth sign-in
+    local_events_changed = pyqtSignal()
     open_tasks = pyqtSignal()
     open_notes = pyqtSignal()
     open_settings = pyqtSignal()
 
-    def __init__(self, on_top: bool = True, ui_scale: float = 1.0) -> None:
-        super().__init__("EVENTS", QSize(580, 650), on_top=on_top, ui_scale=ui_scale)
+    def __init__(self, local_events: LocalEventStore | None = None,
+                 on_top: bool = True, ui_scale: float = 1.0) -> None:
+        super().__init__("EVENTS", QSize(645, 670), on_top=on_top, ui_scale=ui_scale)
         sc = self._ui_scale
+        self.local_store = local_events
         self._result: CalendarResult = CalendarResult([], "ok")
         self._selected_day: date | None = None    # None = ALL 7 DAYS
         self._loading = False
+        self._editing_local_id: str | None = None
+        self._undo_event: dict | None = None
         self._day_btns: dict[date | None, P5FluidButton] = {}
 
         # Header quick actions
         self._count_lbl = QLabel("")
         self._count_lbl.setObjectName("subhead")
         self.header_bar.addWidget(self._count_lbl)
+
+        self._new_ev_btn = self._btn("EVENT", variant="primary", icon="plus", display=True, px=10)
+        self._new_ev_btn.setToolTip("Create a local event (works offline without Google Calendar)")
+        self._new_ev_btn.clicked.connect(self._toggle_new_event_form)
+        if self.local_store is None:
+            self._new_ev_btn.hide()
+        self.header_bar.addWidget(self._new_ev_btn)
 
         self._hdr_refresh = self._btn("", variant="soft", icon="refresh")
         self._hdr_refresh.setFixedSize(_sc(30, sc, 24), _sc(30, sc, 24))
@@ -2264,6 +2576,82 @@ class EventsDialog(P5FluidPanel):
         bl.addLayout(speech_col, 1)
         self.body.addWidget(self._brief_card)
 
+        # Collapsible Local Event Creator / Editor card
+        self._ev_form_box = _make_card("subcard")
+        ef = QVBoxLayout(self._ev_form_box)
+        ef.setContentsMargins(_sc(10, sc, 8), _sc(8, sc, 6), _sc(10, sc, 8), _sc(8, sc, 6))
+        ef.setSpacing(_sc(6, sc, 4))
+
+        ef_r1 = QHBoxLayout()
+        ef_r1.setSpacing(6)
+        self._ev_title_edit = QLineEdit()
+        self._ev_title_edit.setPlaceholderText("Local event title (e.g. Study Group, Dentist, Game Night)...")
+        self._ev_title_edit.returnPressed.connect(self._save_local_event)
+        ef_r1.addWidget(self._ev_title_edit, 1)
+
+        self._ev_all_day = P5CheckBox("All day", scale=sc)
+        self._ev_all_day.toggled.connect(self._on_ev_all_day_toggled)
+        ef_r1.addWidget(self._ev_all_day)
+        ef.addLayout(ef_r1)
+
+        ef_r2 = QHBoxLayout()
+        ef_r2.setSpacing(6)
+        st_lbl = QLabel("Start")
+        st_lbl.setObjectName("tip")
+        ef_r2.addWidget(st_lbl)
+        self._ev_start = QDateTimeEdit()
+        self._ev_start.setCalendarPopup(True)
+        self._ev_start.setDisplayFormat("dd MMM HH:mm")
+        self._ev_start.setMinimumHeight(_sc(28, sc, 24))
+        self._ev_start.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._ev_start.dateTimeChanged.connect(self._on_ev_start_changed)
+        ef_r2.addWidget(self._ev_start, 1)
+
+        self._ev_end_lbl = QLabel("End")
+        self._ev_end_lbl.setObjectName("tip")
+        ef_r2.addWidget(self._ev_end_lbl)
+        self._ev_end = QDateTimeEdit()
+        self._ev_end.setCalendarPopup(True)
+        self._ev_end.setDisplayFormat("dd MMM HH:mm")
+        self._ev_end.setMinimumHeight(_sc(28, sc, 24))
+        self._ev_end.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        ef_r2.addWidget(self._ev_end, 1)
+        ef.addLayout(ef_r2)
+
+        ef_r3 = QHBoxLayout()
+        ef_r3.setSpacing(_sc(5, sc, 4))
+        for text, kind in (("+1h", "1h"), ("23:59", "eod"), ("Tmrw 9:00", "tomorrow")):
+            pb = self._btn(text, variant="gold" if kind == "eod" else "soft", px=10)
+            pb.setFixedHeight(_sc(24, sc, 20))
+            pb.clicked.connect(lambda _c=False, k=kind: self._apply_ev_preset(k))
+            ef_r3.addWidget(pb)
+        self._ev_loc_edit = QLineEdit()
+        self._ev_loc_edit.setPlaceholderText("Location (optional)...")
+        self._ev_loc_edit.setFixedHeight(_sc(26, sc, 22))
+        self._ev_loc_edit.returnPressed.connect(self._save_local_event)
+        ef_r3.addWidget(self._ev_loc_edit, 1)
+        ef.addLayout(ef_r3)
+
+        ef_r4 = QHBoxLayout()
+        ef_r4.setSpacing(6)
+        self._ev_err = QLabel("")
+        self._ev_err.setStyleSheet(f'color: #FF5E6B; font-size: {_sc(12, sc, 10)}px; font-weight: bold;')
+        ef_r4.addWidget(self._ev_err, 1)
+
+        cancel_ev = self._btn("CANCEL", variant="soft", display=True, px=9)
+        cancel_ev.setFixedHeight(_sc(26, sc, 22))
+        cancel_ev.clicked.connect(self._close_event_form)
+        ef_r4.addWidget(cancel_ev)
+
+        self._ev_save_btn = self._btn("SAVE EVENT", variant="primary", icon="plus", display=True, px=10)
+        self._ev_save_btn.setFixedHeight(_sc(26, sc, 22))
+        self._ev_save_btn.clicked.connect(self._save_local_event)
+        ef_r4.addWidget(self._ev_save_btn)
+        ef.addLayout(ef_r4)
+
+        self._ev_form_box.setVisible(False)
+        self.body.addWidget(self._ev_form_box)
+
         # 7-day filter strip
         self._day_strip = QHBoxLayout()
         self._day_strip.setSpacing(_sc(4, sc, 3))
@@ -2280,17 +2668,24 @@ class EventsDialog(P5FluidPanel):
         self._scroll.setFrameShape(QFrame.Shape.NoFrame)
         self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._scroll_body = QWidget()
+        self._scroll_body.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
         self._days_lay = QVBoxLayout(self._scroll_body)
+        self._days_lay.setSizeConstraint(QVBoxLayout.SizeConstraint.SetMinimumSize)
         self._days_lay.setContentsMargins(2, 2, _sc(6, sc, 4), 4)
         self._days_lay.setSpacing(_sc(8, sc, 5))
         self._scroll.setWidget(self._scroll_body)
         lc_lay.addWidget(self._scroll)
         self.body.addWidget(list_card, 1)
 
+        # Undo strip for deleted local events
+        self._undo = UndoBar(scale=sc)
+        self._undo.undo_clicked.connect(self._undo_delete_local)
+        self.body.addWidget(self._undo)
+
         # Footer
         foot = QHBoxLayout()
         foot.setSpacing(8)
-        self._foot_tip = QLabel("7-day calendar & note deadlines")
+        self._foot_tip = QLabel("7-day calendar, local events & deadlines")
         self._foot_tip.setObjectName("tip")
         self._foot_tip.setWordWrap(True)
         foot.addWidget(self._foot_tip, 1)
@@ -2303,8 +2698,123 @@ class EventsDialog(P5FluidPanel):
 
         QShortcut(QKeySequence("F5"), self).activated.connect(lambda: self.refresh_requested.emit(True))
         QShortcut(QKeySequence("Ctrl+R"), self).activated.connect(lambda: self.refresh_requested.emit(True))
+        QShortcut(QKeySequence("Ctrl+N"), self).activated.connect(self._toggle_new_event_form)
         QShortcut(QKeySequence("Ctrl+,"), self).activated.connect(lambda: self.open_settings.emit())
 
+    # -- Local Event Form ----------------------------------------------------
+    def _default_ev_times(self) -> tuple[datetime, datetime]:
+        now = datetime.now().replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        if self._selected_day is not None and self._selected_day != now.date():
+            now = datetime(self._selected_day.year, self._selected_day.month, self._selected_day.day, 10, 0)
+        return now, now + timedelta(hours=1)
+
+    def _toggle_new_event_form(self) -> None:
+        if self.local_store is None:
+            return
+        if self._ev_form_box.isVisible() and self._editing_local_id is None:
+            self._close_event_form()
+            return
+        self._editing_local_id = None
+        st, en = self._default_ev_times()
+        self._ev_title_edit.clear()
+        self._ev_loc_edit.clear()
+        self._ev_all_day.setChecked(False)
+        self._ev_start.setDateTime(_to_qdt(st))
+        self._ev_end.setDateTime(_to_qdt(en))
+        self._ev_err.setText("")
+        self._ev_save_btn.setText("SAVE EVENT")
+        self._ev_form_box.setVisible(True)
+        self._ev_title_edit.setFocus()
+
+    def _edit_local_event(self, raw_id: str) -> None:
+        if self.local_store is None:
+            return
+        ev = self.local_store.get(raw_id)
+        if ev is None:
+            return
+        self._editing_local_id = raw_id
+        st = parse_dt(ev.get("start")) or datetime.now()
+        en = parse_dt(ev.get("end")) or (st + timedelta(hours=1))
+        self._ev_title_edit.setText(ev.get("title", ""))
+        self._ev_loc_edit.setText(ev.get("location", ""))
+        self._ev_all_day.setChecked(bool(ev.get("all_day")))
+        self._ev_start.setDateTime(_to_qdt(st))
+        self._ev_end.setDateTime(_to_qdt(en))
+        self._ev_err.setText("")
+        self._ev_save_btn.setText("UPDATE EVENT")
+        self._ev_form_box.setVisible(True)
+        self._ev_title_edit.setFocus()
+
+    def _close_event_form(self) -> None:
+        self._editing_local_id = None
+        self._ev_err.setText("")
+        self._ev_form_box.setVisible(False)
+
+    def _on_ev_all_day_toggled(self, checked: bool) -> None:
+        self._ev_start.setDisplayFormat("dd MMM yyyy" if checked else "dd MMM HH:mm")
+        self._ev_end.setVisible(not checked)
+        self._ev_end_lbl.setVisible(not checked)
+
+    def _on_ev_start_changed(self, qdt: QDateTime) -> None:
+        if not self._ev_all_day.isChecked() and self._ev_end.dateTime() <= qdt:
+            self._ev_end.setDateTime(qdt.addSecs(3600))
+
+    def _apply_ev_preset(self, kind: str) -> None:
+        now = datetime.now().replace(second=0, microsecond=0)
+        self._ev_all_day.setChecked(False)
+        if kind == "1h":
+            st = now + timedelta(hours=1)
+            en = st + timedelta(hours=1)
+        elif kind == "eod":
+            st = now.replace(hour=23, minute=59)
+            if st <= now:
+                st += timedelta(days=1)
+            en = st + timedelta(minutes=30)
+        else:
+            st = (now + timedelta(days=1)).replace(hour=9, minute=0)
+            en = st + timedelta(hours=1)
+        self._ev_start.setDateTime(_to_qdt(st))
+        self._ev_end.setDateTime(_to_qdt(en))
+
+    def _save_local_event(self) -> None:
+        if self.local_store is None:
+            return
+        title = self._ev_title_edit.text().strip()
+        if not title:
+            self._ev_err.setText("Please enter an event title.")
+            self._ev_title_edit.setFocus()
+            return
+        all_day = self._ev_all_day.isChecked()
+        st = _from_qdt(self._ev_start.dateTime())
+        en = None if all_day else _from_qdt(self._ev_end.dateTime())
+        loc = self._ev_loc_edit.text().strip()
+        if self._editing_local_id:
+            self.local_store.update(self._editing_local_id, title, st, en, all_day=all_day, location=loc)
+        else:
+            self.local_store.add(title, st, en, all_day=all_day, location=loc)
+        self._close_event_form()
+        self.local_events_changed.emit()
+
+    def _delete_local_event(self, raw_id: str) -> None:
+        if self.local_store is None:
+            return
+        ev = self.local_store.get(raw_id)
+        if ev is None:
+            return
+        self._undo_event = dict(ev)
+        self.local_store.delete(raw_id)
+        if self._editing_local_id == raw_id:
+            self._close_event_form()
+        self.local_events_changed.emit()
+        self._undo.trigger(f"Deleted event '{ev.get('title', '')[:30]}'.")
+
+    def _undo_delete_local(self) -> None:
+        if self.local_store is not None and self._undo_event is not None:
+            self.local_store.restore(self._undo_event)
+            self._undo_event = None
+            self.local_events_changed.emit()
+
+    # -- View state ----------------------------------------------------------
     def set_loading(self, loading: bool) -> None:
         self._loading = bool(loading)
         if loading:
@@ -2339,22 +2849,26 @@ class EventsDialog(P5FluidPanel):
         # Header count & footer note
         all_shown = [ev for _, evs in grouped for ev in evs]
         total = len(all_shown)
-        n_notes = sum(1 for ev in all_shown if ev.source == "note")
-        n_cal = total - n_notes
-        note_suffix = (f" · {n_notes} NOTE" + ("" if n_notes == 1 else "S")) if n_notes else ""
+        n_deadlines = sum(1 for ev in all_shown if ev.source in ("note", "task"))
+        n_events = total - n_deadlines
+        due_suffix = (f" · {n_deadlines} DUE" if n_deadlines else "")
         if res.status == "error":
-            self._count_lbl.setText(f"OFFLINE{note_suffix}")
-            self._foot_tip.setText(f"Calendar sync failed: {res.message} · Note deadlines still shown.")
+            self._count_lbl.setText(f"OFFLINE · {total}")
+            self._foot_tip.setText(f"Google offline ({res.message}) · Local events & deadlines still active.")
         elif res.status == "auth_needed":
-            self._count_lbl.setText(f"SIGN IN{note_suffix}")
-            self._foot_tip.setText("Google Calendar token expired. Click SIGN IN to reconnect · Note deadlines still shown.")
+            self._count_lbl.setText(f"SIGN IN · {total}")
+            self._foot_tip.setText("Google token expired. Click SIGN IN to reconnect · Local events & deadlines still active.")
         elif res.is_dummy:
-            self._count_lbl.setText(f"SAMPLE · {total} ITEMS")
-            self._foot_tip.setText("Sample 7-day calendar + your Note deadlines · add credentials.json to sync Google Calendar.")
+            self._count_lbl.setText(f"SAMPLE · {total}")
+            self._foot_tip.setText("Click + EVENT to add local events (replaces sample week) or add credentials.json for Google.")
+        elif res.status in ("no_credentials", "no_libs"):
+            word = "EVENT" if n_events == 1 else "EVENTS"
+            self._count_lbl.setText(f"{n_events} {word}{due_suffix}")
+            self._foot_tip.setText("Local events + Task & Note deadlines · Ctrl+N for new event · add credentials.json for Google.")
         else:
-            word = "EVENT" if n_cal == 1 else "EVENTS"
-            self._count_lbl.setText(f"{n_cal} {word}{note_suffix}")
-            self._foot_tip.setText("Google Calendar + Note deadlines · 7-day schedule · F5 to refresh")
+            word = "EVENT" if n_events == 1 else "EVENTS"
+            self._count_lbl.setText(f"{n_events} {word}{due_suffix}")
+            self._foot_tip.setText("Google + Local events + Task & Note deadlines · F5 to refresh · Ctrl+N to add")
 
         # Morgana briefing banner
         tag, speech = morgana_briefing(res, now=now)
@@ -2378,7 +2892,7 @@ class EventsDialog(P5FluidPanel):
                 f'font-family: "Barlow Condensed", "Arsenal", sans-serif; font-weight: 800; '
                 f'font-size: {_sc(11, sc, 9)}px;'
             )
-        elif "NOTE DEADLINE" in tag:
+        elif "DEADLINE" in tag:
             self._brief_card.set_accent(GOLD)
             self._brief_tag.setStyleSheet(
                 f'background: #2B2208; color: #FAD02C; border: 1px solid #6C5514; '
@@ -2442,6 +2956,7 @@ class EventsDialog(P5FluidPanel):
             hdr = QHBoxLayout()
             hdr.setContentsMargins(2, _sc(4, sc, 2), 2, 0)
             dlbl = QLabel(title)
+            dlbl.setMinimumHeight(_sc(20, sc, 16))
             dlbl.setStyleSheet(
                 f'color: {title_col}; font-family: "Barlow Condensed", "Anton", sans-serif; '
                 f'font-size: {_sc(14, sc, 11)}px; font-weight: 800;'
@@ -2450,6 +2965,7 @@ class EventsDialog(P5FluidPanel):
             hdr.addStretch(1)
             cnt_txt = f"{len(evs)} ITEM" + ("" if len(evs) == 1 else "S") if evs else "CLEAR"
             clbl = QLabel(cnt_txt)
+            clbl.setMinimumHeight(_sc(18, sc, 14))
             clbl.setStyleSheet(
                 f'color: {"#FAD02C" if evs else "#66667A"}; '
                 f'font-family: "Barlow Condensed", sans-serif; '
@@ -2459,8 +2975,9 @@ class EventsDialog(P5FluidPanel):
             self._days_lay.addLayout(hdr)
 
             if not evs:
-                empty = QLabel("No events or note deadlines." if self._selected_day is None
+                empty = QLabel("No events or deadlines." if self._selected_day is None
                                else "Your schedule is clear on this day!")
+                empty.setMinimumHeight(_sc(24, sc, 19))
                 empty.setStyleSheet(
                     f'color: #6B6B7F; padding: {_sc(4, sc, 2)}px {_sc(8, sc, 6)}px; '
                     f'font-size: {_sc(12, sc, 10)}px; font-style: italic;'
@@ -2469,24 +2986,27 @@ class EventsDialog(P5FluidPanel):
                 continue
 
             for ev in evs:
-                is_note = ev.source == "note"
-                is_overdue = is_note and ev.start <= now
-                is_now = (not is_note and not ev.all_day and ev.start <= now and (ev.end is None or ev.end > now))
+                is_deadline = ev.source in ("note", "task")
+                is_local = ev.source == "local"
+                is_overdue = is_deadline and ev.start <= now
+                is_now = (not is_deadline and not ev.all_day and ev.start <= now and (ev.end is None or ev.end > now))
                 is_next = (next_ev is not None and ev is next_ev)
-                is_past = (not is_note and not ev.all_day and (ev.end or ev.start) <= now and not is_now)
+                is_past = (not is_deadline and not ev.all_day and (ev.end or ev.start) <= now and not is_now)
 
                 row_card = _make_card("subcard")
+                row_card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+                row_card.setMinimumHeight(_sc(42, sc, 34))
                 if is_now or is_overdue:
                     row_card.setStyleSheet(
                         "QFrame#subcard { background-color: #2A0C11; border: 1.5px solid #E60012; border-radius: 8px; }"
                     )
-                elif is_next or is_note:
+                elif is_next or is_deadline:
                     row_card.setStyleSheet(
                         "QFrame#subcard { background-color: #221B0A; border: 1.5px solid #6C5514; border-radius: 8px; }"
                     )
                 rl = QHBoxLayout(row_card)
                 rl.setContentsMargins(_sc(10, sc, 7), _sc(7, sc, 5), _sc(10, sc, 7), _sc(7, sc, 5))
-                rl.setSpacing(_sc(8, sc, 6))
+                rl.setSpacing(_sc(7, sc, 5))
 
                 # Time column
                 if ev.all_day:
@@ -2497,7 +3017,7 @@ class EventsDialog(P5FluidPanel):
                         f'font-family: "Barlow Condensed", sans-serif; font-weight: 800; '
                         f'font-size: {_sc(12, sc, 10)}px;'
                     )
-                elif is_note:
+                elif is_deadline:
                     time_txt = f"DUE {ev.start:%H:%M}" if ev.start.date() == d else f"{ev.start:%d %b %H:%M}"
                     time_style = (
                         f'color: {"#FF5E6B" if is_overdue else "#FAD02C"}; '
@@ -2514,22 +3034,31 @@ class EventsDialog(P5FluidPanel):
                     )
                 tlbl = QLabel(time_txt)
                 tlbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                tlbl.setFixedWidth(_sc(94, sc, 76))
+                tlbl.setFixedWidth(_sc(92, sc, 74))
                 tlbl.setStyleSheet(time_style)
                 rl.addWidget(tlbl)
 
-                # Source pill for Note Deadlines
-                if is_note:
-                    src_lbl = QLabel("NOTE")
+                # Source pill for Local Events, Task Deadlines, and Note Deadlines
+                if ev.source in ("local", "task", "note"):
+                    pill_map = {
+                        "local": ("LOCAL", "#10281E", "#5CE09A", "#245943"),
+                        "task":  ("TASK",  "#2B2208", "#FAD02C", "#6C5514"),
+                        "note":  ("NOTE",  "#360A10", "#FF7882", "#731823"),
+                    }
+                    ptxt, pbg, pfg, pbd = pill_map[ev.source]
+                    src_lbl = QLabel(ptxt)
                     src_lbl.setStyleSheet(
-                        f'background: #360A10; color: #FF7882; border: 1px solid #731823; '
+                        f'background: {pbg}; color: {pfg}; border: 1px solid {pbd}; '
                         f'border-radius: 4px; padding: 1px {_sc(5, sc, 4)}px; '
                         f'font-family: "Barlow Condensed", sans-serif; font-weight: 800; '
                         f'font-size: {_sc(10, sc, 8)}px;'
                     )
                     rl.addWidget(src_lbl)
 
-                # Title
+                # Title (+ optional location subtitle)
+                t_col = QVBoxLayout()
+                t_col.setContentsMargins(0, 0, 0, 0)
+                t_col.setSpacing(1)
                 elbl = QLabel(ev.title)
                 elbl.setWordWrap(True)
                 elbl.setStyleSheet(
@@ -2537,7 +3066,12 @@ class EventsDialog(P5FluidPanel):
                     f'font-family: "Arsenal", "Optima", "Segoe UI", sans-serif; '
                     f'font-size: {_sc(14, sc, 11)}px; font-weight: bold;'
                 )
-                rl.addWidget(elbl, 1)
+                t_col.addWidget(elbl)
+                if ev.location:
+                    loc_lbl = QLabel(ev.location)
+                    loc_lbl.setStyleSheet(f'color: #9292A4; font-size: {_sc(11, sc, 9)}px;')
+                    t_col.addWidget(loc_lbl)
+                rl.addLayout(t_col, 1)
 
                 # Status chip
                 badge_txt, badge_css = "", ""
@@ -2561,6 +3095,20 @@ class EventsDialog(P5FluidPanel):
                         f'font-size: {_sc(11, sc, 9)}px;'
                     )
                     rl.addWidget(blbl)
+
+                # Local event quick Edit & Delete actions
+                if is_local and self.local_store is not None and ev.id.startswith("local:"):
+                    raw_id = ev.id[len("local:"):]
+                    eb = self._btn("EDIT", variant="soft", display=True, px=9)
+                    eb.setFixedHeight(_sc(22, sc, 19))
+                    eb.clicked.connect(lambda _c=False, eid=raw_id: self._edit_local_event(eid))
+                    rl.addWidget(eb)
+
+                    db_btn = self._btn("DEL", variant="danger", display=True, px=9)
+                    db_btn.setFixedHeight(_sc(22, sc, 19))
+                    db_btn.clicked.connect(lambda _c=False, eid=raw_id: self._delete_local_event(eid))
+                    rl.addWidget(db_btn)
+
                 self._days_lay.addWidget(row_card)
 
         self._days_lay.addStretch(1)
@@ -2674,9 +3222,7 @@ class SocialPentagonWidget(QWidget):
         for a in angles:
             p.drawLine(QPointF(cx, cy), QPointF(cx + math.cos(a) * radius, cy + math.sin(a) * radius))
 
-        # Filled stat polygon (animates smoothly on point gain!)
-        max_pts = max(100, max(self._totals.values(), default=0))
-        cap = ((max_pts + 19) // 20) * 20
+        # Filled stat polygon mapped directly to Persona 5 Ranks 1..5 rings
         pulse = clamp(self._pulse.value)
         burst = clamp(self._rank_flash.value)
         data_pts: list[QPointF] = []
@@ -2684,7 +3230,7 @@ class SocialPentagonWidget(QWidget):
         for i, key in enumerate(SOCIAL_STAT_KEYS):
             a = angles[i]
             pts = max(0.0, self._anim_pts[key].value)
-            frac = max(0.14, min(1.0, pts / float(cap)))
+            frac = stat_pentagon_fraction(pts)
             if key == self._selected and pulse > 0.01:
                 frac = min(1.05, frac + 0.05 * pulse)
             data_pts.append(QPointF(cx + math.cos(a) * radius * frac, cy + math.sin(a) * radius * frac))
@@ -2714,16 +3260,17 @@ class SocialPentagonWidget(QWidget):
             a = angles[i]
             dpt = data_pts[i]
             is_sel = key == self._selected
+            lv = stat_level(self._totals.get(key, 0))
+            is_mastery = lv > len(STAT_RANK_THRESHOLDS)
             p.setPen(QPen(WHITE if is_sel else GOLD, 2.0 if is_sel else 1.4))
-            p.setBrush(RED if is_sel else BLACK)
+            p.setBrush(GOLD if is_mastery else (RED if is_sel else BLACK))
             dot_r = (5.0 if is_sel else 3.8) * sc
             p.drawEllipse(dpt, dot_r, dot_r)
 
             # Label placement around vertex
             meta = SOCIAL_STATS[key]
             name = meta["label"].upper()
-            lv = stat_level(self._totals.get(key, 0))
-            lv_txt = f"LV {lv}"
+            lv_txt = f"LV {lv} ★" if is_mastery else f"LV {lv}"
             nw = fm_l.horizontalAdvance(name)
             vw = fm_v.horizontalAdvance(lv_txt) + int(10 * sc)
             lh = fm_l.height()
@@ -2847,25 +3394,213 @@ class StatLogDelegate(QStyledItemDelegate):
         p.restore()
 
 
-class SocialStatsDialog(P5FluidPanel):
-    """Persona 5 Royal inspired Social Stats tracker (5 stats, 20 pts/level, daily 2h time blocks)."""
+class HabitRowDelegate(QStyledItemDelegate):
+    """Paints Persona 5 custom daily habit rows with spring checkbox, stat pill, +pts, and streak badge."""
 
-    stat_logged = pyqtSignal(str, str, int, int, int)    # stat, activity, pts, old_lv, new_lv
+    CHECK_POINTS = ((-4.8, 0.4), (-1.4, 3.8), (5.2, -4.2))
+
+    def __init__(self, view: QListWidget, scale: float = 1.0) -> None:
+        super().__init__(view)
+        self._sc = max(0.75, min(1.5, float(scale)))
+        self._springs: dict[str, Spring] = {}
+        self._swallow_release = False
+        self._title_font = ui_font(_sc(14, self._sc, 11), bold=True)
+        self._done_font = ui_font(_sc(14, self._sc, 11), bold=True)
+        self._done_font.setStrikeOut(True)
+        self._pill_font = p5_font(_sc(10, self._sc, 8), italic=False)
+        self._hint_font = ui_font(_sc(13, self._sc, 10), bold=False)
+        self._ticker = FrameTicker(self._frame, self)
+
+    def start_check_anim(self, item_id: str) -> None:
+        sp = Spring(0.0, 420.0)
+        sp.target = 1.0
+        self._springs[item_id] = sp
+        self._ticker.start()
+
+    def clear_anim(self, item_id: str) -> None:
+        self._springs.pop(item_id, None)
+
+    def _frame(self, dt: float) -> bool:
+        for k in list(self._springs):
+            if not self._springs[k].step(dt):
+                del self._springs[k]
+        view = self.parent()
+        if view is not None:
+            view.viewport().update()
+        return bool(self._springs)
+
+    def _box_rect(self, card: QRectF) -> QRectF:
+        bs = 20.0 * self._sc
+        return QRectF(card.left() + 12.0 * self._sc, card.center().y() - bs / 2.0, bs, bs)
+
+    def sizeHint(self, option, index) -> QSize:
+        if index.data(ROLE_ID) is None:
+            return QSize(120, _sc(84, self._sc, 64))
+        return QSize(120, _sc(58, self._sc, 46))
+
+    def _paint_checkbox(self, p: QPainter, box: QRectF, done: bool, prog: float) -> None:
+        p.save()
+        if done:
+            p.setPen(QPen(WHITE, 1.5))
+            p.setBrush(RED)
+            p.drawRoundedRect(box, 4.0, 4.0)
+            if prog > 0.01:
+                c = box.center()
+                pts = self.CHECK_POINTS
+                seg1 = ((pts[1][0] - pts[0][0]) ** 2 + (pts[1][1] - pts[0][1]) ** 2) ** 0.5
+                seg2 = ((pts[2][0] - pts[1][0]) ** 2 + (pts[2][1] - pts[1][1]) ** 2) ** 0.5
+                reach = clamp(prog) * (seg1 + seg2)
+                path = QPainterPath()
+                path.moveTo(c.x() + pts[0][0], c.y() + pts[0][1])
+                if reach <= seg1:
+                    f = reach / seg1
+                    path.lineTo(c.x() + pts[0][0] + (pts[1][0] - pts[0][0]) * f,
+                                c.y() + pts[0][1] + (pts[1][1] - pts[0][1]) * f)
+                else:
+                    f = (reach - seg1) / seg2
+                    path.lineTo(c.x() + pts[1][0], c.y() + pts[1][1])
+                    path.lineTo(c.x() + pts[1][0] + (pts[2][0] - pts[1][0]) * f,
+                                c.y() + pts[1][1] + (pts[2][1] - pts[1][1]) * f)
+                p.setPen(QPen(WHITE, 2.3, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
+                              Qt.PenJoinStyle.RoundJoin))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawPath(path)
+        else:
+            p.setPen(QPen(QColor("#8E8EA0"), 1.6))
+            p.setBrush(P5_BG)
+            p.drawRoundedRect(box, 4.0, 4.0)
+        p.restore()
+
+    def paint(self, painter, option, index) -> None:
+        r = QRectF(option.rect)
+        item_id = index.data(ROLE_ID)
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+
+        if item_id is None:
+            painter.setPen(P5_MUTED)
+            painter.setFont(self._hint_font)
+            painter.drawText(r.adjusted(14, 6, -14, -6),
+                             Qt.AlignmentFlag.AlignCenter.value | Qt.TextFlag.TextWordWrap.value,
+                             index.data(Qt.ItemDataRole.DisplayRole) or "")
+            painter.restore()
+            return
+
+        card = r.adjusted(2, 3, -4, -3)
+        done = bool(index.data(ROLE_DONE))
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
+        sc = self._sc
+
+        if selected:
+            bg, border = P5_SELECTED, RED
+        elif done:
+            bg, border = (P5_HOVER if hovered else QColor("#141F1B")), QColor("#245943")
+        elif hovered:
+            bg, border = P5_HOVER, P5_BORDER_HI
+        else:
+            bg, border = P5_SURFACE, P5_BORDER
+
+        painter.setPen(QPen(border, 1.2))
+        painter.setBrush(bg)
+        painter.drawRoundedRect(card, 8.0, 8.0)
+
+        box = self._box_rect(card)
+        sp = self._springs.get(item_id)
+        self._paint_checkbox(painter, box, done, sp.value if sp else 1.0)
+
+        tx = box.right() + 10.0 * sc
+        tw = max(40.0, card.right() - tx - 10.0 * sc)
+        title = index.data(Qt.ItemDataRole.DisplayRole) or ""
+        font = self._done_font if done else self._title_font
+        fm = QFontMetrics(font)
+        painter.setFont(font)
+        painter.setPen(P5_MUTED if done else WHITE)
+        painter.drawText(QPointF(tx, card.top() + 8.0 * sc + fm.ascent()),
+                         fm.elidedText(title, Qt.TextElideMode.ElideRight, int(tw)))
+
+        # Second line: STAT chip + +PTS gold chip + optional STREAK chip + DONE chip
+        ph = 16.0 * sc
+        py = card.top() + 30.0 * sc
+        x_cur = tx
+        pfm = QFontMetrics(self._pill_font)
+
+        def _chip(txt: str, bg_c: QColor, fg_c: QColor) -> None:
+            nonlocal x_cur
+            w = pfm.horizontalAdvance(txt) + 12.0 * sc
+            rect = QRectF(x_cur, py, w, ph)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(bg_c)
+            painter.drawRoundedRect(rect, 4.0, 4.0)
+            painter.setFont(self._pill_font)
+            painter.setPen(fg_c)
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter.value, txt)
+            x_cur = rect.right() + 5.0 * sc
+
+        stat_short = index.data(ROLE_CAT) or "KNO"
+        pts_txt = index.data(ROLE_BADGE) or "+2"
+        streak_txt = index.data(ROLE_STREAK) or ""
+        _chip(stat_short, P5_RED_BG, P5_RED_FG)
+        _chip(pts_txt, P5_GOLD_BG, P5_GOLD_FG)
+        if streak_txt:
+            _chip(streak_txt, QColor("#2B2208"), GOLD)
+        if done:
+            _chip("DONE TODAY", P5_MINT_BG, P5_MINT_FG)
+        painter.restore()
+
+    def editorEvent(self, event, model, option, index) -> bool:
+        if index.data(ROLE_ID) is None:
+            return False
+        et = event.type()
+        if et in (QEvent.Type.MouseButtonRelease, QEvent.Type.MouseButtonDblClick) \
+                and event.button() == Qt.MouseButton.LeftButton:
+            card = QRectF(option.rect).adjusted(2, 3, -4, -3)
+            hit = self._box_rect(card).adjusted(-8, -8, 8, 8)
+            if hit.contains(event.position()):
+                if et == QEvent.Type.MouseButtonDblClick:
+                    self._swallow_release = True
+                    return True
+                if self._swallow_release:
+                    self._swallow_release = False
+                    return True
+                model.setData(index, not bool(index.data(ROLE_DONE)), ROLE_DONE)
+                return True
+        return super().editorEvent(event, model, option, index)
+
+
+class SocialStatsDialog(P5FluidPanel):
+    """Persona 5 Royal Social Stats tracker with progressive ranks, custom Daily Habits, and activity log."""
+
+    stat_logged = pyqtSignal(str, str, int, int, int)             # stat, activity, pts, old_lv, new_lv
+    habit_toggled = pyqtSignal(str, bool, object, int, int)       # habit_id, now_done, stat_entry, old_lv, new_lv
+    open_briefing = pyqtSignal()
     open_settings = pyqtSignal()
 
-    def __init__(self, store: SocialStatsStore, on_top: bool = True, ui_scale: float = 1.0) -> None:
-        super().__init__("SOCIAL STATS", QSize(790, 650), on_top=on_top, ui_scale=ui_scale)
+    def __init__(self, store: SocialStatsStore, habits: HabitStore | None = None,
+                 on_top: bool = True, ui_scale: float = 1.0) -> None:
+        super().__init__("SOCIAL STATS", QSize(830, 670), on_top=on_top, ui_scale=ui_scale)
         sc = self._ui_scale
         self.store = store
+        self.habits = habits
         self._selected_stat = "knowledge"
+        self._habit_stat = "knowledge"
+        self._habit_pts = 2
         self._selected_block = default_time_block()
         self._log_filter = "all"
-        self._undo_entry: dict | None = None
+        self._right_tab = "habits" if habits is not None else "log"
+        self._undo_kind = ""
+        self._undo_payload: dict | None = None
 
         # Header bar
         self._blocks_hdr = QLabel("")
         self._blocks_hdr.setObjectName("subhead")
         self.header_bar.addWidget(self._blocks_hdr)
+
+        brief_btn = self._btn("BRIEFING", variant="gold", display=True, px=10)
+        brief_btn.setToolTip("Open Daily Briefing & Confidant Summary")
+        brief_btn.clicked.connect(lambda _c=False: self.open_briefing.emit())
+        self.header_bar.addWidget(brief_btn)
 
         set_btn = self._btn("", variant="soft", icon="gear")
         set_btn.setFixedSize(_sc(30, sc, 24), _sc(30, sc, 24))
@@ -2878,18 +3613,39 @@ class SocialStatsDialog(P5FluidPanel):
         cols = QHBoxLayout()
         cols.setSpacing(_sc(12, sc, 8))
 
-        # -- LEFT COLUMN: Pentagon radar + 5 stat bars --------------------------
+        # -- LEFT COLUMN: Pentagon radar + Confidant rank strip + 5 stat bars ---
         left = QVBoxLayout()
-        left.setSpacing(_sc(8, sc, 6))
+        left.setSpacing(_sc(7, sc, 5))
 
         self._pentagon = SocialPentagonWidget(scale=sc)
         self._pentagon.stat_clicked.connect(self._select_stat)
         left.addWidget(self._pentagon)
 
+        # Confidant Rank & Streak summary pill row
+        conf_bar = _make_card("subcard")
+        cbl = QHBoxLayout(conf_bar)
+        cbl.setContentsMargins(_sc(10, sc, 7), _sc(5, sc, 4), _sc(10, sc, 7), _sc(5, sc, 4))
+        cbl.setSpacing(6)
+        self._conf_rank_lbl = QLabel("CONFIDANT LV 5 / 25")
+        self._conf_rank_lbl.setStyleSheet(
+            f'color: #FFFFFF; font-family: "Barlow Condensed", "Anton", sans-serif; '
+            f'font-size: {_sc(13, sc, 10)}px; font-weight: 800;'
+        )
+        cbl.addWidget(self._conf_rank_lbl)
+        cbl.addStretch(1)
+        self._streak_lbl = QLabel("0D STREAK")
+        self._streak_lbl.setStyleSheet(
+            f'background: #2B2208; color: #FAD02C; border: 1px solid #6C5514; '
+            f'border-radius: 4px; padding: 1px {_sc(7, sc, 5)}px; '
+            f'font-family: "Barlow Condensed", sans-serif; font-size: {_sc(11, sc, 9)}px; font-weight: 800;'
+        )
+        cbl.addWidget(self._streak_lbl)
+        left.addWidget(conf_bar)
+
         stats_card = _make_card()
         sl = QVBoxLayout(stats_card)
         sl.setContentsMargins(_sc(10, sc, 8), _sc(8, sc, 6), _sc(10, sc, 8), _sc(8, sc, 6))
-        sl.setSpacing(_sc(6, sc, 4))
+        sl.setSpacing(_sc(5, sc, 4))
 
         self._stat_rows: dict[str, tuple[QFrame, QLabel, QLabel, QProgressBar]] = {}
         for key in ("knowledge", "guts", "proficiency", "charm", "kindness"):
@@ -2931,17 +3687,124 @@ class SocialStatsDialog(P5FluidPanel):
             self._stat_rows[key] = (row_f, rank_lbl, pts_lbl, bar)
 
         left.addWidget(stats_card, 1)
-        cols.addLayout(left, 46)
+        cols.addLayout(left, 45)
 
-        # -- RIGHT COLUMN: Log Time Block form + Recent Activity Log ------------
+        # -- RIGHT COLUMN: Mode switcher (DAILY HABITS | LOG & HISTORY) ---------
         right = QVBoxLayout()
         right.setSpacing(_sc(8, sc, 6))
 
-        # Log form card
+        tab_row = QHBoxLayout()
+        tab_row.setSpacing(_sc(6, sc, 4))
+        self._tab_habits_btn = self._btn("DAILY HABITS", variant="soft", display=True, px=11)
+        self._tab_habits_btn.setFixedHeight(_sc(30, sc, 24))
+        self._tab_habits_btn.clicked.connect(lambda _c=False: self._set_right_tab("habits"))
+        self._tab_log_btn = self._btn("LOG & HISTORY", variant="soft", display=True, px=11)
+        self._tab_log_btn.setFixedHeight(_sc(30, sc, 24))
+        self._tab_log_btn.clicked.connect(lambda _c=False: self._set_right_tab("log"))
+        tab_row.addWidget(self._tab_habits_btn, 1)
+        tab_row.addWidget(self._tab_log_btn, 1)
+        if self.habits is None:
+            self._tab_habits_btn.hide()
+        right.addLayout(tab_row)
+
+        # ---- PAGE A: Custom Daily Habits --------------------------------------
+        self._habits_page = QWidget()
+        hpl = QVBoxLayout(self._habits_page)
+        hpl.setContentsMargins(0, 0, 0, 0)
+        hpl.setSpacing(_sc(8, sc, 6))
+
+        add_h_card = _make_card()
+        ahl = QVBoxLayout(add_h_card)
+        ahl.setContentsMargins(_sc(11, sc, 8), _sc(9, sc, 7), _sc(11, sc, 8), _sc(9, sc, 7))
+        ahl.setSpacing(_sc(6, sc, 4))
+
+        ah_top = QHBoxLayout()
+        ah_lbl = QLabel("CUSTOM DAILY HABITS")
+        ah_lbl.setObjectName("section")
+        ah_top.addWidget(ah_lbl)
+        ah_top.addStretch(1)
+        self._habits_prog_lbl = QLabel("0 / 0 TODAY")
+        self._habits_prog_lbl.setStyleSheet(
+            f'color: #FAD02C; font-family: "Barlow Condensed", sans-serif; '
+            f'font-size: {_sc(12, sc, 10)}px; font-weight: 800;'
+        )
+        ah_top.addWidget(self._habits_prog_lbl)
+        ahl.addLayout(ah_top)
+
+        h_inp_row = QHBoxLayout()
+        h_inp_row.setSpacing(_sc(6, sc, 4))
+        self._habit_input = QLineEdit()
+        self._habit_input.setPlaceholderText("New habit (e.g. Read 20m, Workout, Drink 2L water)...")
+        self._habit_input.returnPressed.connect(self._add_habit)
+        h_inp_row.addWidget(self._habit_input, 1)
+
+        add_h_btn = self._btn("ADD HABIT", variant="primary", icon="plus", display=True, px=10)
+        add_h_btn.setFixedHeight(_sc(30, sc, 25))
+        add_h_btn.clicked.connect(self._add_habit)
+        h_inp_row.addWidget(add_h_btn)
+        ahl.addLayout(h_inp_row)
+
+        # Custom stat & reward points selector for new habit
+        h_opt_row = QHBoxLayout()
+        h_opt_row.setSpacing(_sc(4, sc, 3))
+        self._hstat_btns: dict[str, P5FluidButton] = {}
+        for k in ("knowledge", "guts", "proficiency", "charm", "kindness"):
+            hb = self._btn(SOCIAL_STATS[k]["short"], variant="soft", display=True, px=9)
+            hb.setFixedHeight(_sc(24, sc, 20))
+            hb.setToolTip(f"Reward {SOCIAL_STATS[k]['label']} points")
+            hb.clicked.connect(lambda _c=False, key=k: self._select_habit_stat(key))
+            self._hstat_btns[k] = hb
+            h_opt_row.addWidget(hb, 1)
+
+        self._hpts_btns: dict[int, P5FluidButton] = {}
+        for pv in (1, 2, 3):
+            pb = self._btn(f"+{pv}", variant="soft", display=True, px=9)
+            pb.setFixedHeight(_sc(24, sc, 20))
+            pb.setToolTip(f"Award +{pv} pts each day completed")
+            pb.clicked.connect(lambda _c=False, v=pv: self._select_habit_pts(v))
+            self._hpts_btns[pv] = pb
+            h_opt_row.addWidget(pb)
+        ahl.addLayout(h_opt_row)
+        hpl.addWidget(add_h_card)
+
+        hlist_card = _make_card()
+        hlc = QVBoxLayout(hlist_card)
+        hlc.setContentsMargins(_sc(8, sc, 6), _sc(8, sc, 6), _sc(8, sc, 6), _sc(8, sc, 6))
+        hlc.setSpacing(_sc(6, sc, 4))
+
+        self._habit_list = _KeyAwareList()
+        self._habit_list.setMouseTracking(True)
+        self._habit_list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self._habit_delegate = HabitRowDelegate(self._habit_list, scale=sc)
+        self._habit_list.setItemDelegate(self._habit_delegate)
+        self._habit_list.itemChanged.connect(self._on_habit_item_changed)
+        self._habit_list.space_pressed.connect(self._toggle_selected_habit)
+        self._habit_list.delete_pressed.connect(self._delete_selected_habit)
+        hlc.addWidget(self._habit_list, 1)
+
+        hf_foot = QHBoxLayout()
+        hf_foot.setSpacing(6)
+        htip = QLabel("Resets daily · Auto-awards Social Stats · Space: check")
+        htip.setObjectName("tip")
+        hf_foot.addWidget(htip, 1)
+        hdel_btn = self._btn("DELETE", variant="danger", display=True, px=10)
+        hdel_btn.setFixedHeight(_sc(26, sc, 22))
+        hdel_btn.clicked.connect(self._delete_selected_habit)
+        hf_foot.addWidget(hdel_btn)
+        hlc.addLayout(hf_foot)
+        hpl.addWidget(hlist_card, 1)
+        right.addWidget(self._habits_page, 1)
+
+        # ---- PAGE B: Manual Time Block Logger & Recent History ----------------
+        self._log_page = QWidget()
+        lpl = QVBoxLayout(self._log_page)
+        lpl.setContentsMargins(0, 0, 0, 0)
+        lpl.setSpacing(_sc(8, sc, 6))
+
         log_card = _make_card()
         fl = QVBoxLayout(log_card)
-        fl.setContentsMargins(_sc(12, sc, 9), _sc(10, sc, 7), _sc(12, sc, 9), _sc(10, sc, 7))
-        fl.setSpacing(_sc(7, sc, 5))
+        fl.setContentsMargins(_sc(12, sc, 9), _sc(9, sc, 7), _sc(12, sc, 9), _sc(9, sc, 7))
+        fl.setSpacing(_sc(6, sc, 5))
 
         f_hdr = QHBoxLayout()
         h_lbl = QLabel("LOG TIME BLOCK (~2H)")
@@ -2962,7 +3825,7 @@ class SocialStatsDialog(P5FluidPanel):
         r1.setSpacing(_sc(5, sc, 4))
         for k in ("knowledge", "guts", "proficiency"):
             b = self._btn(SOCIAL_STATS[k]["label"].upper(), variant="soft", display=True, px=10)
-            b.setFixedHeight(_sc(26, sc, 22))
+            b.setFixedHeight(_sc(25, sc, 21))
             b.clicked.connect(lambda _c=False, key=k: self._select_stat(key))
             self._stat_btns[k] = b
             r1.addWidget(b, 1)
@@ -2972,7 +3835,7 @@ class SocialStatsDialog(P5FluidPanel):
         r2.setSpacing(_sc(5, sc, 4))
         for k in ("charm", "kindness"):
             b = self._btn(SOCIAL_STATS[k]["label"].upper(), variant="soft", display=True, px=10)
-            b.setFixedHeight(_sc(26, sc, 22))
+            b.setFixedHeight(_sc(25, sc, 21))
             b.clicked.connect(lambda _c=False, key=k: self._select_stat(key))
             self._stat_btns[k] = b
             r2.addWidget(b, 1)
@@ -2983,7 +3846,6 @@ class SocialStatsDialog(P5FluidPanel):
         self._rule_hint.setWordWrap(True)
         fl.addWidget(self._rule_hint)
 
-        # Activity input + primary LOG button
         act_row = QHBoxLayout()
         act_row.setSpacing(_sc(6, sc, 4))
         self._act_input = QLineEdit()
@@ -2997,7 +3859,6 @@ class SocialStatsDialog(P5FluidPanel):
         act_row.addWidget(self._log_btn)
         fl.addLayout(act_row)
 
-        # Time block selector
         blk_row = QHBoxLayout()
         blk_row.setSpacing(_sc(5, sc, 4))
         blk_lbl = QLabel("Block")
@@ -3006,13 +3867,12 @@ class SocialStatsDialog(P5FluidPanel):
         self._block_btns: dict[str, P5FluidButton] = {}
         for blk in TIME_BLOCKS:
             b = self._btn(blk.upper(), variant="soft", display=True, px=9)
-            b.setFixedHeight(_sc(25, sc, 21))
+            b.setFixedHeight(_sc(24, sc, 20))
             b.clicked.connect(lambda _c=False, name=blk: self._select_block(name))
             self._block_btns[blk] = b
             blk_row.addWidget(b, 1)
         fl.addLayout(blk_row)
 
-        # Points selector (+1 / +2 / +3 / +5 + editable spinbox)
         pts_row = QHBoxLayout()
         pts_row.setSpacing(_sc(5, sc, 4))
         pts_tag = QLabel("Points")
@@ -3021,7 +3881,7 @@ class SocialStatsDialog(P5FluidPanel):
         self._quick_pts_btns: dict[int, P5FluidButton] = {}
         for val in QUICK_STAT_POINTS:
             b = self._btn(f"+{val}", variant="soft", display=True, px=10)
-            b.setFixedHeight(_sc(26, sc, 22))
+            b.setFixedHeight(_sc(25, sc, 21))
             b.clicked.connect(lambda _c=False, v=val: self._set_points(v))
             self._quick_pts_btns[val] = b
             pts_row.addWidget(b, 1)
@@ -3031,13 +3891,12 @@ class SocialStatsDialog(P5FluidPanel):
         self._pts_spin.setValue(DEFAULT_STAT_POINTS)
         self._pts_spin.setSuffix(" pts")
         self._pts_spin.setMinimumWidth(_sc(84, sc, 68))
-        self._pts_spin.setFixedHeight(_sc(26, sc, 22))
+        self._pts_spin.setFixedHeight(_sc(25, sc, 21))
         self._pts_spin.valueChanged.connect(self._on_points_changed)
         pts_row.addWidget(self._pts_spin)
         fl.addLayout(pts_row)
-        right.addWidget(log_card)
+        lpl.addWidget(log_card)
 
-        # Recent log card
         hist_card = _make_card()
         hl = QVBoxLayout(hist_card)
         hl.setContentsMargins(_sc(10, sc, 8), _sc(8, sc, 6), _sc(10, sc, 8), _sc(8, sc, 6))
@@ -3075,7 +3934,8 @@ class SocialStatsDialog(P5FluidPanel):
 
         h_foot = QHBoxLayout()
         h_foot.setSpacing(6)
-        tip = QLabel("20 pts/level · Del to remove")
+        req_str = "/".join(str(x) for x in STAT_RANK_THRESHOLDS[1:])
+        tip = QLabel(f"Ranks: {req_str} pts · +{STAT_MASTERY_STEP} Mastery")
         tip.setObjectName("tip")
         h_foot.addWidget(tip, 1)
 
@@ -3085,23 +3945,37 @@ class SocialStatsDialog(P5FluidPanel):
         h_foot.addWidget(del_btn)
         hl.addLayout(h_foot)
 
-        right.addWidget(hist_card, 1)
+        lpl.addWidget(hist_card, 1)
+        right.addWidget(self._log_page, 1)
 
         self._undo = UndoBar(scale=sc)
         self._undo.undo_clicked.connect(self._undo_delete)
         right.addWidget(self._undo)
 
-        cols.addLayout(right, 54)
+        cols.addLayout(right, 55)
         self.body.addLayout(cols, 1)
 
         QShortcut(QKeySequence("Ctrl+,"), self).activated.connect(lambda: self.open_settings.emit())
         self._select_stat("knowledge")
+        self._select_habit_stat("knowledge")
+        self._select_habit_pts(2)
         self._select_block(self._selected_block)
         self._on_points_changed(DEFAULT_STAT_POINTS)
+        self._set_right_tab(self._right_tab)
 
     def on_shown(self) -> None:
         self._select_block(default_time_block())
-        QTimer.singleShot(20, self._act_input.setFocus)
+        target = self._habit_input if self._right_tab == "habits" else self._act_input
+        QTimer.singleShot(20, target.setFocus)
+
+    def _set_right_tab(self, tab: str) -> None:
+        if tab == "habits" and self.habits is None:
+            tab = "log"
+        self._right_tab = tab
+        self._habits_page.setVisible(tab == "habits")
+        self._log_page.setVisible(tab == "log")
+        self._tab_habits_btn.set_active(tab == "habits")
+        self._tab_log_btn.set_active(tab == "log")
 
     def _select_stat(self, key: str) -> None:
         if key not in SOCIAL_STATS:
@@ -3113,6 +3987,18 @@ class SocialStatsDialog(P5FluidPanel):
         self._rule_hint.setText(f"{meta['label']} — {meta['examples']}")
         self._act_input.setPlaceholderText(meta["placeholder"])
         self._refresh_visuals()
+
+    def _select_habit_stat(self, key: str) -> None:
+        if key not in SOCIAL_STATS:
+            return
+        self._habit_stat = key
+        for k, b in self._hstat_btns.items():
+            b.set_active(k == key)
+
+    def _select_habit_pts(self, pts: int) -> None:
+        self._habit_pts = max(1, min(5, int(pts)))
+        for v, b in self._hpts_btns.items():
+            b.set_active(v == self._habit_pts, active_variant="gold")
 
     def _select_block(self, blk: str) -> None:
         if blk not in TIME_BLOCKS:
@@ -3135,6 +4021,96 @@ class SocialStatsDialog(P5FluidPanel):
             b.set_active(k == key)
         self._refresh_log()
 
+    # -- Custom Daily Habits actions -----------------------------------------
+    def _add_habit(self) -> None:
+        if self.habits is None:
+            return
+        h = self.habits.add(self._habit_input.text(), stat=self._habit_stat, points=self._habit_pts)
+        if h is None:
+            return
+        self._habit_input.clear()
+        self._refresh_habits()
+        self._habit_input.setFocus()
+
+    def _on_habit_item_changed(self, item: QListWidgetItem) -> None:
+        if self.habits is None:
+            return
+        hid = item.data(ROLE_ID)
+        habit = self.habits.get(hid) if hid else None
+        if habit is None:
+            return
+        want_done = bool(item.data(ROLE_DONE))
+        cur_done = self.habits.is_done_on(habit)
+        if want_done == cur_done:
+            return
+        now_done, entry, old_lv, new_lv = self.habits.toggle_today(hid, self.store)
+        if now_done:
+            self._habit_delegate.start_check_anim(hid)
+        else:
+            play_ui("cancel")
+            self._habit_delegate.clear_anim(hid)
+            self._refresh_visuals(animate=True)
+        self._refresh_habits()
+        self._refresh_log()
+        self.habit_toggled.emit(hid, now_done, entry, old_lv, new_lv)
+
+    def _toggle_selected_habit(self) -> None:
+        item = self._habit_list.currentItem()
+        if item is not None and item.data(ROLE_ID):
+            item.setData(ROLE_DONE, not bool(item.data(ROLE_DONE)))
+
+    def _delete_selected_habit(self) -> None:
+        if self.habits is None:
+            return
+        item = self._habit_list.currentItem()
+        if item is None:
+            return
+        hid = item.data(ROLE_ID)
+        habit = self.habits.get(hid) if hid else None
+        if habit is None:
+            return
+        self._undo_kind = "habit"
+        self._undo_payload = dict(habit)
+        self.habits.delete(hid)
+        self._refresh_habits()
+        self._undo.trigger(f"Removed habit '{habit.get('title', '')[:28]}'.")
+
+    def _refresh_habits(self) -> None:
+        if self.habits is None:
+            return
+        items = self.habits.all()
+        done_cnt, total_cnt = self.habits.today_summary()
+        self._habits_prog_lbl.setText(f"{done_cnt} / {total_cnt} TODAY")
+        self._tab_habits_btn.setText(f"DAILY HABITS ({done_cnt}/{total_cnt})" if total_cnt else "DAILY HABITS")
+
+        self._habit_list.blockSignals(True)
+        self._habit_list.clear()
+        if not items:
+            self._habit_list.addItem(_hint_item(
+                "No custom daily habits yet!\n"
+                "Type a habit above, choose its Social Stat & points (+1 to +3), and click ADD HABIT."
+            ))
+            self._habit_list.blockSignals(False)
+            return
+
+        # Pending today first, then done today
+        ordered = sorted(items, key=lambda h: (1 if self.habits.is_done_on(h) else 0))
+        for h in ordered:
+            stat = h.get("stat", "knowledge")
+            meta = SOCIAL_STATS.get(stat, {})
+            done = self.habits.is_done_on(h)
+            st_days = self.habits.streak(h)
+            it = QListWidgetItem(h.get("title", ""))
+            it.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            it.setData(ROLE_ID, h["id"])
+            it.setData(ROLE_DONE, done)
+            it.setData(ROLE_CAT, meta.get("short", stat[:3].upper()))
+            it.setData(ROLE_BADGE, f"+{h.get('points', 2)}")
+            it.setData(ROLE_STREAK, f"{st_days}D STREAK" if st_days >= 1 else "")
+            self._habit_list.addItem(it)
+        self._habit_list.blockSignals(False)
+
+    # -- Manual Time Block & History actions ---------------------------------
     def _log_activity(self) -> None:
         self._pts_spin.interpretText()
         pts = self._pts_spin.value()
@@ -3143,6 +4119,7 @@ class SocialStatsDialog(P5FluidPanel):
             self._act_input.text(),
             points=pts,
             block=self._selected_block,
+            source="manual",
         )
         if entry is None:
             return
@@ -3169,28 +4146,40 @@ class SocialStatsDialog(P5FluidPanel):
         entry = self.store.get(entry_id)
         if entry is None:
             return
-        self._undo_entry = dict(entry)
+        self._undo_kind = "log"
+        self._undo_payload = dict(entry)
         self.store.delete(entry_id)
         self.refresh()
         self._undo.trigger(f"Removed '{entry.get('activity', '')[:28]}' (+{entry.get('points', 0)} pts).")
 
     def _undo_delete(self) -> None:
-        if self._undo_entry is None:
+        if self._undo_payload is None:
             return
-        self.store.restore(self._undo_entry)
-        self._undo_entry = None
+        if self._undo_kind == "habit" and self.habits is not None:
+            self.habits.restore(self._undo_payload)
+        elif self._undo_kind == "log":
+            self.store.restore(self._undo_payload)
+        self._undo_kind = ""
+        self._undo_payload = None
         self.refresh()
 
     def refresh(self) -> None:
         self._refresh_visuals(animate=False)
+        self._refresh_habits()
         self._refresh_log()
 
     def _refresh_visuals(self, animate: bool = False) -> None:
         totals = self.store.totals()
         self._pentagon.set_data(totals, self._selected_stat, animate=animate)
 
+        today_pts = self.store.today_points()
         today_n = len(self.store.today_entries())
-        self._blocks_hdr.setText(f"TODAY: {today_n} / {DAILY_BLOCK_TARGET} BLOCKS")
+        conf_lv, conf_max = overall_confidant_level(totals)
+        streak = self.store.streak_days()
+        self._blocks_hdr.setText(f"TODAY: +{today_pts} PTS · {today_n} LOGS")
+        self._conf_rank_lbl.setText(f"CONFIDANT LV {conf_lv} / {conf_max}")
+        self._streak_lbl.setText(f"{streak}D STREAK" if streak else "START STREAK")
+
         filled = min(today_n, DAILY_BLOCK_TARGET)
         pips = "● " * filled + "○ " * (DAILY_BLOCK_TARGET - filled)
         extra = f" (+{today_n - DAILY_BLOCK_TARGET})" if today_n > DAILY_BLOCK_TARGET else ""
@@ -3206,7 +4195,7 @@ class SocialStatsDialog(P5FluidPanel):
                 if is_sel else ""
             )
             rank_lbl.setText(f"LV {lv} · {title.upper()}")
-            pts_lbl.setText(f"{pts} PTS (-{to_next})")
+            pts_lbl.setText(f"{into}/{span} (-{to_next})")
             bar.setRange(0, max(1, span))
             bar.setValue(into)
 
@@ -3216,11 +4205,12 @@ class SocialStatsDialog(P5FluidPanel):
         self._log_cnt_lbl.setText(f"{n} " + ("entry" if n == 1 else "entries"))
         self._log_list.clear()
         if not entries:
-            msg = ("No activities logged yet.\nPick a stat above, enter your ~2h activity, and click LOG!"
+            msg = ("No activities logged yet.\nComplete a Habit, Task, Focus block, or log manually above!"
                    if self._log_filter == "all"
                    else f"No {SOCIAL_STATS[self._log_filter]['label']} entries yet.")
             self._log_list.addItem(_hint_item(msg))
             return
+        src_labels = {"habit": "HABIT", "task": "TASK", "focus": "FOCUS", "note": "NOTE"}
         for e in entries:
             stat = e.get("stat", "knowledge")
             meta = SOCIAL_STATS.get(stat, {})
@@ -3233,8 +4223,308 @@ class SocialStatsDialog(P5FluidPanel):
                 d_fmt = datetime.strptime(d_str, "%Y-%m-%d").strftime("%d %b")
             except ValueError:
                 d_fmt = d_str
-            item.setData(ROLE_DATE, f"{e.get('block', 'Daytime')} · {d_fmt}")
+            src_tag = src_labels.get(str(e.get("source", "")).lower(), "")
+            meta_parts = [p for p in (src_tag, e.get("block", "Daytime"), d_fmt) if p]
+            item.setData(ROLE_DATE, " · ".join(meta_parts))
             self._log_list.addItem(item)
+
+
+# ---------------------------------------------------------------------------
+# DAILY BRIEFING & CONFIDANT SUMMARY DIALOG
+# ---------------------------------------------------------------------------
+class BriefingDialog(P5FluidPanel):
+    """Persona 5 Daily Morning Briefing & Confidant Summary report card."""
+
+    open_events = pyqtSignal()
+    open_tasks = pyqtSignal()
+    open_stats = pyqtSignal()
+
+    def __init__(self, on_top: bool = True, ui_scale: float = 1.0) -> None:
+        super().__init__("DAILY BRIEFING", QSize(565, 640), on_top=on_top, ui_scale=ui_scale)
+        sc = self._ui_scale
+
+        self._date_hdr = QLabel("")
+        self._date_hdr.setObjectName("subhead")
+        self.header_bar.addWidget(self._date_hdr)
+        self._add_close_button()
+
+        # 1) Morgana Confidant Banner
+        self._banner = _MorganaBriefingFrame(scale=sc)
+        bl = QHBoxLayout(self._banner)
+        bl.setContentsMargins(_sc(24, sc, 18), _sc(10, sc, 8), _sc(12, sc, 9), _sc(10, sc, 8))
+        bl.setSpacing(_sc(12, sc, 8))
+
+        av_lbl = QLabel()
+        av_lbl.setPixmap(_morgana_avatar(_sc(52, sc, 40)))
+        av_lbl.setFixedSize(_sc(52, sc, 40), _sc(52, sc, 40))
+        bl.addWidget(av_lbl, 0, Qt.AlignmentFlag.AlignTop)
+
+        scol = QVBoxLayout()
+        scol.setSpacing(_sc(4, sc, 3))
+        top_m = QHBoxLayout()
+        top_m.setSpacing(_sc(6, sc, 4))
+
+        m_lbl = QLabel("MORGANA")
+        m_lbl.setStyleSheet(
+            f'background: #0B0B0B; color: #FFFFFF; border: 1.5px solid #FFFFFF; '
+            f'border-radius: 4px; padding: 1px {_sc(7, sc, 5)}px; '
+            f'font-family: "Anton", "Barlow Condensed", sans-serif; font-size: {_sc(12, sc, 10)}px;'
+        )
+        top_m.addWidget(m_lbl)
+
+        self._period_pill = QLabel("MORNING")
+        self._period_pill.setStyleSheet(
+            f'background: #E60012; color: #FFFFFF; border: none; border-radius: 4px; '
+            f'padding: 1px {_sc(7, sc, 5)}px; font-family: "Barlow Condensed", sans-serif; '
+            f'font-weight: 800; font-size: {_sc(11, sc, 9)}px;'
+        )
+        top_m.addWidget(self._period_pill)
+
+        self._conf_pill = QLabel("CONFIDANT LV 5/25")
+        self._conf_pill.setStyleSheet(
+            f'background: #2B2208; color: #FAD02C; border: 1px solid #6C5514; border-radius: 4px; '
+            f'padding: 1px {_sc(7, sc, 5)}px; font-family: "Barlow Condensed", sans-serif; '
+            f'font-weight: 800; font-size: {_sc(11, sc, 9)}px;'
+        )
+        top_m.addWidget(self._conf_pill)
+        top_m.addStretch(1)
+        scol.addLayout(top_m)
+
+        self._headline_lbl = QLabel("GOOD MORNING!")
+        self._headline_lbl.setWordWrap(True)
+        self._headline_lbl.setStyleSheet(
+            f'color: #FAD02C; font-family: "Barlow Condensed", "Anton", sans-serif; '
+            f'font-size: {_sc(15, sc, 12)}px; font-weight: 800;'
+        )
+        scol.addWidget(self._headline_lbl)
+
+        self._advice_lbl = QLabel("")
+        self._advice_lbl.setWordWrap(True)
+        self._advice_lbl.setStyleSheet(
+            f'color: #FFFFFF; font-family: "Arsenal", "Optima", "Segoe UI", sans-serif; '
+            f'font-size: {_sc(13, sc, 10)}px; font-weight: bold;'
+        )
+        scol.addWidget(self._advice_lbl)
+        bl.addLayout(scol, 1)
+        self.body.addWidget(self._banner)
+
+        # 2) 4 KPI summary tiles
+        kpi_row = QHBoxLayout()
+        kpi_row.setSpacing(_sc(7, sc, 5))
+        self._kpis: dict[str, tuple[QLabel, QLabel]] = {}
+        for key, title in (("events", "TODAY EVENTS"), ("tasks", "PENDING TASKS"),
+                           ("habits", "DAILY HABITS"), ("streak", "STREAK")):
+            tile = _make_card("subcard")
+            tl = QVBoxLayout(tile)
+            tl.setContentsMargins(_sc(8, sc, 5), _sc(6, sc, 4), _sc(8, sc, 5), _sc(6, sc, 4))
+            tl.setSpacing(2)
+            v_lbl = QLabel("0")
+            v_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            v_lbl.setStyleSheet(
+                f'color: #FFFFFF; font-family: "Anton", "Barlow Condensed", sans-serif; '
+                f'font-size: {_sc(20, sc, 15)}px;'
+            )
+            k_lbl = QLabel(title)
+            k_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            k_lbl.setStyleSheet(
+                f'color: #9292A4; font-family: "Barlow Condensed", sans-serif; '
+                f'font-size: {_sc(10, sc, 8)}px; font-weight: 800;'
+            )
+            tl.addWidget(v_lbl)
+            tl.addWidget(k_lbl)
+            kpi_row.addWidget(tile, 1)
+            self._kpis[key] = (v_lbl, k_lbl)
+        self.body.addLayout(kpi_row)
+
+        # 3) Scrollable Agenda + Confidant Stats summary
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        s_body = QWidget()
+        s_lay = QVBoxLayout(s_body)
+        s_lay.setContentsMargins(0, 0, _sc(4, sc, 2), 0)
+        s_lay.setSpacing(_sc(8, sc, 6))
+
+        # Today's Agenda & Deadlines card
+        ag_card = _make_card()
+        agl = QVBoxLayout(ag_card)
+        agl.setContentsMargins(_sc(11, sc, 8), _sc(9, sc, 7), _sc(11, sc, 8), _sc(9, sc, 7))
+        agl.setSpacing(_sc(5, sc, 4))
+        ag_hdr = QLabel("TODAY'S SCHEDULE & DEADLINES")
+        ag_hdr.setObjectName("section")
+        agl.addWidget(ag_hdr)
+        self._agenda_lay = QVBoxLayout()
+        self._agenda_lay.setSpacing(_sc(4, sc, 3))
+        agl.addLayout(self._agenda_lay)
+        s_lay.addWidget(ag_card)
+
+        # Confidant Social Stats Summary card
+        st_card = _make_card()
+        stl = QVBoxLayout(st_card)
+        stl.setContentsMargins(_sc(11, sc, 8), _sc(9, sc, 7), _sc(11, sc, 8), _sc(9, sc, 7))
+        stl.setSpacing(_sc(5, sc, 4))
+        st_hdr_row = QHBoxLayout()
+        st_hdr = QLabel("CONFIDANT SUMMARY")
+        st_hdr.setObjectName("section")
+        st_hdr_row.addWidget(st_hdr)
+        st_hdr_row.addStretch(1)
+        self._today_pts_lbl = QLabel("+0 PTS TODAY")
+        self._today_pts_lbl.setStyleSheet(
+            f'color: #FAD02C; font-family: "Barlow Condensed", sans-serif; '
+            f'font-size: {_sc(11, sc, 9)}px; font-weight: 800;'
+        )
+        st_hdr_row.addWidget(self._today_pts_lbl)
+        stl.addLayout(st_hdr_row)
+
+        self._stat_summary_rows: dict[str, tuple[QLabel, QLabel, QProgressBar]] = {}
+        for key in ("knowledge", "guts", "proficiency", "charm", "kindness"):
+            row = QHBoxLayout()
+            row.setSpacing(_sc(8, sc, 5))
+            nlbl = QLabel(SOCIAL_STATS[key]["label"].upper())
+            nlbl.setFixedWidth(_sc(86, sc, 68))
+            nlbl.setStyleSheet(
+                f'color: #FFFFFF; font-family: "Barlow Condensed", sans-serif; '
+                f'font-size: {_sc(12, sc, 10)}px; font-weight: 800;'
+            )
+            rlbl = QLabel("LV 1")
+            rlbl.setFixedWidth(_sc(118, sc, 94))
+            rlbl.setStyleSheet(
+                f'color: #FAD02C; font-family: "Barlow Condensed", sans-serif; '
+                f'font-size: {_sc(11, sc, 9)}px; font-weight: 800;'
+            )
+            bar = QProgressBar()
+            bar.setTextVisible(False)
+            bar.setFixedHeight(_sc(6, sc, 5))
+            plbl = QLabel("0/30")
+            plbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            plbl.setFixedWidth(_sc(56, sc, 46))
+            plbl.setStyleSheet(f'color: #9292A4; font-size: {_sc(11, sc, 9)}px; font-weight: bold;')
+            row.addWidget(nlbl)
+            row.addWidget(rlbl)
+            row.addWidget(bar, 1)
+            row.addWidget(plbl)
+            stl.addLayout(row)
+            self._stat_summary_rows[key] = (rlbl, plbl, bar)
+        s_lay.addWidget(st_card)
+        s_lay.addStretch(1)
+
+        scroll.setWidget(s_body)
+        self.body.addWidget(scroll, 1)
+
+        # Footer quick jumps + primary close
+        foot = QHBoxLayout()
+        foot.setSpacing(6)
+        self._btn_ev = self._btn("EVENTS", variant="soft", display=True, px=10)
+        self._btn_ev.setFixedHeight(_sc(28, sc, 24))
+        self._btn_ev.clicked.connect(lambda _c=False: self.open_events.emit())
+        foot.addWidget(self._btn_ev)
+
+        self._btn_tk = self._btn("TASKS", variant="soft", display=True, px=10)
+        self._btn_tk.setFixedHeight(_sc(28, sc, 24))
+        self._btn_tk.clicked.connect(lambda _c=False: self.open_tasks.emit())
+        foot.addWidget(self._btn_tk)
+
+        self._btn_st = self._btn("STATS & HABITS", variant="gold", display=True, px=10)
+        self._btn_st.setFixedHeight(_sc(28, sc, 24))
+        self._btn_st.clicked.connect(lambda _c=False: self.open_stats.emit())
+        foot.addWidget(self._btn_st)
+        foot.addStretch(1)
+
+        go_btn = self._btn("LET'S GO!", variant="primary", display=True, px=11)
+        go_btn.setFixedHeight(_sc(28, sc, 24))
+        go_btn.clicked.connect(self.close)
+        foot.addWidget(go_btn)
+        self.body.addLayout(foot)
+
+    def set_data(self, payload: dict) -> None:
+        """Populate the Daily Briefing & Confidant Summary card from a prepared snapshot dict."""
+        sc = self._ui_scale
+        brief = build_daily_briefing(payload)
+        self._date_hdr.setText(brief["date_banner"])
+        self._period_pill.setText(brief["period"])
+        self._headline_lbl.setText(brief["headline"])
+        self._advice_lbl.setText(brief["advice"])
+        conf_lv = int(payload.get("confidant_lv", 5))
+        conf_max = int(payload.get("confidant_max", 25))
+        streak = int(payload.get("streak_days", 0))
+        self._conf_pill.setText(f"CONFIDANT LV {conf_lv}/{conf_max}")
+
+        overdue = int(payload.get("overdue_count", 0))
+        self._banner.set_accent(RED if overdue else GOLD)
+
+        # KPIs
+        ev_n = len(payload.get("today_events") or ())
+        pending_n = int(payload.get("pending_tasks", 0))
+        h_done = int(payload.get("habits_done", 0))
+        h_total = int(payload.get("habits_total", 0))
+        self._kpis["events"][0].setText(str(ev_n))
+        self._kpis["tasks"][0].setText(str(pending_n))
+        self._kpis["tasks"][0].setStyleSheet(
+            f'color: {"#FF5E6B" if overdue else "#FFFFFF"}; '
+            f'font-family: "Anton", "Barlow Condensed", sans-serif; font-size: {_sc(20, sc, 15)}px;'
+        )
+        self._kpis["habits"][0].setText(f"{h_done}/{h_total}" if h_total else "—")
+        self._kpis["streak"][0].setText(f"{streak}D")
+        self._kpis["streak"][0].setStyleSheet(
+            f'color: {"#FAD02C" if streak >= 1 else "#FFFFFF"}; '
+            f'font-family: "Anton", "Barlow Condensed", sans-serif; font-size: {_sc(20, sc, 15)}px;'
+        )
+
+        # Agenda & Deadlines rows
+        _clear_layout(self._agenda_lay)
+        agenda_items = list(payload.get("agenda_rows") or ())
+        if not agenda_items:
+            empty = QLabel("All clear today! No timed events or deadlines due.")
+            empty.setObjectName("tip")
+            self._agenda_lay.addWidget(empty)
+        else:
+            pill_styles = {
+                "OVERDUE": ("#E60012", "#FFFFFF"),
+                "LOCAL":   ("#10281E", "#5CE09A"),
+                "EVENT":   ("#1C1C28", "#D6D6E8"),
+                "TASK":    ("#2B2208", "#FAD02C"),
+                "NOTE":    ("#360A10", "#FF7882"),
+            }
+            for tag, time_s, title_s in agenda_items[:6]:
+                r = QHBoxLayout()
+                r.setSpacing(_sc(6, sc, 4))
+                bg_c, fg_c = pill_styles.get(tag, ("#1C1C28", "#FFFFFF"))
+                p_lbl = QLabel(tag)
+                p_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                p_lbl.setFixedWidth(_sc(56, sc, 46))
+                p_lbl.setStyleSheet(
+                    f'background: {bg_c}; color: {fg_c}; border-radius: 4px; padding: 1px 4px; '
+                    f'font-family: "Barlow Condensed", sans-serif; font-weight: 800; font-size: {_sc(10, sc, 8)}px;'
+                )
+                t_lbl = QLabel(time_s)
+                t_lbl.setFixedWidth(_sc(56, sc, 46))
+                t_lbl.setStyleSheet(
+                    f'color: {"#FF5E6B" if tag == "OVERDUE" else "#FAD02C"}; '
+                    f'font-family: "Barlow Condensed", sans-serif; font-weight: 800; font-size: {_sc(12, sc, 10)}px;'
+                )
+                n_lbl = QLabel(title_s)
+                n_lbl.setStyleSheet(f'color: #FFFFFF; font-size: {_sc(13, sc, 10)}px; font-weight: bold;')
+                r.addWidget(p_lbl)
+                r.addWidget(t_lbl)
+                r.addWidget(n_lbl, 1)
+                self._agenda_lay.addLayout(r)
+            if len(agenda_items) > 6:
+                more = QLabel(f"+{len(agenda_items) - 6} more items in Events / Tasks")
+                more.setObjectName("tip")
+                self._agenda_lay.addWidget(more)
+
+        # Social Stats rows
+        totals = payload.get("stat_totals") or {}
+        today_pts = int(payload.get("today_points", 0))
+        self._today_pts_lbl.setText(f"+{today_pts} PTS TODAY")
+        for key, (rlbl, plbl, bar) in self._stat_summary_rows.items():
+            pts = int(totals.get(key, 0))
+            lv, into, span, _to_next = stat_level_progress(pts)
+            rlbl.setText(f"LV {lv} · {stat_rank_title(key, lv).upper()}")
+            plbl.setText(f"{into}/{span}")
+            bar.setRange(0, max(1, span))
+            bar.setValue(into)
 
 
 # ---------------------------------------------------------------------------
