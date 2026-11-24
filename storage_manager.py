@@ -14,7 +14,7 @@ import logging
 import os
 import tempfile
 import uuid
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from datetime import time as dtime
 from pathlib import Path
 
@@ -107,15 +107,26 @@ class JsonListStore:
 
 
 class TaskStore(JsonListStore):
-    """Tugas: {"id", "title", "done", "created", "done_at"}."""
+    """Tugas: {"id", "title", "done", "priority", "deadline", "notified", "rewarded", "created", "done_at"}."""
 
-    def add(self, title: str, priority: str = "normal") -> dict | None:
+    def add(self, title: str, priority: str = "normal",
+            deadline: datetime | None = None) -> dict | None:
         title = (title or "").strip()
         if not title:
             return None
         prio = "high" if priority == "high" else "normal"
-        task = {"id": uuid.uuid4().hex[:12], "title": title, "done": False,
-                "priority": prio, "created": now_iso(), "done_at": None}
+        dl_str = deadline.isoformat(timespec="minutes") if deadline else None
+        task = {
+            "id": uuid.uuid4().hex[:12],
+            "title": title,
+            "done": False,
+            "priority": prio,
+            "deadline": dl_str,
+            "notified": False,
+            "rewarded": False,
+            "created": now_iso(),
+            "done_at": None,
+        }
         self._items.append(task)
         self.save()
         return task
@@ -127,6 +138,43 @@ class TaskStore(JsonListStore):
         task["priority"] = "high" if priority == "high" else "normal"
         self.save()
         return True
+
+    def set_deadline(self, task_id: str, deadline: datetime | None) -> bool:
+        task = self.get(task_id)
+        if task is None:
+            return False
+        new_dl = deadline.isoformat(timespec="minutes") if deadline else None
+        if new_dl != task.get("deadline"):
+            task["notified"] = False
+        task["deadline"] = new_dl
+        self.save()
+        return True
+
+    def mark_rewarded(self, task_id: str) -> None:
+        task = self.get(task_id)
+        if task is not None and not task.get("rewarded"):
+            task["rewarded"] = True
+            self.save()
+
+    def with_deadline(self) -> list[dict]:
+        """Pending tasks that have an active deadline."""
+        return [t for t in self._items if t.get("deadline") and not t.get("done")]
+
+    def due(self, now: datetime | None = None) -> list[dict]:
+        """Pending tasks whose deadline has passed and haven't triggered a due alert yet."""
+        now = now or datetime.now()
+        result = []
+        for t in self.with_deadline():
+            dl = parse_dt(t.get("deadline"))
+            if dl is not None and dl <= now and not t.get("notified"):
+                result.append(t)
+        return result
+
+    def mark_notified(self, task_id: str) -> None:
+        task = self.get(task_id)
+        if task is not None and not task.get("notified"):
+            task["notified"] = True
+            self.save()
 
     def restore(self, items: list[dict]) -> None:
         existing = {i.get("id") for i in self._items}
@@ -170,7 +218,7 @@ class TaskStore(JsonListStore):
 
 
 class NoteStore(JsonListStore):
-    """Catatan: {"id", "title", "content", "deadline", "done", "notified", "created", "updated"}.
+    """Catatan: {"id", "title", "content", "deadline", "done", "notified", "rewarded", "created", "updated"}.
 
     `deadline` berupa string ISO waktu lokal atau None. `done` = ditandai selesai (tidak lagi
     diingatkan). `notified` menandai pengingat "deadline sudah tiba" sudah dibunyikan.
@@ -182,7 +230,8 @@ class NoteStore(JsonListStore):
         note = {"id": uuid.uuid4().hex[:12], "title": title.strip(), "content": content.strip(),
                 "category": (category or "Personal").strip() or "Personal", "pinned": False,
                 "deadline": deadline.isoformat(timespec="minutes") if deadline else None,
-                "done": False, "notified": False, "created": stamp, "updated": stamp}
+                "done": False, "notified": False, "rewarded": False,
+                "created": stamp, "updated": stamp}
         self._items.append(note)
         self.save()
         return note
@@ -211,6 +260,12 @@ class NoteStore(JsonListStore):
         note["updated"] = now_iso()
         self.save()
         return True
+
+    def mark_rewarded(self, note_id: str) -> None:
+        note = self.get(note_id)
+        if note is not None and not note.get("rewarded"):
+            note["rewarded"] = True
+            self.save()
 
     def set_pinned(self, note_id: str, pinned: bool) -> bool:
         note = self.get(note_id)
@@ -251,11 +306,99 @@ class NoteStore(JsonListStore):
             self.save()
 
 
+class LocalEventStore(JsonListStore):
+    """Local calendar events (`local_events.json`): works with or without Google Calendar.
+
+    Schema: {"id", "title", "start", "end", "all_day", "location", "notes", "created", "updated"}.
+    """
+
+    def add(self, title: str, start: datetime, end: datetime | None = None,
+            all_day: bool = False, location: str = "", notes: str = "") -> dict | None:
+        title = (title or "").strip()
+        if not title or start is None:
+            return None
+        if all_day:
+            s_iso = start.replace(hour=0, minute=0, second=0, microsecond=0).isoformat(timespec="minutes")
+            e_dt = (start.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1))
+            e_iso = e_dt.isoformat(timespec="minutes")
+        else:
+            s_clean = start.replace(second=0, microsecond=0)
+            if end is not None:
+                e_clean = end.replace(second=0, microsecond=0)
+                if e_clean <= s_clean:
+                    e_clean = s_clean + timedelta(hours=1)
+                e_iso = e_clean.isoformat(timespec="minutes")
+            else:
+                e_iso = None
+            s_iso = s_clean.isoformat(timespec="minutes")
+        stamp = now_iso()
+        ev = {
+            "id": uuid.uuid4().hex[:12],
+            "title": title,
+            "start": s_iso,
+            "end": e_iso,
+            "all_day": bool(all_day),
+            "location": (location or "").strip(),
+            "notes": (notes or "").strip(),
+            "created": stamp,
+            "updated": stamp,
+        }
+        self._items.append(ev)
+        self.save()
+        return ev
+
+    def update(self, event_id: str, title: str, start: datetime, end: datetime | None = None,
+               all_day: bool = False, location: str = "", notes: str = "") -> dict | None:
+        ev = self.get(event_id)
+        title = (title or "").strip()
+        if ev is None or not title or start is None:
+            return None
+        if all_day:
+            s_iso = start.replace(hour=0, minute=0, second=0, microsecond=0).isoformat(timespec="minutes")
+            e_iso = (start.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)).isoformat(timespec="minutes")
+        else:
+            s_clean = start.replace(second=0, microsecond=0)
+            if end is not None:
+                e_clean = end.replace(second=0, microsecond=0)
+                if e_clean <= s_clean:
+                    e_clean = s_clean + timedelta(hours=1)
+                e_iso = e_clean.isoformat(timespec="minutes")
+            else:
+                e_iso = None
+            s_iso = s_clean.isoformat(timespec="minutes")
+        ev.update(
+            title=title,
+            start=s_iso,
+            end=e_iso,
+            all_day=bool(all_day),
+            location=(location or "").strip(),
+            notes=(notes or "").strip(),
+            updated=now_iso(),
+        )
+        self.save()
+        return ev
+
+    def restore(self, event: dict) -> dict | None:
+        if not isinstance(event, dict) or not event.get("id"):
+            return None
+        if self.get(event["id"]) is None:
+            copy = dict(event)
+            self._items.append(copy)
+            self.save()
+            return copy
+        return None
+
+
+
 # ---------------------------------------------------------------------------
-# Social Stats (social_stats.json) — Persona 5 Royal style, 20 pts per level
+# Social Stats (social_stats.json) — Persona 5 Royal progressive rank curve
 # ---------------------------------------------------------------------------
-STAT_POINTS_PER_LEVEL = 20
-DEFAULT_STAT_POINTS = 3
+# Escalating thresholds for Ranks 1..5 (Lv 1: 0, Lv 2: 30, Lv 3: 85, Lv 4: 175, Lv 5: 310),
+# followed by unlimited Mastery tiers every +180 pts (Lv 6 ★1: 490, Lv 7 ★2: 670, ...).
+STAT_RANK_THRESHOLDS: tuple[int, ...] = (0, 30, 85, 175, 310)
+STAT_MASTERY_STEP = 180
+STAT_POINTS_PER_LEVEL = STAT_RANK_THRESHOLDS[1]   # legacy compatibility constant
+DEFAULT_STAT_POINTS = 2
 QUICK_STAT_POINTS = (1, 2, 3, 5)
 DAILY_BLOCK_TARGET = 3
 TIME_BLOCKS = ("Daytime", "After School", "Evening")
@@ -267,35 +410,35 @@ SOCIAL_STATS: dict[str, dict] = {
     "knowledge": {
         "label": "Knowledge",
         "short": "KNO",
-        "examples": "Study, lectures, coursework",
+        "examples": "Study, lectures, coursework, deep focus",
         "placeholder": "e.g. Lecture review, 2h study session...",
         "ranks": ("Oblivious", "Learned", "Scholarly", "Encyclopedic", "Erudite"),
     },
     "guts": {
         "label": "Guts",
         "short": "GUT",
-        "examples": "Gym, workouts, physical training",
+        "examples": "Gym, workouts, tough challenges, physical training",
         "placeholder": "e.g. Gym session, strength workout...",
         "ranks": ("Milquetoast", "Bold", "Staunch", "Dauntless", "Lionhearted"),
     },
     "proficiency": {
         "label": "Proficiency",
         "short": "PRO",
-        "examples": "Badminton, volleyball, technique sports",
-        "placeholder": "e.g. Badminton match, volleyball practice...",
+        "examples": "Craft, coding projects, sports technique, tasks",
+        "placeholder": "e.g. Badminton match, coding sprint...",
         "ranks": ("Bumbling", "Decent", "Skilled", "Expert", "Transcendent"),
     },
     "charm": {
         "label": "Charm",
         "short": "CHA",
-        "examples": "Movies, books, drawing, 3D, gamedev",
+        "examples": "Movies, books, art, 3D, gamedev, presentation",
         "placeholder": "e.g. Watched a movie, 3D modeling, gamedev...",
         "ranks": ("Existent", "Head-Turning", "Suave", "Charismatic", "Debonair"),
     },
     "kindness": {
         "label": "Kindness",
         "short": "KIN",
-        "examples": "Cleaning, laundry, groceries, room chores",
+        "examples": "Cleaning, laundry, groceries, helping others",
         "placeholder": "e.g. Room cleaning, laundry, grocery run...",
         "ranks": ("Inoffensive", "Considerate", "Empathetic", "Selfless", "Angelic"),
     },
@@ -303,32 +446,72 @@ SOCIAL_STATS: dict[str, dict] = {
 
 
 def stat_level(points: int) -> int:
-    """0-20 -> Lv 1, 21-40 -> Lv 2, 41-60 -> Lv 3, ... (unlimited)."""
+    """Progressive P5R rank curve: Lv1=0..29, Lv2=30..84, Lv3=85..174, Lv4=175..309,
+    Lv5=310..489 (Max Rank), then Mastery Lv6+ every +180 pts."""
     pts = max(0, int(points))
-    if pts <= STAT_POINTS_PER_LEVEL:
-        return 1
-    return ((pts - 1) // STAT_POINTS_PER_LEVEL) + 1
+    max_base = len(STAT_RANK_THRESHOLDS)
+    top_req = STAT_RANK_THRESHOLDS[-1]
+    if pts >= top_req:
+        return max_base + (pts - top_req) // STAT_MASTERY_STEP
+    lv = 1
+    for idx in range(1, max_base):
+        if pts >= STAT_RANK_THRESHOLDS[idx]:
+            lv = idx + 1
+        else:
+            break
+    return lv
 
 
 def stat_level_progress(points: int) -> tuple[int, int, int, int]:
     """Return `(level, into_level, band_span, to_next_level)` for progress displays."""
     pts = max(0, int(points))
     lv = stat_level(pts)
-    next_at = lv * STAT_POINTS_PER_LEVEL + 1
-    if lv == 1:
-        band_start = 0
-        band_span = STAT_POINTS_PER_LEVEL + 1
+    max_base = len(STAT_RANK_THRESHOLDS)
+    if lv < max_base:
+        band_start = STAT_RANK_THRESHOLDS[lv - 1]
+        next_at = STAT_RANK_THRESHOLDS[lv]
     else:
-        band_start = (lv - 1) * STAT_POINTS_PER_LEVEL + 1
-        band_span = STAT_POINTS_PER_LEVEL
+        mastery_idx = lv - max_base
+        band_start = STAT_RANK_THRESHOLDS[-1] + mastery_idx * STAT_MASTERY_STEP
+        next_at = band_start + STAT_MASTERY_STEP
+    band_span = max(1, next_at - band_start)
     return lv, pts - band_start, band_span, max(0, next_at - pts)
 
 
+def stat_pentagon_fraction(points: float) -> float:
+    """Map raw points smoothly onto the 5 concentric pentagon rings (0.16..1.00).
+
+    Ring 1 = Lv 1 start (0.20), Ring 2 = Lv 2 (0.40), Ring 3 = Lv 3 (0.60),
+    Ring 4 = Lv 4 (0.80), Ring 5 = Lv 5 Max Rank (1.00).
+    """
+    pts = max(0.0, float(points))
+    top_req = float(STAT_RANK_THRESHOLDS[-1])
+    if pts >= top_req:
+        return 1.0
+    max_base = len(STAT_RANK_THRESHOLDS)
+    for idx in range(max_base - 1):
+        lo = float(STAT_RANK_THRESHOLDS[idx])
+        hi = float(STAT_RANK_THRESHOLDS[idx + 1])
+        if pts < hi:
+            frac_in_band = (pts - lo) / max(1.0, hi - lo)
+            rank_float = (idx + 1) + frac_in_band   # 1.0 .. 5.0
+            return max(0.16, min(1.0, rank_float / 5.0))
+    return 1.0
+
+
 def stat_rank_title(stat: str, level: int) -> str:
-    """Persona 5 Royal rank title for `stat` at `level`."""
+    """Persona 5 Royal rank title for `stat` at `level` (appends `★N` for Mastery Lv 6+)."""
     ranks = SOCIAL_STATS.get(stat, {}).get("ranks", ("Rank 1",))
-    idx = max(0, min(len(ranks) - 1, int(level) - 1))
-    return ranks[idx]
+    lv = max(1, int(level))
+    if lv <= len(ranks):
+        return ranks[lv - 1]
+    return f"{ranks[-1]} ★{lv - len(ranks)}"
+
+
+def overall_confidant_level(totals: dict[str, int]) -> tuple[int, int]:
+    """Return `(total_rank_sum, max_base_rank_sum)` across all 5 stats (starts at 5 / 25)."""
+    total_lv = sum(stat_level(totals.get(k, 0)) for k in SOCIAL_STAT_KEYS)
+    return total_lv, len(SOCIAL_STAT_KEYS) * len(STAT_RANK_THRESHOLDS)
 
 
 def default_time_block(hour: int | None = None) -> str:
@@ -342,10 +525,11 @@ def default_time_block(hour: int | None = None) -> str:
 
 
 class SocialStatsStore(JsonListStore):
-    """Activity log: {"id", "stat", "activity", "points", "date", "block", "created"}."""
+    """Activity log: {"id", "stat", "activity", "points", "date", "block", "source", "ref_id", "created"}."""
 
     def add(self, stat: str, activity: str, points: int = DEFAULT_STAT_POINTS,
-            block: str | None = None, day: str | None = None) -> tuple[dict | None, int, int]:
+            block: str | None = None, day: str | None = None,
+            source: str = "manual", ref_id: str = "") -> tuple[dict | None, int, int]:
         if stat not in SOCIAL_STATS:
             return None, 1, 1
         pts = max(1, min(500, int(points)))
@@ -360,6 +544,8 @@ class SocialStatsStore(JsonListStore):
             "points": pts,
             "date": date_str,
             "block": blk,
+            "source": (source or "manual").strip().lower(),
+            "ref_id": str(ref_id or ""),
             "created": now_iso(),
         }
         self._items.append(entry)
@@ -392,9 +578,191 @@ class SocialStatsStore(JsonListStore):
         target = day or datetime.now().strftime("%Y-%m-%d")
         return [i for i in self._items if i.get("date") == target]
 
+    def today_points(self, day: str | None = None) -> int:
+        return sum(max(0, int(i.get("points", 0))) for i in self.today_entries(day))
+
+    def streak_days(self, today: date | None = None) -> int:
+        """Consecutive calendar days with at least one logged activity (active through yesterday or today)."""
+        active_dates: set[date] = set()
+        for item in self._items:
+            raw = item.get("date")
+            if not raw:
+                continue
+            try:
+                active_dates.add(date.fromisoformat(str(raw)))
+            except ValueError:
+                continue
+        if not active_dates:
+            return 0
+        ref = today or date.today()
+        if ref not in active_dates:
+            ref = ref - timedelta(days=1)
+            if ref not in active_dates:
+                return 0
+        count = 0
+        cur = ref
+        while cur in active_dates:
+            count += 1
+            cur -= timedelta(days=1)
+        return count
+
     def recent(self, limit: int = 50, stat_filter: str = "all") -> list[dict]:
         items = self._items if stat_filter == "all" else [i for i in self._items if i.get("stat") == stat_filter]
         return list(reversed(items))[:max(1, limit)]
+
+
+# ---------------------------------------------------------------------------
+# Custom Daily Habits (habits.json) — user-defined daily checklist + Social Stat auto-reward
+# ---------------------------------------------------------------------------
+class HabitStore(JsonListStore):
+    """User-customizable daily habits linked to Social Stats.
+
+    Schema: {"id", "title", "stat", "points", "done_dates": [YYYY-MM-DD], "log_ids": {date: entry_id}, "created"}.
+    Completion resets automatically each new day while tracking consecutive streaks.
+    """
+
+    def add(self, title: str, stat: str = "knowledge", points: int = 2) -> dict | None:
+        title = (title or "").strip()
+        if not title:
+            return None
+        st = stat if stat in SOCIAL_STATS else "knowledge"
+        pts = max(1, min(10, int(points)))
+        habit = {
+            "id": uuid.uuid4().hex[:12],
+            "title": title,
+            "stat": st,
+            "points": pts,
+            "done_dates": [],
+            "log_ids": {},
+            "created": now_iso(),
+        }
+        self._items.append(habit)
+        self.save()
+        return habit
+
+    def update(self, habit_id: str, title: str, stat: str, points: int) -> dict | None:
+        h = self.get(habit_id)
+        title = (title or "").strip()
+        if h is None or not title:
+            return None
+        h["title"] = title
+        h["stat"] = stat if stat in SOCIAL_STATS else h.get("stat", "knowledge")
+        h["points"] = max(1, min(10, int(points)))
+        self.save()
+        return h
+
+    def restore(self, habit: dict) -> dict | None:
+        if not isinstance(habit, dict) or not habit.get("id"):
+            return None
+        if self.get(habit["id"]) is None:
+            copy = dict(habit)
+            copy["done_dates"] = list(habit.get("done_dates") or [])
+            copy["log_ids"] = dict(habit.get("log_ids") or {})
+            self._items.append(copy)
+            self.save()
+            return copy
+        return None
+
+    def is_done_on(self, habit: dict, day: date | str | None = None) -> bool:
+        if isinstance(day, date):
+            key = day.isoformat()
+        elif isinstance(day, str) and day:
+            key = day
+        else:
+            key = date.today().isoformat()
+        return key in (habit.get("done_dates") or [])
+
+    def toggle_today(self, habit_id: str, stats_store: SocialStatsStore | None = None,
+                     today: date | None = None) -> tuple[bool, dict | None, int, int]:
+        """Toggle today's completion for `habit_id`.
+
+        When checked: awards Social Stat points via `stats_store` (idempotent per day).
+        When unchecked: reverts today's linked stat entry so toggling cannot farm points.
+        Returns `(now_done, stat_entry, old_lv, new_lv)`.
+        """
+        habit = self.get(habit_id)
+        if habit is None:
+            return False, None, 1, 1
+        ref = today or date.today()
+        day_str = ref.isoformat()
+        dates = list(habit.get("done_dates") or [])
+        log_ids = dict(habit.get("log_ids") or {})
+
+        if day_str in dates:
+            dates = [d for d in dates if d != day_str]
+            old_entry_id = log_ids.pop(day_str, None)
+            habit["done_dates"] = dates
+            habit["log_ids"] = log_ids
+            self.save()
+            if stats_store is not None and old_entry_id:
+                stats_store.delete(old_entry_id)
+            return False, None, 1, 1
+
+        dates.append(day_str)
+        # Keep unique sorted dates
+        habit["done_dates"] = sorted(set(dates))
+        entry, old_lv, new_lv = None, 1, 1
+        if stats_store is not None:
+            stat = habit.get("stat", "knowledge")
+            pts = max(1, min(10, int(habit.get("points", 2))))
+            entry, old_lv, new_lv = stats_store.add(
+                stat=stat,
+                activity=f"Habit: {habit.get('title', 'Daily Habit')}",
+                points=pts,
+                day=day_str,
+                source="habit",
+                ref_id=habit_id,
+            )
+            if entry is not None:
+                log_ids[day_str] = entry["id"]
+        habit["log_ids"] = log_ids
+        self.save()
+        return True, entry, old_lv, new_lv
+
+    def streak(self, habit: dict, today: date | None = None) -> int:
+        done_set: set[date] = set()
+        for raw in habit.get("done_dates") or ():
+            try:
+                done_set.add(date.fromisoformat(str(raw)))
+            except ValueError:
+                continue
+        if not done_set:
+            return 0
+        ref = today or date.today()
+        if ref not in done_set:
+            ref = ref - timedelta(days=1)
+            if ref not in done_set:
+                return 0
+        n = 0
+        cur = ref
+        while cur in done_set:
+            n += 1
+            cur -= timedelta(days=1)
+        return n
+
+    def best_streak(self, habit: dict) -> int:
+        days: list[date] = []
+        for raw in habit.get("done_dates") or ():
+            try:
+                days.append(date.fromisoformat(str(raw)))
+            except ValueError:
+                continue
+        if not days:
+            return 0
+        days = sorted(set(days))
+        best = cur = 1
+        for i in range(1, len(days)):
+            if (days[i] - days[i - 1]).days == 1:
+                cur += 1
+                best = max(best, cur)
+            else:
+                cur = 1
+        return best
+
+    def today_summary(self, today: date | None = None) -> tuple[int, int]:
+        ref = today or date.today()
+        done = sum(1 for h in self._items if self.is_done_on(h, ref))
+        return done, len(self._items)
 
 
 # ---------------------------------------------------------------------------
@@ -420,8 +788,13 @@ SETTINGS_DEFAULTS = {
     "focus_min": 25,                    # Pomodoro focus duration (min)
     "rest_min": 5,                      # Pomodoro break duration (min)
     "ui_scale": 100,                    # UI size percentage (75-150)
-    "sound_enabled": True,              # UI SFX, Social Stats fanfare, and Morgana voice
-    "sound_volume": 80,                 # Master audio volume percentage (0-100)
+    "sound_enabled": True,              # Master audio toggle
+    "sound_volume": 80,                 # Legacy master audio volume (kept for migration)
+    "voice_volume": 85,                 # Morgana voiceline volume percentage (0-100)
+    "sfx_volume": 75,                   # UI & Social Stats SFX volume percentage (0-100)
+    "morning_briefing": True,           # Show Daily Briefing & Confidant Summary once daily
+    "auto_stat_rewards": True,          # Auto-award Social Stats from tasks, notes & focus
+    "last_briefing_date": "",           # YYYY-MM-DD of last auto-delivered Daily Briefing
     "enabled_tabs": list(RADIAL_TAB_KEYS),  # Active tabs shown in Morgana's radial menu
 }
 _INT_RANGES = {
@@ -432,12 +805,25 @@ _INT_RANGES = {
     "rest_min": (1, 60),
     "ui_scale": (75, 150),
     "sound_volume": (0, 100),
+    "voice_volume": (0, 100),
+    "sfx_volume": (0, 100),
 }
+_BOOL_KEYS = ("curfew_enabled", "sound_enabled", "morning_briefing", "auto_stat_rewards")
 
 
 def _valid_hhmm(value) -> bool:
     try:
         datetime.strptime(str(value), "%H:%M")
+        return True
+    except ValueError:
+        return False
+
+
+def _valid_iso_date(value) -> bool:
+    if value == "":
+        return True
+    try:
+        date.fromisoformat(str(value))
         return True
     except ValueError:
         return False
@@ -482,6 +868,14 @@ class SettingsStore:
             old_m = raw.get("curfew_interval_min")
             if isinstance(old_m, (int, float)) and not isinstance(old_m, bool) and int(old_m) > 1:
                 patch["curfew_interval_sec"] = int(old_m) * 60
+        # Migrate legacy single sound_volume -> separate voice_volume & sfx_volume
+        if "sound_volume" in raw:
+            old_v = raw.get("sound_volume")
+            if isinstance(old_v, (int, float)) and not isinstance(old_v, bool):
+                if "voice_volume" not in raw:
+                    patch["voice_volume"] = int(old_v)
+                if "sfx_volume" not in raw:
+                    patch["sfx_volume"] = int(old_v)
         self.set(save=False, **patch)
 
     def set(self, save: bool = True, **values) -> None:
@@ -496,8 +890,11 @@ class SettingsStore:
             if key in ("bedtime", "wake"):
                 if _valid_hhmm(value):
                     self.data[key] = datetime.strptime(str(value), "%H:%M").strftime("%H:%M")
-            elif key in ("curfew_enabled", "sound_enabled"):
+            elif key in _BOOL_KEYS:
                 if isinstance(value, bool):
+                    self.data[key] = value
+            elif key == "last_briefing_date":
+                if isinstance(value, str) and _valid_iso_date(value):
                     self.data[key] = value
             elif key == "enabled_tabs":
                 cleaned = normalize_enabled_tabs(value)

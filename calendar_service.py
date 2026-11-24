@@ -45,8 +45,10 @@ class CalendarEvent:
     end: datetime | None = None
     all_day: bool = False
     is_dummy: bool = False
-    source: str = "calendar"      # "calendar" | "note"
-    category: str = ""            # optional note category ("Personal" | "Work" | "Study")
+    source: str = "calendar"      # "calendar" | "local" | "note" | "task"
+    category: str = ""            # optional note category or task priority ("high")
+    location: str = ""            # optional location for local events
+    notes: str = ""               # optional description for local events
 
 
 @dataclass
@@ -67,6 +69,16 @@ class AuthRequired(Exception):
 # ---------------------------------------------------------------------------
 def _parse_dt(text: str) -> datetime:
     return datetime.fromisoformat(text.replace("Z", "+00:00")).astimezone()
+
+
+def _parse_local_aware(raw: str | None) -> datetime | None:
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(raw))
+        return dt.astimezone()
+    except (TypeError, ValueError):
+        return None
 
 
 def parse_event(item: dict) -> CalendarEvent | None:
@@ -90,7 +102,8 @@ def parse_event(item: dict) -> CalendarEvent | None:
     except (ValueError, KeyError):
         return None
     return CalendarEvent(id=item.get("id", ""), title=item.get("summary") or "(untitled)",
-                         start=start, end=end, all_day=all_day)
+                         start=start, end=end, all_day=all_day,
+                         location=(item.get("location") or "").strip())
 
 
 def note_deadline_events(notes: list[dict], now: datetime | None = None,
@@ -103,16 +116,8 @@ def note_deadline_events(notes: list[dict], now: datetime | None = None,
     for n in notes or ():
         if not isinstance(n, dict) or n.get("done") or not n.get("deadline"):
             continue
-        raw_dl = n.get("deadline")
-        try:
-            dl = datetime.fromisoformat(str(raw_dl))
-            if dl.tzinfo is None:
-                dl = dl.astimezone()
-            else:
-                dl = dl.astimezone()
-        except (TypeError, ValueError):
-            continue
-        if dl < end_limit:
+        dl = _parse_local_aware(n.get("deadline"))
+        if dl is not None and dl < end_limit:
             items.append(CalendarEvent(
                 id=f"note:{n.get('id', '')}",
                 title=(n.get("title") or "").strip() or "(Untitled Note)",
@@ -127,19 +132,111 @@ def note_deadline_events(notes: list[dict], now: datetime | None = None,
     return items
 
 
-def merge_note_deadlines(result: CalendarResult, notes: list[dict],
-                         now: datetime | None = None, days: int = 7) -> CalendarResult:
-    """Return a new `CalendarResult` combining calendar events with active note deadlines."""
+def task_deadline_events(tasks: list[dict], now: datetime | None = None,
+                         days: int = 7) -> list[CalendarEvent]:
+    """Convert pending tasks with deadlines (overdue or within `days`) into `CalendarEvent`s."""
     now = now or datetime.now().astimezone()
-    base = [e for e in result.events if e.source != "note"]
+    start_day = now.date()
+    end_limit = datetime(start_day.year, start_day.month, start_day.day).astimezone() + timedelta(days=max(1, days))
+    items: list[CalendarEvent] = []
+    for t in tasks or ():
+        if not isinstance(t, dict) or t.get("done") or not t.get("deadline"):
+            continue
+        dl = _parse_local_aware(t.get("deadline"))
+        if dl is not None and dl < end_limit:
+            items.append(CalendarEvent(
+                id=f"task:{t.get('id', '')}",
+                title=(t.get("title") or "").strip() or "(Untitled Task)",
+                start=dl,
+                end=None,
+                all_day=False,
+                is_dummy=False,
+                source="task",
+                category="high" if t.get("priority") == "high" else "",
+            ))
+    items.sort(key=lambda e: e.start)
+    return items
+
+
+def local_calendar_events(local_events: list[dict], now: datetime | None = None,
+                          days: int = 7) -> list[CalendarEvent]:
+    """Convert user-created local events overlapping the `[today, today+days)` window."""
+    now = now or datetime.now().astimezone()
+    start_day = now.date()
+    win_start = datetime(start_day.year, start_day.month, start_day.day).astimezone()
+    win_end = win_start + timedelta(days=max(1, days))
+    items: list[CalendarEvent] = []
+    for ev in local_events or ():
+        if not isinstance(ev, dict) or not ev.get("start"):
+            continue
+        st = _parse_local_aware(ev.get("start"))
+        if st is None:
+            continue
+        en = _parse_local_aware(ev.get("end"))
+        all_day = bool(ev.get("all_day"))
+        if all_day:
+            s_d = st.date()
+            e_d = en.date() if en else (s_d + timedelta(days=1))
+            if e_d <= s_d:
+                e_d = s_d + timedelta(days=1)
+            if e_d <= start_day or s_d >= (start_day + timedelta(days=max(1, days))):
+                continue
+            st = datetime(s_d.year, s_d.month, s_d.day).astimezone()
+            en = datetime(e_d.year, e_d.month, e_d.day).astimezone()
+        else:
+            effective_end = en if (en is not None and en > st) else st
+            if effective_end < win_start or st >= win_end:
+                continue
+        items.append(CalendarEvent(
+            id=f"local:{ev.get('id', '')}",
+            title=(ev.get("title") or "").strip() or "(Untitled Event)",
+            start=st,
+            end=en,
+            all_day=all_day,
+            is_dummy=False,
+            source="local",
+            location=(ev.get("location") or "").strip(),
+            notes=(ev.get("notes") or "").strip(),
+        ))
+    items.sort(key=lambda e: (0 if e.all_day else 1, e.start))
+    return items
+
+
+def merge_companion_items(result: CalendarResult, notes: list[dict] = (),
+                          tasks: list[dict] = (), local_events: list[dict] = (),
+                          now: datetime | None = None, days: int = 7) -> CalendarResult:
+    """Combine calendar events with local events, active note deadlines, and pending task deadlines.
+
+    When Google Calendar is unconfigured (sample/dummy mode) and the user has created
+    local events, dummy sample rows are suppressed so real local events shine cleanly.
+    """
+    now = now or datetime.now().astimezone()
+    local_evs = local_calendar_events(local_events, now=now, days=days)
     note_evs = note_deadline_events(notes, now=now, days=days)
-    combined = sorted(base + note_evs, key=lambda e: (0 if e.all_day else 1, e.start))
+    task_evs = task_deadline_events(tasks, now=now, days=days)
+
+    has_any_local = bool(local_events)
+    if result.is_dummy and has_any_local:
+        base: list[CalendarEvent] = []
+        is_dummy = False
+    else:
+        base = [e for e in result.events if e.source == "calendar"]
+        is_dummy = result.is_dummy
+
+    combined = sorted(base + local_evs + note_evs + task_evs,
+                      key=lambda e: (0 if e.all_day else 1, e.start))
     return CalendarResult(
         events=combined,
         status=result.status,
         message=result.message,
-        is_dummy=result.is_dummy,
+        is_dummy=is_dummy,
     )
+
+
+def merge_note_deadlines(result: CalendarResult, notes: list[dict],
+                         now: datetime | None = None, days: int = 7) -> CalendarResult:
+    """Backward-compatible wrapper around `merge_companion_items`."""
+    return merge_companion_items(result, notes=notes, now=now, days=days)
 
 
 def human_delta(td: timedelta) -> str:
@@ -164,10 +261,14 @@ def day_label(when: datetime, now: datetime) -> str:
     return f"{when:%a, %d %b}"
 
 
+def _is_deadline_source(source: str) -> bool:
+    return source in ("note", "task")
+
+
 def events_by_day(events: list[CalendarEvent], now: datetime | None = None,
                   days: int = 7) -> list[tuple[date, list[CalendarEvent]]]:
     """Group `events` into `days` consecutive day buckets starting from today.
-    Overdue active note deadlines are pinned to today's bucket so they are never missed."""
+    Overdue active note/task deadlines are pinned to today's bucket so they are never missed."""
     now = now or datetime.now().astimezone()
     start_day = now.date()
     day_list = [start_day + timedelta(days=i) for i in range(max(1, days))]
@@ -185,27 +286,31 @@ def events_by_day(events: list[CalendarEvent], now: datetime | None = None,
             d = ev.start.date()
             if d in buckets:
                 buckets[d].append(ev)
-            elif ev.source == "note" and d < start_day:
+            elif _is_deadline_source(ev.source) and d < start_day:
                 buckets[start_day].append(ev)
     for d in day_list:
-        buckets[d].sort(key=lambda e: (0 if (e.source == "note" and e.start <= now) else (1 if e.all_day else 2), e.start))
+        buckets[d].sort(
+            key=lambda e: (0 if (_is_deadline_source(e.source) and e.start <= now)
+                           else (1 if e.all_day else 2), e.start)
+        )
     return [(d, buckets[d]) for d in day_list]
 
 
 def morgana_briefing(result: CalendarResult, now: datetime | None = None) -> tuple[str, str]:
-    """Return `(status_tag, morgana_line)` about the next event or note deadline for the Events window."""
+    """Return `(status_tag, morgana_line)` about the next event or task/note deadline."""
     now = now or datetime.now().astimezone()
-    note_evs = [e for e in result.events if e.source == "note"]
-    if result.status == "error" and not note_evs:
+    companion_evs = [e for e in result.events if e.source in ("local", "note", "task")]
+    if result.status == "error" and not companion_evs:
         return ("SYNC ERROR",
-                f"I couldn't reach your calendar right now ({result.message}). Hit Refresh to try again!")
-    if result.status == "auth_needed" and not note_evs:
+                f"I couldn't reach your calendar right now ({result.message}). Hit Refresh or add a local event!")
+    if result.status == "auth_needed" and not companion_evs:
         return ("SIGN IN",
-                "Your Google Calendar session expired. Click Sign In and I'll grab your week's schedule!")
+                "Your Google Calendar session expired. Click Sign In, or add local events anytime!")
 
     timed = sorted((e for e in result.events if not e.all_day), key=lambda e: e.start)
-    ongoing = [e for e in timed if e.source != "note" and e.start <= now and (e.end is None or e.end > now)]
-    overdue_notes = [e for e in timed if e.source == "note" and e.start <= now]
+    ongoing = [e for e in timed if not _is_deadline_source(e.source)
+               and e.start <= now and (e.end is None or e.end > now)]
+    overdue = [e for e in timed if _is_deadline_source(e.source) and e.start <= now]
     upcoming = [e for e in timed if e.start > now]
     today_all_day = [
         e for e in result.events
@@ -213,41 +318,55 @@ def morgana_briefing(result: CalendarResult, now: datetime | None = None) -> tup
     ]
     sample_note = ""
     if result.status == "no_credentials":
-        sample_note = " (Showing sample calendar + your Note deadlines—add credentials.json to sync Google Calendar.)" if note_evs else " (Showing a sample week—add credentials.json to sync Google Calendar.)"
-    elif result.status == "no_libs":
-        sample_note = " (Showing a sample week—install the Google Calendar packages to sync.)"
+        if result.is_dummy:
+            sample_note = (" (Sample calendar + your deadlines—click + EVENT to add local events or add credentials.json.)"
+                           if companion_evs else " (Showing a sample week—click + EVENT for local events or add credentials.json.)")
+        else:
+            sample_note = ""
+    elif result.status == "no_libs" and result.is_dummy:
+        sample_note = " (Showing a sample week—click + EVENT to manage local events anytime.)"
     elif result.status == "error":
-        sample_note = f" (Calendar offline: {result.message}; showing your Note deadlines.)"
+        sample_note = f" (Google offline: {result.message}; showing your local events & deadlines.)"
     elif result.status == "auth_needed":
-        sample_note = " (Calendar needs Sign In; showing your Note deadlines.)"
+        sample_note = " (Google needs Sign In; showing your local events & deadlines.)"
 
     if ongoing:
         ev = ongoing[0]
         until = f" until {ev.end:%H:%M}" if ev.end else ""
         extra = ""
-        if overdue_notes:
-            extra = f" Watch out—note deadline '{overdue_notes[0].title}' is overdue!"
+        if overdue:
+            kind_w = "task" if overdue[0].source == "task" else "note"
+            extra = f" Watch out—{kind_w} deadline '{overdue[0].title}' is overdue!"
         elif upcoming:
             nxt = upcoming[0]
-            kind = "Note deadline" if nxt.source == "note" else "Next up:"
+            kind = ("Task deadline" if nxt.source == "task"
+                    else ("Note deadline" if nxt.source == "note" else "Next up:"))
             extra = f" After that, {kind} {nxt.title} at {nxt.start:%H:%M} ({day_label(nxt.start, now)})."
         return ("HAPPENING NOW",
                 f"You've got {ev.title} happening right now{until}! Stay focused—you've got this.{extra}{sample_note}")
-    if overdue_notes:
-        ov = overdue_notes[0]
-        cnt = len(overdue_notes)
+    if overdue:
+        ov = overdue[0]
+        cnt = len(overdue)
         more = f" (+{cnt - 1} more overdue)" if cnt > 1 else ""
         when = f"{ov.start:%H:%M}" if ov.start.date() == now.date() else f"{ov.start:%d %b %H:%M}"
+        if ov.source == "task":
+            return ("OVERDUE TASK",
+                    f"Heads up! Task '{ov.title}' was due at {when}{more}! Open Tasks to knock it out!{sample_note}")
         return ("OVERDUE NOTE",
                 f"Heads up! Your note deadline '{ov.title}' was due at {when}{more}! Open Notes to check it off!{sample_note}")
     if upcoming:
         ev = upcoming[0]
+        if ev.source == "task":
+            return ("TASK DEADLINE",
+                    f"Next up is your task deadline '{ev.title}' in {human_delta(ev.start - now)}! "
+                    f"Due at {ev.start:%H:%M} ({day_label(ev.start, now)}).{sample_note}")
         if ev.source == "note":
             return ("NOTE DEADLINE",
                     f"Next up is your note deadline '{ev.title}' in {human_delta(ev.start - now)}! "
                     f"Due at {ev.start:%H:%M} ({day_label(ev.start, now)}).{sample_note}")
-        tag = "SAMPLE · NEXT UP" if result.is_dummy else "NEXT UP"
-        msg = (f"Next up is {ev.title} in {human_delta(ev.start - now)}! "
+        tag = "SAMPLE · NEXT UP" if result.is_dummy else ("LOCAL · NEXT UP" if ev.source == "local" else "NEXT UP")
+        loc = f" at {ev.location}" if ev.location else ""
+        msg = (f"Next up is {ev.title}{loc} in {human_delta(ev.start - now)}! "
                f"It starts at {ev.start:%H:%M} ({day_label(ev.start, now)}).")
         if today_all_day:
             msg += f" Also on today's calendar: {today_all_day[0].title}."
