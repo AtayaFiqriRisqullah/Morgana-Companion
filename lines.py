@@ -449,6 +449,12 @@ class ContextualDialogue:
                 ("You've got the game plan—let's tackle the day together!", "smug", "hmm"),
             ])
 
+        if kind == "wrapup":
+            return self._pick("close_wrapup", [
+                ("Day wrapped up cleanly! Get some real rest tonight—you earned it!", "wink", "hmm"),
+                ("Tomorrow's board is all set. Recharge well tonight, partner!", "smug", "naa"),
+            ])
+
         return ("Alright, all closed!", "neutral", "hmm")
 
     def task_completed(self, title: str, remaining: int, reward_note: str = "") -> tuple[str, str, str]:
@@ -659,3 +665,82 @@ def build_daily_briefing(ctx: dict) -> dict:
         "voice": voice,
         "advice": advice,
     }
+
+
+# ---------------------------------------------------------------------------
+# Evening Wrap-up Recap & Auto-DND Recovery (Qt-free)
+# ---------------------------------------------------------------------------
+def build_evening_wrapup(ctx: dict) -> dict:
+    """Build structured Persona 5 Evening Wrap-up recap copy from today's activity."""
+    done_today = int(ctx.get("done_today_count", 0))
+    pending = int(ctx.get("pending_count", 0))
+    habits_done = int(ctx.get("habits_done", 0))
+    habits_total = int(ctx.get("habits_total", 0))
+    focus_done = int(ctx.get("focus_sessions", 0))
+    scr_text = str(ctx.get("screen_time_text") or "0m")
+    today_pts = int(ctx.get("today_points", 0))
+
+    wins = done_today + habits_done + focus_done
+    if wins >= 5:
+        headline = "WHAT A RUN TODAY — HUGE PROGRESS!"
+        emotion, voice = "excited", "oh_excited"
+    elif wins >= 2:
+        headline = "SOLID WORK TODAY — TIME TO UNWIND!"
+        emotion, voice = "wink", "hmm"
+    elif wins == 1:
+        headline = "NICE STEP FORWARD — EASY EVENING!"
+        emotion, voice = "smug", "naa"
+    else:
+        headline = "QUIET DAY — READY TO RESET FOR TOMORROW?"
+        emotion, voice = "neutral", "hmm"
+
+    bits: list[str] = []
+    if done_today:
+        bits.append(f"{done_today} {'task' if done_today == 1 else 'tasks'} finished")
+    if habits_total:
+        bits.append(f"{habits_done}/{habits_total} daily habits")
+    if focus_done:
+        bits.append(f"{focus_done} focus {'sprint' if focus_done == 1 else 'sprints'}")
+    if today_pts:
+        bits.append(f"+{today_pts} Social Stat pts")
+
+    if bits:
+        summary = "Today you logged " + ", ".join(bits) + f" across {scr_text} of active screen time."
+    else:
+        summary = f"You spent {scr_text} active today. Even quiet days count—reset cleanly for tomorrow!"
+
+    if pending > 0:
+        advice = (
+            f"{summary} You still have {pending} unfinished {'task' if pending == 1 else 'tasks'}—"
+            "roll any over to tomorrow in one click, jot a 1-line reflection, and get real rest!"
+        )
+    else:
+        advice = (
+            f"{summary} Zero pending tasks left on the board! "
+            "Drop a quick 1-line reflection into your Journal and enjoy a stress-free night."
+        )
+
+    spoken = (
+        f"Evening wrap-up time! {summary} "
+        + ("Let's roll over what's left to tomorrow and jot a quick note!" if pending else "Everything's clear—save a quick reflection and rest up!")
+    )
+    return {
+        "date_banner": ctx.get("date_banner", ""),
+        "headline": headline,
+        "advice": advice,
+        "spoken": spoken,
+        "emotion": emotion,
+        "voice": voice,
+    }
+
+
+def dnd_recovery_line(reason: str, duration_text: str, deferred_count: int = 0) -> tuple[str, str, str]:
+    """Gentle catch-up remark after Auto-DND disengages following a meeting or fullscreen session."""
+    if reason == "meeting":
+        base = f"Welcome back from your call ({duration_text} in quiet mode)!"
+    else:
+        base = f"Back from fullscreen ({duration_text} in quiet mode)!"
+    if deferred_count > 0:
+        word = "reminder" if deferred_count == 1 else "reminders"
+        return (f"{base} I held {deferred_count} {word} while you were busy:", "wink", "hmm")
+    return (f"{base} Hope that went smoothly—grab some water and stretch!", "wink", "naa")
