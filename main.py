@@ -47,21 +47,25 @@ from pathlib import Path
 from PyQt6.QtCore import (QDir, QLockFile, QObject, QPoint, QPointF, QRect, QRectF, Qt,
                           QTimer, pyqtSignal)
 from PyQt6.QtGui import (QAction, QActionGroup, QColor, QCursor, QFontMetrics, QGuiApplication,
-                         QIcon, QPainter, QPainterPath, QPen, QPixmap, QPolygonF, QRegion,
-                         QTransform)
+                         QIcon, QKeySequence, QPainter, QPainterPath, QPen, QPixmap, QPolygonF,
+                         QRegion, QShortcut, QTransform)
 from PyQt6.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QWidget
 
 import app_paths
 import autostart
 from audio_manager import init_audio, play_ui
-from awareness import AppAwarenessMonitor, ScreenTimeStore, get_active_window, get_idle_seconds
+from awareness import (AppAwarenessMonitor, ScreenTimeStore, format_duration, get_active_window,
+                       get_idle_seconds)
 from calendar_service import (CalendarEvent, CalendarResult, CalendarService, events_by_day,
                               format_agenda, human_delta, local_calendar_events,
                               merge_companion_items, note_deadline_events, task_deadline_events)
+from command_engine import CommandResult, parse_and_plan, query_ai_endpoint
 from dialogue_engine import DialogueEngine, DialogueMemoryStore
 from emotions import EXPRESSIONS, STATE_EXPRESSION, emotion_for_text, voice_for_dialogue
+from hotkeys import GlobalHotkeyManager
 from motion import FrameTicker, Spring, clamp
-from lines import (ContextualDialogue, LineBag, build_daily_briefing, greeting_pool, load_lines)
+from lines import (ContextualDialogue, LineBag, build_daily_briefing, build_evening_wrapup,
+                   dnd_recovery_line, greeting_pool, load_lines)
 from particles import ParticleOverlay
 import sprites
 from sprites import EYE_CLOSED, EYE_HALF, EYE_OPEN, MOUTH_BASE, MorganaSprites
@@ -73,8 +77,8 @@ from theme import (BLACK, BLACK_BURST_SHARDS, BLUE, GOLD, LIGHT_RED, MENU_QSS, P
                    P5_SURFACE, RED, RED_BURST_SHARDS, UI_SCALE_PRESETS, WHITE, lerp_color,
                    load_fonts, menu_qss, p5_dialogue_font, p5_font, pen, scale_polygon,
                    star_polygon, tapered_wedge)
-from ui_dialogs import (BriefingDialog, EventsDialog, NotesDialog, SettingsDialog,
-                        SocialStatsDialog, TasksDialog, TimerDialog)
+from ui_dialogs import (BriefingDialog, EventsDialog, NotesDialog, QuickCommandDialog,
+                        SettingsDialog, SocialStatsDialog, TasksDialog, TimerDialog, WrapUpDialog)
 
 try:
     import psutil
@@ -2507,6 +2511,42 @@ class CalendarFetcher(QObject):
         self.done.emit(result)          # diterima di thread UI (queued connection)
 
 
+class AIFetcher(QObject):
+    """Background worker for strictly opt-in OpenAI-compatible AI replies (never blocks UI)."""
+
+    done = pyqtSignal(bool, str, object)  # (ok, reply_text, fallback_CommandResult)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._busy = False
+
+    @property
+    def busy(self) -> bool:
+        return self._busy
+
+    def ask(self, prompt: str, ctx: dict, endpoint: str, model: str,
+            api_key: str, fallback: CommandResult) -> bool:
+        if self._busy:
+            return False
+        self._busy = True
+        threading.Thread(
+            target=self._run,
+            args=(prompt, ctx, endpoint, model, api_key, fallback),
+            daemon=True,
+            name="morgana-ai-ask",
+        ).start()
+        return True
+
+    def _run(self, prompt: str, ctx: dict, endpoint: str, model: str,
+             api_key: str, fallback: CommandResult) -> None:
+        try:
+            ok, text = query_ai_endpoint(prompt, ctx, endpoint, model, api_key)
+        except Exception as exc:
+            ok, text = False, str(exc)
+        self._busy = False
+        self.done.emit(ok, text, fallback)
+
+
 # ---------------------------------------------------------------------------
 # 8. CONTROLLER
 # ---------------------------------------------------------------------------
@@ -2570,6 +2610,8 @@ class PetController(QObject):
         self.dialogue = ContextualDialogue()
         self.calendar = CalendarService(APP_DIR)
         self.fetcher = CalendarFetcher(self.calendar, self)
+        self.ai_fetcher = AIFetcher(self)
+        self.hotkeys = GlobalHotkeyManager(self)
         self.tasks_dialog: TasksDialog | None = None
         self.notes_dialog: NotesDialog | None = None
         self.events_dialog: EventsDialog | None = None
@@ -2577,10 +2619,13 @@ class PetController(QObject):
         self.timer_dialog: TimerDialog | None = None
         self.settings_dialog: SettingsDialog | None = None
         self.briefing_dialog: BriefingDialog | None = None
+        self.quick_cmd_dialog: QuickCommandDialog | None = None
+        self.wrapup_dialog: WrapUpDialog | None = None
         self._cal_events: list[CalendarEvent] = []
         self._last_cal_result: CalendarResult | None = None
         self._remind_last: dict[str, float] = {}    # kunci acara -> waktu (monotonic) pengingat terakhir
         self._remind_started: set[str] = set()      # acara yang sudah diberi pesan "dimulai sekarang"
+        self._deferred_reminders: list[str] = []    # reminders queued while Do Not Disturb is active
         self._agenda_wanted = False            # pengguna menunggu hasil EVENTS
         self._rebuilding_ui = False            # suppress open/close chatter during UI scale/tab sync
         self._last_bump_t = 0.0
@@ -2589,10 +2634,13 @@ class PetController(QObject):
         self._pending_choices: list[str] = []
         self._menu_hover_action: dict[int, object] = {}
 
-        # state karakter
+        # state karakter & Do Not Disturb
         self.forced_state: str | None = None   # override manual dari menu klik kanan
         self.forced_expression: str | None = None
         self.sleep_mode = False
+        self.manual_dnd = bool(self.settings["manual_dnd"])
+        self._auto_dnd_reason = ""             # "", "meeting", or "fullscreen"
+        self._auto_dnd_since: float | None = None
         self.curfew_enabled = bool(self.settings["curfew_enabled"])
         self.curfew_active = False
         self._last_curfew_msg: datetime | None = None
@@ -2617,6 +2665,10 @@ class PetController(QObject):
         self._build_system_menu()
         self._build_tray()
 
+        # In-app Quick Command fallback shortcut (works whenever Morgana sprite has focus)
+        self._inapp_cmd_sc = QShortcut(QKeySequence("Ctrl+K"), self.pet)
+        self._inapp_cmd_sc.activated.connect(self._open_quick_command)
+
         self.pet.clicked.connect(self._on_pet_clicked)
         self.pet.double_clicked.connect(self._on_pet_double_clicked)
         self.pet.moved.connect(self._on_pet_moved)
@@ -2640,6 +2692,8 @@ class PetController(QObject):
         self.manual_timers.changed.connect(self._sync_timer_ui)
         self.manual_timers.fired.connect(self._on_manual_timer_fired)
         self.fetcher.done.connect(self._on_calendar_result)
+        self.ai_fetcher.done.connect(self._on_ai_reply)
+        self.hotkeys.activated.connect(self._open_quick_command)
 
         self._curfew_timer = QTimer(self)
         self._curfew_timer.setInterval(5_000)      # 5s precision check for 30s bedtime cadence
@@ -2665,6 +2719,9 @@ class PetController(QObject):
         self._move_to_corner(QGuiApplication.primaryScreen())
         self.pet.show()
         self.particles.follow()
+        self.hotkeys.register(str(self.settings["quick_hotkey"]))
+        self._sync_timer_ui()
+        self._update_tray_tooltip()
         self._check_curfew()
         self._curfew_timer.start()
         self._reminder_timer.start()
@@ -2676,6 +2733,7 @@ class PetController(QObject):
         QTimer.singleShot(3000, self._refresh_calendar)
 
     def quit(self) -> None:
+        self.hotkeys.unregister()
         self.screen_time.save()
         self.audio.stop_all()
         self.particles.hide()
@@ -2839,7 +2897,139 @@ class PetController(QObject):
             "next_event_title": next_title,
             "next_event_delta": next_delta,
             "week_events_count": len(cal_list),
+            "favorite_drink": str(self.dialogue_memory.get_pref("drink") or ""),
+            "dnd_active": self.is_dnd_active(),
+            "dnd_reason": self.dnd_reason(),
         }
+
+    # -- Do Not Disturb (Manual + Auto-DND for Meetings & Fullscreen) --------
+    def is_dnd_active(self) -> bool:
+        return bool(self.manual_dnd or self._auto_dnd_reason)
+
+    def dnd_reason(self) -> str:
+        if self.manual_dnd:
+            return "manual"
+        return self._auto_dnd_reason
+
+    def set_manual_dnd(self, on: bool, announce: bool = True) -> None:
+        on = bool(on)
+        changed = (on != self.manual_dnd)
+        self.manual_dnd = on
+        self.settings.set(manual_dnd=on)
+        for act in (getattr(self, "act_dnd", None), getattr(self, "act_tray_dnd", None),
+                    getattr(self, "act_sys_dnd", None)):
+            if act is not None:
+                act.blockSignals(True)
+                act.setChecked(on)
+                act.blockSignals(False)
+        if on:
+            if self.choices.is_open:
+                self.choices.close_choices(silent=True)
+            if self.bubble.isVisible() and not announce:
+                self.bubble.dismiss()
+        self._sync_timer_ui()
+        self._update_tray_tooltip()
+        self._sync_quick_cmd_badge()
+        if changed and not on and self._deferred_reminders:
+            self._flush_deferred_reminders()
+        elif changed and announce:
+            if on:
+                self.say("Do Not Disturb is ON. I'll stay completely quiet until you turn it back off.",
+                         "neutral", ms=4200, voice=False)
+            else:
+                self.say("Do Not Disturb is OFF—I'm back online!", "talking", ms=3600, particle="sparkle")
+
+    def _update_auto_dnd(self, info, now_mono: float) -> None:
+        want_meet = bool(self.settings["auto_dnd_meetings"])
+        want_fs = bool(self.settings["auto_dnd_fullscreen"])
+        new_reason = ""
+        if info is not None:
+            if want_meet and info.category == "meeting":
+                new_reason = "meeting"
+            elif want_fs and bool(getattr(info, "is_fullscreen", False)):
+                new_reason = "fullscreen"
+
+        prev = self._auto_dnd_reason
+        if new_reason == prev:
+            return
+
+        if new_reason and not prev:
+            # Entering Auto-DND: quietly dismiss unsolicited overlays so calls/presentations stay clean
+            self._auto_dnd_reason = new_reason
+            self._auto_dnd_since = now_mono
+            if self.choices.is_open:
+                self.choices.close_choices(silent=True)
+            if self.bubble.isVisible():
+                self.bubble.dismiss()
+            self._sync_timer_ui()
+            self._update_tray_tooltip()
+            self._sync_quick_cmd_badge()
+        elif not new_reason and prev:
+            # Exiting Auto-DND: gentle welcome back after long sessions (>= 5 min) or flush deferred alerts
+            elapsed = (now_mono - self._auto_dnd_since) if self._auto_dnd_since else 0.0
+            self._auto_dnd_reason = ""
+            self._auto_dnd_since = None
+            self._sync_timer_ui()
+            self._update_tray_tooltip()
+            self._sync_quick_cmd_badge()
+            if self.manual_dnd or self.sleep_mode or self.curfew_active:
+                return
+            if self._deferred_reminders:
+                self._flush_deferred_reminders(prev_reason=prev, elapsed_s=elapsed)
+            elif elapsed >= 300.0 and self.pet.isVisible():
+                text, emo, voice = dnd_recovery_line(prev, format_duration(elapsed), 0)
+                self.say(text, "talking", ms=6000, emotion=emo, voice=voice, particle="sparkle")
+        else:
+            # Switching between meeting <-> fullscreen
+            self._auto_dnd_reason = new_reason
+            self._sync_timer_ui()
+            self._update_tray_tooltip()
+            self._sync_quick_cmd_badge()
+
+    def _flush_deferred_reminders(self, prev_reason: str = "", elapsed_s: float = 0.0) -> None:
+        if not self._deferred_reminders or self.is_dnd_active():
+            return
+        queued = list(self._deferred_reminders)
+        self._deferred_reminders.clear()
+        if prev_reason:
+            head, emo, voice = dnd_recovery_line(prev_reason, format_duration(max(60.0, elapsed_s)), len(queued))
+            body = head + "\n\n" + "\n\n".join(queued[:4])
+            self.say(body, "talking", ms=12000, emotion=emo, voice=voice, context="reminder", particle="alert")
+        else:
+            body = "While Do Not Disturb was on:\n\n" + "\n\n".join(queued[:4])
+            self.say(body, "talking", ms=12000, context="reminder", particle="alert")
+        if self.pet.isVisible():
+            self.pet.bump(1.2)
+
+    def _update_tray_tooltip(self) -> None:
+        if self.tray is None:
+            return
+        hk = str(self.settings["quick_hotkey"])
+        hk_s = f" · {hk}" if hk and hk != "Off" else ""
+        if self.manual_dnd:
+            state = "Do Not Disturb (Manual)"
+        elif self._auto_dnd_reason == "meeting":
+            state = "Auto-DND (Meeting)"
+        elif self._auto_dnd_reason == "fullscreen":
+            state = "Auto-DND (Fullscreen)"
+        elif not self.pet.isVisible():
+            state = "Hidden in Tray"
+        else:
+            state = "Active"
+        self.tray.setToolTip(f"Morgana Companion — {state}{hk_s}")
+
+    def _sync_quick_cmd_badge(self) -> None:
+        if self.quick_cmd_dialog is None:
+            return
+        if self.manual_dnd:
+            self.quick_cmd_dialog.set_header_badge("DND · MANUAL", alert=True)
+        elif self._auto_dnd_reason == "meeting":
+            self.quick_cmd_dialog.set_header_badge("AUTO-DND · CALL", alert=True)
+        elif self._auto_dnd_reason == "fullscreen":
+            self.quick_cmd_dialog.set_header_badge("AUTO-DND · FULL", alert=True)
+        else:
+            hk = str(self.settings["quick_hotkey"])
+            self.quick_cmd_dialog.set_header_badge(hk if hk and hk != "Off" else "CTRL+K", alert=False)
 
     def _schedule_chatter(self) -> None:
         base_ms = max(0.05, self.args.chatter) * 60_000
@@ -2847,7 +3037,8 @@ class PetController(QObject):
 
     def _chatter(self) -> None:
         self._ensure_state_healthy()
-        busy = (self.sleep_mode or self.curfew_active or self.menu.is_open
+        busy = (self.sleep_mode or self.curfew_active or self.is_dnd_active()
+                or not self.pet.isVisible() or self.menu.is_open
                 or self.bubble.isVisible() or self.choices.is_open or self.dialogue_engine.is_active)
         if not busy:
             # 30% chance to spark a multi-turn interactive Choice Prompt if enabled & not in Focus sprint
@@ -2862,9 +3053,9 @@ class PetController(QObject):
                 self.say(self._bag_general.next())
         self._schedule_chatter()
 
-    # -- Active App Awareness, Screen Time & Micro-Particles ------------------
+    # -- Active App Awareness, Screen Time, Auto-DND & Micro-Particles --------
     def _sleep_zzz_tick(self) -> None:
-        if (self.sleep_mode or self.curfew_active) and not self.bubble.isVisible():
+        if (self.sleep_mode or self.curfew_active) and not self.bubble.isVisible() and not self.is_dnd_active():
             self.particles.emit_zzz()
 
     def _poll_awareness_and_screen_time(self) -> None:
@@ -2875,11 +3066,14 @@ class PetController(QObject):
 
         want_app = bool(self.settings["app_awareness_enabled"])
         want_scr = bool(self.settings["screen_time_enabled"])
-        if not (want_app or want_scr):
+        want_dnd = bool(self.settings["auto_dnd_meetings"]) or bool(self.settings["auto_dnd_fullscreen"])
+        if not (want_app or want_scr or want_dnd):
+            self._update_auto_dnd(None, now_mono)
             return
 
-        info = get_active_window() if want_app else None
-        if info is not None:
+        info = get_active_window() if (want_app or want_dnd or want_scr) else None
+        self._update_auto_dnd(info, now_mono)
+        if info is not None and want_app:
             self.awareness.note_window(info, now_mono=now_mono)
         if want_scr:
             idle_s = get_idle_seconds()
@@ -2894,10 +3088,13 @@ class PetController(QObject):
                 self.timer_dialog.update_screen_time(self.screen_time.today_summary())
             if self.briefing_dialog is not None and self.briefing_dialog.isVisible():
                 self._sync_briefing_view()
+            if self.wrapup_dialog is not None and self.wrapup_dialog.isVisible():
+                self._sync_wrapup_view()
 
-        # Avoid interrupting active dialogs, sleep/curfew, or ongoing conversations
+        # Avoid interrupting DND, hidden tray mode, active dialogs, sleep/curfew, or ongoing conversations
         can_speak = not (
-            self.sleep_mode or self.curfew_active or self.menu.is_open
+            self.is_dnd_active() or not self.pet.isVisible()
+            or self.sleep_mode or self.curfew_active or self.menu.is_open
             or self.bubble.isVisible() or self.choices.is_open or self.dialogue_engine.is_active
         )
         if not can_speak:
@@ -3096,6 +3293,7 @@ class PetController(QObject):
             self.briefing_dialog.open_events.connect(self._open_events)
             self.briefing_dialog.open_tasks.connect(self._open_tasks)
             self.briefing_dialog.open_stats.connect(self._open_stats)
+            self.briefing_dialog.open_wrapup.connect(lambda: self._open_wrapup(announce=False))
             self.briefing_dialog.closed.connect(lambda: self._on_dialog_closed("briefing"))
         payload = self._build_briefing_payload()
         self.briefing_dialog.set_data(payload)
@@ -3105,9 +3303,302 @@ class PetController(QObject):
             brief = build_daily_briefing(payload)
             self.say(brief["spoken"], "talking", ms=7500, emotion=brief["emotion"], voice=brief["voice"])
 
+    # -- Evening Wrap-up (End-of-Day Recap + Task Rollover + 1-Line Journal) --
+    def _build_wrapup_payload(self) -> dict:
+        now = datetime.now()
+        today = now.date()
+        done_today = self.tasks.completed_today(now)
+        pending = self.tasks.pending()
+        h_done, h_tot = self.habits.today_summary(now)
+        scr = self.screen_time.today_summary(now)
+
+        # Prioritize overdue & due-today pending tasks first (preselected for rollover)
+        pending_items: list[dict] = []
+        for t in pending:
+            dl = parse_dt(t.get("deadline"))
+            tag = ""
+            preselect = False
+            sort_rank = 3
+            if dl is not None:
+                if dl <= now:
+                    tag = "OVERDUE"
+                    preselect = True
+                    sort_rank = 0
+                elif dl.date() == today:
+                    tag = f"DUE {dl:%H:%M}"
+                    preselect = True
+                    sort_rank = 1
+                elif dl.date() == today + timedelta(days=1):
+                    tag = f"TOMORROW {dl:%H:%M}"
+                    sort_rank = 4
+                else:
+                    tag = f"{dl:%d %b}"
+                    sort_rank = 4
+            elif t.get("priority") == "high":
+                tag = "HIGH"
+                sort_rank = 2
+            pending_items.append({
+                "id": t["id"],
+                "title": t.get("title") or "Untitled Task",
+                "tag": tag,
+                "preselect": preselect,
+                "_rank": sort_rank,
+            })
+        pending_items.sort(key=lambda x: x["_rank"])
+
+        return {
+            "date_banner": f"{now:%a %d %b}".upper(),
+            "done_today_count": len(done_today),
+            "done_today_titles": [t.get("title") or "Task" for t in done_today],
+            "pending_count": len(pending),
+            "pending_items": pending_items,
+            "habits_done": h_done,
+            "habits_total": h_tot,
+            "focus_sessions": int(self.pomodoro.completed),
+            "screen_time_text": scr.get("active_text", "0m"),
+            "top_categories": scr.get("top_categories", []),
+            "breaks": int(scr.get("breaks", 0)),
+            "today_points": int(self.social_stats.today_points()),
+        }
+
+    def _sync_wrapup_view(self) -> None:
+        if self.wrapup_dialog is not None and self.wrapup_dialog.isVisible():
+            self.wrapup_dialog.set_data(self._build_wrapup_payload())
+
+    def _open_wrapup(self, announce: bool = True) -> None:
+        was_open = self.wrapup_dialog is not None and self.wrapup_dialog.isVisible()
+        if self.wrapup_dialog is None:
+            self.wrapup_dialog = WrapUpDialog(on_top=self.on_top, ui_scale=self.ui_scale)
+            self.wrapup_dialog.rollover_requested.connect(self._on_wrapup_rollover)
+            self.wrapup_dialog.reflection_saved.connect(self._on_wrapup_reflection)
+            self.wrapup_dialog.open_notes.connect(self._open_notes)
+            self.wrapup_dialog.open_tasks.connect(self._open_tasks)
+            self.wrapup_dialog.open_stats.connect(self._open_stats)
+            self.wrapup_dialog.closed.connect(lambda: self._on_dialog_closed("wrapup"))
+        payload = self._build_wrapup_payload()
+        self.wrapup_dialog.set_data(payload)
+        self._sync_dialog_links()
+        self.wrapup_dialog.show_near(self.pet.geometry())
+        if announce and not was_open and not self._rebuilding_ui and self.pet.isVisible():
+            recap = build_evening_wrapup(payload)
+            self.say(recap["spoken"], "talking", ms=7500, emotion=recap["emotion"], voice=recap["voice"])
+
+    def _on_wrapup_rollover(self, task_ids: list) -> None:
+        moved = self.tasks.rollover_to_tomorrow([str(i) for i in task_ids])
+        if moved > 0:
+            if self.tasks_dialog is not None:
+                self.tasks_dialog.refresh()
+            self._sync_events_view()
+            self._sync_briefing_view()
+            self._sync_wrapup_view()
+            play_ui("select")
+            word = "task" if moved == 1 else "tasks"
+            if self.pet.isVisible() and not self.is_dnd_active():
+                self.say(f"Moved {moved} {word} cleanly to tomorrow—sleep guilt-free tonight!",
+                         "talking", ms=4800, particle="sparkle")
+
+    def _on_wrapup_reflection(self, text: str, mood: str) -> None:
+        note = self.notes.append_journal_reflection(text, mood=mood)
+        if note is not None:
+            if self.notes_dialog is not None:
+                self.notes_dialog.refresh()
+            play_ui("select")
+            if self.pet.isVisible() and not self.is_dnd_active():
+                self.say("Saved your reflection to your Journal in Notes! Thanks for sharing today with me.",
+                         "talking", ms=4800, particle="hearts")
+
+    # -- Quick Command & Free-Form Ask Bar (Spotlight / Global Hotkey) --------
+    def _ensure_quick_cmd_dialog(self) -> QuickCommandDialog:
+        if self.quick_cmd_dialog is None:
+            self.quick_cmd_dialog = QuickCommandDialog(on_top=self.on_top, ui_scale=self.ui_scale)
+            self.quick_cmd_dialog.submitted.connect(self._on_quick_command_submitted)
+            self.quick_cmd_dialog.action_requested.connect(self._on_quick_command_action)
+        self._sync_quick_cmd_badge()
+        return self.quick_cmd_dialog
+
+    def _open_quick_command(self) -> None:
+        dlg = self._ensure_quick_cmd_dialog()
+        if dlg.isVisible():
+            dlg.raise_()
+            dlg.activateWindow()
+            dlg.input_edit.setFocus()
+            return
+        dlg.show_spotlight()
+        play_ui("open_window")
+
+    def _on_quick_command_submitted(self, raw_text: str) -> None:
+        dlg = self._ensure_quick_cmd_dialog()
+        ctx = self._ctx()
+        ai_on = bool(self.settings["ai_enabled"])
+        res = parse_and_plan(raw_text, ctx=ctx, ai_enabled=ai_on)
+
+        # Optional async AI fallback for free-form chat
+        if res.kind == "needs_ai":
+            dlg.show_thinking(raw_text)
+            started = self.ai_fetcher.ask(
+                prompt=res.payload.get("prompt", raw_text),
+                ctx=ctx,
+                endpoint=str(self.settings["ai_endpoint"]),
+                model=str(self.settings["ai_model"]),
+                api_key=str(self.settings["ai_api_key"]),
+                fallback=res.payload.get("fallback", res),
+            )
+            if not started:
+                fb: CommandResult = res.payload.get("fallback", res)
+                self._present_quick_result(fb)
+            return
+
+        # Execute structured local command immediately
+        if res.kind == "add_task":
+            p = res.payload
+            self.tasks.add(
+                p["title"],
+                priority=p.get("priority", "normal"),
+                deadline=p.get("deadline"),
+                stat=p.get("stat", "proficiency"),
+            )
+            if self.tasks_dialog is not None:
+                self.tasks_dialog.refresh()
+            self._sync_events_view()
+            self._sync_briefing_view()
+            self._sync_wrapup_view()
+        elif res.kind == "add_note":
+            p = res.payload
+            self.notes.add(p["title"], p["content"], category=p.get("category", "Personal"))
+            if self.notes_dialog is not None:
+                self.notes_dialog.refresh()
+        elif res.kind == "add_event":
+            p = res.payload
+            self.local_events.add(p["title"], p["start"])
+            self._sync_events_view()
+            self._sync_briefing_view()
+        elif res.kind == "start_focus":
+            mins = int(res.payload.get("minutes") or 0)
+            f_m = mins if mins > 0 else int(self.settings["focus_min"])
+            r_m = int(self.settings["rest_min"])
+            self._start_focus_from_dialog(f_m, r_m, silent_say=True)
+        elif res.kind == "start_break":
+            mins = int(res.payload.get("minutes") or 5)
+            self._start_break_timer(mins, silent_say=True)
+        elif res.kind == "start_timer":
+            self.manual_timers.add(int(res.payload["seconds"]), str(res.payload["label"]))
+            self._sync_timer_ui()
+        elif res.kind == "stop_timer":
+            self.pomodoro.stop()
+            self._sync_timer_ui()
+        elif res.kind == "toggle_dnd":
+            want = res.payload.get("state")
+            new_state = (not self.manual_dnd) if want is None else bool(want)
+            self.set_manual_dnd(new_state, announce=False)
+            res.reply = (
+                "Do Not Disturb is ON. Popups, nudges, and chatter are paused."
+                if new_state else "Do Not Disturb is OFF. Morgana is back online!"
+            )
+            res.badge = "DND ON" if new_state else "DND OFF"
+        elif res.kind == "toggle_sound":
+            self.set_sound_enabled(bool(res.payload.get("state", True)))
+        elif res.kind == "toggle_sleep":
+            want = bool(res.payload.get("state", True))
+            if want != self.sleep_mode:
+                self.sleep_mode = want
+                self._restore_state()
+        elif res.kind == "toggle_visibility":
+            self._set_pet_visible(bool(res.payload.get("visible", True)))
+        elif res.kind == "open_panel":
+            target = str(res.payload.get("target") or "")
+            self._present_quick_result(res)
+            dlg.hide()
+            self._on_quick_command_action(target)
+            return
+
+        self._present_quick_result(res)
+
+    def _on_ai_reply(self, ok: bool, text: str, fallback: CommandResult) -> None:
+        if ok and text.strip():
+            res = CommandResult(
+                kind="chat",
+                reply=text.strip(),
+                emotion=fallback.emotion or "happy",
+                voice="hmm",
+                particle=fallback.particle,
+                badge="AI · MORGANA",
+                action_label=fallback.action_label,
+                action_target=fallback.action_target,
+            )
+        else:
+            res = fallback
+            res.badge = "LOCAL · MORGANA"
+        self._present_quick_result(res)
+
+    def _present_quick_result(self, res: CommandResult) -> None:
+        if self.quick_cmd_dialog is not None:
+            self.quick_cmd_dialog.show_reply(
+                res.reply,
+                badge=res.badge or "MORGANA",
+                action_label=res.action_label,
+                action_target=res.action_target,
+                accent_red=(res.emotion in ("angry", "worried")),
+            )
+        if self.pet.isVisible() and not self.is_dnd_active():
+            self.say(
+                res.reply,
+                "talking",
+                ms=5200,
+                emotion=res.emotion or None,
+                voice=res.voice or None,
+                particle=res.particle,
+            )
+        else:
+            play_ui("select")
+
+    def _on_quick_command_action(self, target: str) -> None:
+        if self.quick_cmd_dialog is not None and self.quick_cmd_dialog.isVisible():
+            self.quick_cmd_dialog.hide()
+        if target == "tasks":
+            self._open_tasks(announce=False)
+        elif target == "notes":
+            self._open_notes(announce=False)
+        elif target == "events":
+            self._open_events()
+        elif target == "stats":
+            self._open_stats(announce=False)
+        elif target == "timer":
+            self._open_timer()
+        elif target == "briefing":
+            self._open_briefing(announce=False)
+        elif target == "wrapup":
+            self._open_wrapup(announce=False)
+        elif target == "talk":
+            self._set_pet_visible(True)
+            self._start_talk()
+        elif target == "settings":
+            self._open_settings_deferred()
+        elif target == "break_5":
+            self._start_break_timer(5)
+        elif target == "focus_10":
+            self._start_focus_from_dialog(10, int(self.settings["rest_min"]))
+        elif target == "focus_25":
+            self._start_focus_from_dialog(25, int(self.settings["rest_min"]))
+
+    def _set_pet_visible(self, visible: bool) -> None:
+        if visible:
+            self.pet.show()
+            self.pet.raise_()
+            self.particles.follow()
+        else:
+            self.menu.hide()
+            self.choices.close_choices(silent=True)
+            self.particles.hide()
+            self.bubble.dismiss()
+            self.pet.hide()
+        self._update_tray_tooltip()
+
+    def _toggle_pet_visibility(self) -> None:
+        self._set_pet_visible(not self.pet.isVisible())
+
     # -- startup: Daily Morning Briefing (once/day) atau ringkasan singkat ----
     def _startup_report(self) -> None:
-        if self.curfew_active:                  # pengingat tidur lebih penting
+        if self.curfew_active or self.is_dnd_active():
             return
         today_str = datetime.now().strftime("%Y-%m-%d")
         if bool(self.settings["morning_briefing"]) and self.settings["last_briefing_date"] != today_str:
@@ -3388,6 +3879,10 @@ class PetController(QObject):
             self.briefing_dialog._btn_ev.setVisible("events" in enabled)
             self.briefing_dialog._btn_tk.setVisible("tasks" in enabled)
             self.briefing_dialog._btn_st.setVisible("stats" in enabled)
+        if self.wrapup_dialog is not None:
+            self.wrapup_dialog._btn_nt.setVisible("notes" in enabled)
+            self.wrapup_dialog._btn_tk.setVisible("tasks" in enabled)
+            self.wrapup_dialog._btn_st.setVisible("stats" in enabled)
 
     def _open_tasks(self, announce: bool = True) -> None:
         was_open = self.tasks_dialog is not None and self.tasks_dialog.isVisible()
@@ -3397,6 +3892,7 @@ class PetController(QObject):
             self.tasks_dialog.open_notes.connect(self._open_notes)
             self.tasks_dialog.tasks_changed.connect(self._sync_events_view)
             self.tasks_dialog.tasks_changed.connect(self._sync_briefing_view)
+            self.tasks_dialog.tasks_changed.connect(self._sync_wrapup_view)
             self.tasks_dialog.task_reward_eligible.connect(self._on_task_reward_eligible)
             self.tasks_dialog.task_completed.connect(self._on_task_completed)
             self.tasks_dialog.closed.connect(lambda: self._on_dialog_closed("tasks"))
@@ -3484,7 +3980,7 @@ class PetController(QObject):
         rects: list[QRect] = []
         for dlg in (self.tasks_dialog, self.notes_dialog, self.events_dialog,
                     self.stats_dialog, self.timer_dialog, self.settings_dialog,
-                    self.briefing_dialog):
+                    self.briefing_dialog, self.wrapup_dialog, self.quick_cmd_dialog):
             if dlg is not None and dlg.isVisible():
                 rects.append(dlg.geometry())
         return rects
@@ -3563,6 +4059,7 @@ class PetController(QObject):
     def _on_stat_logged(self, stat: str, activity: str, pts: int, old_lv: int, new_lv: int) -> None:
         label = SOCIAL_STATS.get(stat, {}).get("label", stat.title())
         self._sync_briefing_view()
+        self._sync_wrapup_view()
 
         prev_totals = self.social_stats.totals()
         prev_totals[stat] = max(0, prev_totals.get(stat, 0) - pts)
@@ -3642,10 +4139,28 @@ class PetController(QObject):
             messages.append(f"{head} " + " · ".join(countdown) + "\n" + self._bag_agenda.next())
 
         if messages:
-            self.say("\n\n".join(messages), "talking", ms=12000, context="reminder", particle="alert")
-            self.pet.bump(1.3)                                      # melompat menarik perhatian
+            if self.is_dnd_active():
+                # Queue important due/starting alerts cleanly until DND ends
+                for m in messages:
+                    if m not in self._deferred_reminders:
+                        self._deferred_reminders.append(m)
+                self._deferred_reminders = self._deferred_reminders[-8:]
+                return
+            joined = "\n\n".join(messages)
+            if self.pet.isVisible():
+                self.say(joined, "talking", ms=12000, context="reminder", particle="alert")
+                self.pet.bump(1.3)                                      # melompat menarik perhatian
+            else:
+                self._notify_tray("Morgana Reminder", joined)
             if not self.audio.enabled:
                 play_beep()
+
+    def _notify_tray(self, title: str, message: str) -> None:
+        if self.tray is not None and not self.is_dnd_active():
+            try:
+                self.tray.showMessage(title, message[:240], QSystemTrayIcon.MessageIcon.Information, 6000)
+            except Exception:
+                pass
 
     # -- SYSTEM: opsi cepat & mode tidur ---------------------------------------
     def _build_system_menu(self) -> None:
@@ -3653,10 +4168,17 @@ class PetController(QObject):
         m.setStyleSheet(menu_qss(self.ui_scale))
         self.system_menu = m
         self._attach_menu_sfx(m)
+        self.act_sys_cmd = m.addAction("ASK & COMMAND...", self._open_quick_command)
         m.addAction("TALK WITH MORGANA...", lambda: self._start_talk())
         m.addAction("DAILY BRIEFING...", lambda: self._open_briefing(announce=True))
+        m.addAction("EVENING WRAP-UP...", lambda: self._open_wrapup(announce=True))
+        m.addSeparator()
         self.act_sys_status = m.addAction("SYSTEM STATUS (CPU / RAM)", self._act_item)
         self.act_sys_pomo = m.addAction("TIMER & FOCUS...", self._open_timer)
+        self.act_sys_dnd = m.addAction("DO NOT DISTURB")
+        self.act_sys_dnd.setCheckable(True)
+        self.act_sys_dnd.setChecked(self.manual_dnd)
+        self.act_sys_dnd.toggled.connect(self.set_manual_dnd)
         self.act_sys_sleep = m.addAction("SLEEP MODE", self._toggle_sleep_mode)
         self.act_sys_bed = m.addAction("BEDTIME")
         self.act_sys_bed.setEnabled(False)
@@ -3667,6 +4189,8 @@ class PetController(QObject):
         m.aboutToShow.connect(self._refresh_system_menu)
 
     def _refresh_system_menu(self) -> None:
+        hk = str(self.settings["quick_hotkey"])
+        self.act_sys_cmd.setText(f"ASK & COMMAND...  ({hk})" if hk and hk != "Off" else "ASK & COMMAND...  (Ctrl+K)")
         self.act_sys_pomo.setVisible("timer" in self.settings["enabled_tabs"])
         if self.pomodoro.running:
             self.act_sys_pomo.setText(f"TIMER & FOCUS  ({fmt_mmss(self.pomodoro.remaining())} left)")
@@ -3675,6 +4199,13 @@ class PetController(QObject):
             self.act_sys_pomo.setText(f"TIMER & FOCUS  ({fmt_hms(nxt.remaining())} left)")
         else:
             self.act_sys_pomo.setText("TIMER & FOCUS...")
+        self.act_sys_dnd.blockSignals(True)
+        self.act_sys_dnd.setChecked(self.manual_dnd)
+        self.act_sys_dnd.blockSignals(False)
+        if self._auto_dnd_reason and not self.manual_dnd:
+            self.act_sys_dnd.setText(f"DO NOT DISTURB  (Auto: {self._auto_dnd_reason.title()})")
+        else:
+            self.act_sys_dnd.setText("DO NOT DISTURB")
         self.act_sys_sleep.setText("WAKE UP  (Disable Sleep Mode)" if self.sleep_mode
                                    else "SLEEP MODE  (Take a Break)")
         self.act_sys_bed.setText(self._bedtime_text())
@@ -3710,6 +4241,7 @@ class PetController(QObject):
                 self.settings,
                 get_on_top=lambda: self.on_top,
                 get_autostart=autostart.is_enabled,
+                get_hotkey_status=lambda: self.hotkeys.status_text,
                 on_top=self.on_top,
                 ui_scale=self.ui_scale,
             )
@@ -3721,7 +4253,8 @@ class PetController(QObject):
         # If any panel is open, center Settings over it so it's never buried
         shown = False
         for panel in (self.notes_dialog, self.tasks_dialog, self.events_dialog,
-                      self.stats_dialog, self.timer_dialog, self.briefing_dialog):
+                      self.stats_dialog, self.timer_dialog, self.briefing_dialog,
+                      self.wrapup_dialog):
             if panel is not None and panel.isVisible():
                 self.settings_dialog.show_near(panel.geometry(), prefer_center=True)
                 shown = True
@@ -3746,7 +4279,15 @@ class PetController(QObject):
         self.act_sound.blockSignals(True)
         self.act_sound.setChecked(sound_on)
         self.act_sound.blockSignals(False)
+        if getattr(self, "act_tray_sound", None) is not None:
+            self.act_tray_sound.blockSignals(True)
+            self.act_tray_sound.setChecked(sound_on)
+            self.act_tray_sound.blockSignals(False)
         self.particles.set_enabled(bool(self.settings["particles_enabled"]))
+        self.set_manual_dnd(bool(self.settings["manual_dnd"]), announce=False)
+        self.hotkeys.register(str(self.settings["quick_hotkey"]))
+        self._update_tray_tooltip()
+        self._sync_quick_cmd_badge()
         enabled_tabs = list(self.settings["enabled_tabs"])
         self.menu.set_enabled_tabs(enabled_tabs)
         self._sync_dialog_links()
@@ -3796,7 +4337,7 @@ class PetController(QObject):
             text += "\nCPU/RAM usage is high. Try closing apps you don't need."
         self.say(text, "action" if heavy else "talking", ms=7000)
 
-    # -- Pomodoro & Manual Timers (Persona 5 Timer + HUD) -------------------------
+    # -- Pomodoro & Manual Timers (Persona 5 Timer + HUD + DND badge) ------------
     def _sync_timer_ui(self) -> None:
         had_hud = self.pet._hud is not None
         manual = self.manual_timers.snapshot()
@@ -3822,6 +4363,10 @@ class PetController(QObject):
                 accent="gold",
                 extra=extra,
             )
+        elif self.is_dnd_active():
+            reason = self.dnd_reason()
+            sub = "CALL" if reason == "meeting" else ("FULL" if reason == "fullscreen" else "QUIET")
+            self.pet.set_hud("DND", sub, progress=1.0, accent="red")
         else:
             self.pet.clear_hud()
 
@@ -3858,6 +4403,7 @@ class PetController(QObject):
         if self.timer_dialog is not None:
             self.timer_dialog.update_screen_time(self.screen_time.today_summary())
         self._sync_briefing_view()
+        self._sync_wrapup_view()
         self.pet.bump(0.85)
         self.particles.emit_hearts(3)
         if not silent_say:
@@ -3873,9 +4419,12 @@ class PetController(QObject):
         self.manual_timers.cancel(timer_id)
 
     def _on_manual_timer_fired(self, label: str, total_s: int) -> None:
-        self.say(f"Time's up! Your timer '{clip(label, 42)}' ({fmt_hms(total_s)}) just finished!",
-                 "action", ms=11000, context="timer_up", particle="alert")
-        self.pet.bump(1.4)
+        msg = f"Time's up! Your timer '{clip(label, 42)}' ({fmt_hms(total_s)}) just finished!"
+        if self.pet.isVisible():
+            self.say(msg, "action", ms=11000, context="timer_up", particle="alert")
+            self.pet.bump(1.4)
+        else:
+            self._notify_tray("Timer Finished", msg)
         play_beep()
 
     def _on_pomo_tick(self, _phase: str, _left: int) -> None:
@@ -3887,13 +4436,16 @@ class PetController(QObject):
             if getattr(self, "_suppress_focus_start_say", False):
                 return
             t = fmt_mmss(self.pomodoro.focus_s)
-            self.say(random.choice(_FOCUS_START).format(t=t), "action", particle="sparkle")
+            if self.pet.isVisible():
+                self.say(random.choice(_FOCUS_START).format(t=t), "action", particle="sparkle")
         else:
             t = fmt_mmss(self.pomodoro.rest_s)
             self.screen_time.record_break()
             if self.timer_dialog is not None:
                 self.timer_dialog.update_screen_time(self.screen_time.today_summary())
-            self.pet.bump(1.2)
+            self._sync_wrapup_view()
+            if self.pet.isVisible():
+                self.pet.bump(1.2)
             play_beep()
             focus_mins = max(1, int(round(self.pomodoro.focus_s / 60.0)))
             pts = 3 if focus_mins >= 45 else 2
@@ -3909,16 +4461,25 @@ class PetController(QObject):
             msg = random.choice(_FOCUS_REST).format(t=t)
             if awarded > 0:
                 msg += f" (+{awarded} Knowledge!)"
-            self.say(msg, particle="music")
+            if self.pet.isVisible():
+                self.say(msg, particle="music")
+            else:
+                self._notify_tray("Focus Complete", msg)
 
     def _on_pomo_finished(self) -> None:
         self._sync_timer_ui()
-        self.pet.bump(1.3)
+        self._sync_wrapup_view()
+        if self.pet.isVisible():
+            self.pet.bump(1.3)
         play_beep()
         n = self.pomodoro.completed
         word = "session" if n == 1 else "sessions"
-        self.say(f"Break's over! That's {n} focus {word} completed today—you're doing awesome! "
-                 "Open TIMER whenever you're ready for another round.", "action")
+        msg = (f"Break's over! That's {n} focus {word} completed today—you're doing awesome! "
+               "Open TIMER whenever you're ready for another round.")
+        if self.pet.isVisible():
+            self.say(msg, "action")
+        else:
+            self._notify_tray("Break Finished", msg)
 
     def _stop_pomodoro(self) -> None:
         self.pomodoro.stop()
@@ -3939,7 +4500,7 @@ class PetController(QObject):
         else:
             self.say("Couldn't find a terminal. Set the TERMINAL environment variable or edit find_terminal().")
 
-    # -- curfew ------------------------------------------------------------------
+    # -- curfew & Evening Wrap-up auto-trigger -----------------------------------
     def _check_curfew(self) -> None:
         self._ensure_state_healthy()
         now = datetime.now()
@@ -3949,14 +4510,31 @@ class PetController(QObject):
                 self.curfew_active = True
                 self._restore_state()
             interval_s = max(10, int(self.settings["curfew_interval_sec"]))
-            if (self._last_curfew_msg is None
-                    or (now - self._last_curfew_msg).total_seconds() >= interval_s - 1.5):
+            if (not self.is_dnd_active() and self.pet.isVisible()
+                    and (self._last_curfew_msg is None
+                         or (now - self._last_curfew_msg).total_seconds() >= interval_s - 1.5)):
                 self._last_curfew_msg = now
                 self.say(self._bag_bedtime.next(), "sleepy", 10000, context="bedtime")
+            return
         elif self.curfew_active:
             self.curfew_active = False
             self._last_curfew_msg = None
             self._restore_state()
+
+        # Gentle Evening Wrap-up once per evening (never interrupts Focus sprints or DND)
+        today_str = now.strftime("%Y-%m-%d")
+        if (bool(self.settings["evening_wrapup"])
+                and self.settings["last_wrapup_date"] != today_str
+                and now.time() >= self.settings.wrapup_time
+                and not self.sleep_mode
+                and not self.is_dnd_active()
+                and self.pet.isVisible()
+                and not (self.pomodoro.running and self.pomodoro.phase == PomodoroTimer.FOCUS)
+                and not (self.wrapup_dialog is not None and self.wrapup_dialog.isVisible())):
+            idle_s = get_idle_seconds()
+            if idle_s is None or idle_s < 300.0:
+                self.settings.set(last_wrapup_date=today_str)
+                self._open_wrapup(announce=True)
 
     def _attach_menu_sfx(self, menu: QMenu) -> None:
         """Play subtle Persona 5 hover & select SFX on QMenu interactions."""
@@ -3980,15 +4558,17 @@ class PetController(QObject):
         menu.triggered.connect(_on_trigger)
         menu.aboutToHide.connect(_on_hide)
 
-    # -- menu klik kanan & tray ------------------------------------------------
+    # -- menu klik kanan & dedicated rich system tray ---------------------------
     def _build_context_menu(self) -> None:
         m = QMenu()
         m.setStyleSheet(menu_qss(self.ui_scale))
         self.context_menu = m
         self._attach_menu_sfx(m)
 
+        self.act_ctx_cmd = m.addAction("ASK & COMMAND...", self._open_quick_command)
         m.addAction("TALK WITH MORGANA...", lambda: self._start_talk())
         m.addAction("DAILY BRIEFING...", lambda: self._open_briefing(announce=True))
+        m.addAction("EVENING WRAP-UP...", lambda: self._open_wrapup(announce=True))
         m.addSeparator()
 
         state_menu = m.addMenu("STATE")
@@ -4047,6 +4627,11 @@ class PetController(QObject):
         self._ui_size_group.triggered.connect(lambda a: self.set_ui_scale(int(a.data())))
 
         m.addSeparator()
+        self.act_dnd = m.addAction("DO NOT DISTURB")
+        self.act_dnd.setCheckable(True)
+        self.act_dnd.setChecked(self.manual_dnd)
+        self.act_dnd.toggled.connect(self.set_manual_dnd)
+
         self.act_top = m.addAction("ALWAYS ON TOP")
         self.act_top.setCheckable(True)
         self.act_top.setChecked(True)
@@ -4069,35 +4654,98 @@ class PetController(QObject):
         self.act_autostart.triggered.connect(self._toggle_autostart)
 
         self.act_stop_pomo = m.addAction("STOP FOCUS TIMER", self._stop_pomodoro)
+        m.addAction("HIDE TO TRAY", lambda: self._set_pet_visible(False))
         m.addAction("RESET POSITION", self.reset_position)
         m.addSeparator()
         m.addAction("QUIT", self.quit)
         m.aboutToShow.connect(self._refresh_context_menu)
 
     def _refresh_context_menu(self) -> None:
+        hk = str(self.settings["quick_hotkey"])
+        self.act_ctx_cmd.setText(f"ASK & COMMAND...  ({hk})" if hk and hk != "Off" else "ASK & COMMAND...  (Ctrl+K)")
+        self.act_dnd.blockSignals(True)
+        self.act_dnd.setChecked(self.manual_dnd)
+        self.act_dnd.blockSignals(False)
+        if self._auto_dnd_reason and not self.manual_dnd:
+            self.act_dnd.setText(f"DO NOT DISTURB  (Auto: {self._auto_dnd_reason.title()})")
+        else:
+            self.act_dnd.setText("DO NOT DISTURB")
         self.act_stop_pomo.setEnabled(self.pomodoro.running)
         self.act_autostart.setChecked(autostart.is_enabled())    # sinkron bila diubah dari luar
 
     def _build_tray(self) -> None:
         self.tray: QSystemTrayIcon | None = None
+        self.tray_menu: QMenu | None = None
+        self.act_tray_cmd: QAction | None = None
+        self.act_tray_toggle: QAction | None = None
+        self.act_tray_dnd: QAction | None = None
+        self.act_tray_sound: QAction | None = None
         if not QSystemTrayIcon.isSystemTrayAvailable():
             return
+
+        tm = QMenu()
+        tm.setStyleSheet(menu_qss(self.ui_scale))
+        self.tray_menu = tm
+        self._attach_menu_sfx(tm)
+
+        self.act_tray_cmd = tm.addAction("ASK & COMMAND...", self._open_quick_command)
+        self.act_tray_toggle = tm.addAction("HIDE MORGANA TO TRAY", self._toggle_pet_visibility)
+        self.act_tray_dnd = tm.addAction("DO NOT DISTURB")
+        self.act_tray_dnd.setCheckable(True)
+        self.act_tray_dnd.setChecked(self.manual_dnd)
+        self.act_tray_dnd.toggled.connect(self.set_manual_dnd)
+        tm.addSeparator()
+
+        tm.addAction("DAILY BRIEFING...", lambda: self._open_briefing(announce=True))
+        tm.addAction("EVENING WRAP-UP...", lambda: self._open_wrapup(announce=True))
+        tm.addSeparator()
+
+        tm.addAction("TASKS...", lambda: self._open_tasks(announce=False))
+        tm.addAction("NOTES...", lambda: self._open_notes(announce=False))
+        tm.addAction("EVENTS...", self._open_events)
+        tm.addAction("TIMER & FOCUS...", self._open_timer)
+        tm.addAction("SOCIAL STATS...", lambda: self._open_stats(announce=False))
+        tm.addSeparator()
+
+        self.act_tray_sound = tm.addAction("SOUND EFFECTS")
+        self.act_tray_sound.setCheckable(True)
+        self.act_tray_sound.setChecked(bool(self.settings["sound_enabled"]))
+        self.act_tray_sound.toggled.connect(self.set_sound_enabled)
+        tm.addAction("SETTINGS...", self._open_settings_deferred)
+        tm.addSeparator()
+        tm.addAction("QUIT", self.quit)
+        tm.aboutToShow.connect(self._refresh_tray_menu)
+
         self.tray = QSystemTrayIcon(QIcon(self.sprites.get("neutral", 64, 1.0)), self)
-        self.tray.setToolTip(f"{PET_NAME.title()} - Coding Pet")
-        self.tray.setContextMenu(self.context_menu)
+        self.tray.setContextMenu(tm)
         self.tray.activated.connect(self._on_tray_activated)
+        self._update_tray_tooltip()
         self.tray.show()
 
-    def _on_tray_activated(self, reason) -> None:
-        if reason == QSystemTrayIcon.ActivationReason.Trigger:   # klik kiri pada ikon tray
-            if self.pet.isVisible():
-                self.menu.hide()
-                self.choices.close_choices(silent=True)
-                self.particles.hide()
-                self.bubble.dismiss()
-                self.pet.hide()
+    def _refresh_tray_menu(self) -> None:
+        if self.act_tray_cmd is not None:
+            hk = str(self.settings["quick_hotkey"])
+            self.act_tray_cmd.setText(f"ASK & COMMAND...  ({hk})" if hk and hk != "Off" else "ASK & COMMAND...  (Ctrl+K)")
+        if self.act_tray_toggle is not None:
+            self.act_tray_toggle.setText("HIDE MORGANA TO TRAY" if self.pet.isVisible() else "SHOW MORGANA")
+        if self.act_tray_dnd is not None:
+            self.act_tray_dnd.blockSignals(True)
+            self.act_tray_dnd.setChecked(self.manual_dnd)
+            self.act_tray_dnd.blockSignals(False)
+            if self._auto_dnd_reason and not self.manual_dnd:
+                self.act_tray_dnd.setText(f"DO NOT DISTURB  (Auto: {self._auto_dnd_reason.title()})")
             else:
-                self.pet.show()
+                self.act_tray_dnd.setText("DO NOT DISTURB")
+        if self.act_tray_sound is not None:
+            self.act_tray_sound.blockSignals(True)
+            self.act_tray_sound.setChecked(bool(self.settings["sound_enabled"]))
+            self.act_tray_sound.blockSignals(False)
+
+    def _on_tray_activated(self, reason) -> None:
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:          # left-click toggles Show / Hide
+            self._toggle_pet_visibility()
+        elif reason == QSystemTrayIcon.ActivationReason.MiddleClick:    # middle-click opens Ask & Command
+            self._open_quick_command()
 
     # -- aksi menu klik kanan ----------------------------------------------------
     def _toggle_autostart(self, checked: bool) -> None:
@@ -4145,6 +4793,8 @@ class PetController(QObject):
         qss = menu_qss(self.ui_scale)
         self.system_menu.setStyleSheet(qss)
         self.context_menu.setStyleSheet(qss)
+        if getattr(self, "tray_menu", None) is not None:
+            self.tray_menu.setStyleSheet(qss)
 
         # Rebuild cached dialogs at the new scale (suppress open/close chatter during rebuild)
         self._rebuilding_ui = True
@@ -4156,6 +4806,8 @@ class PetController(QObject):
                 ("stats_dialog", self._open_stats, False),
                 ("timer_dialog", self._open_timer, False),
                 ("briefing_dialog", lambda: self._open_briefing(announce=False), False),
+                ("wrapup_dialog", lambda: self._open_wrapup(announce=False), False),
+                ("quick_cmd_dialog", self._open_quick_command, False),
             ):
                 dlg = getattr(self, attr)
                 if dlg is not None:
@@ -4208,7 +4860,7 @@ class PetController(QObject):
         self._ensure_state_healthy()
         for dlg in (self.tasks_dialog, self.notes_dialog, self.events_dialog,
                     self.stats_dialog, self.timer_dialog, self.settings_dialog,
-                    self.briefing_dialog):
+                    self.briefing_dialog, self.wrapup_dialog, self.quick_cmd_dialog):
             if dlg is not None:
                 dlg.set_on_top(on)
 
@@ -4224,6 +4876,10 @@ class PetController(QObject):
         self.act_sound.blockSignals(True)
         self.act_sound.setChecked(on)
         self.act_sound.blockSignals(False)
+        if getattr(self, "act_tray_sound", None) is not None:
+            self.act_tray_sound.blockSignals(True)
+            self.act_tray_sound.setChecked(on)
+            self.act_tray_sound.blockSignals(False)
 
     def reset_position(self) -> None:
         screen = QGuiApplication.screenAt(self.pet.geometry().center()) or QGuiApplication.primaryScreen()
