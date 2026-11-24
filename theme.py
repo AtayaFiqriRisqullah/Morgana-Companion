@@ -404,6 +404,28 @@ QCalendarWidget QToolButton {{
     border-radius: 4px;
     padding: 3px 6px;
 }}
+QSlider::groove:horizontal {{
+    height: 6px;
+    background: #1E1E27;
+    border: 1px solid #323240;
+    border-radius: 3px;
+}}
+QSlider::sub-page:horizontal {{
+    background: #E60012;
+    border-radius: 3px;
+}}
+QSlider::handle:horizontal {{
+    background: #FFFFFF;
+    border: 2px solid #E60012;
+    width: 14px;
+    height: 14px;
+    margin: -5px 0px;
+    border-radius: 7px;
+}}
+QSlider::handle:horizontal:hover {{
+    background: #FAD02C;
+    border: 2px solid #FFFFFF;
+}}
 """
 
 

@@ -261,10 +261,16 @@ class AudioManager(QObject):
         "ui_hover": 0.025,
     }
 
-    def __init__(self, parent=None, enabled: bool = True, volume_pct: int = 80) -> None:
+    def __init__(self, parent=None, enabled: bool = True, volume_pct: int = 80,
+                 voice_volume_pct: int | None = None, sfx_volume_pct: int | None = None) -> None:
         super().__init__(parent)
         self._enabled = bool(enabled)
-        self._volume = max(0.0, min(1.0, volume_pct / 100.0))
+        base_pct = max(0, min(100, int(volume_pct)))
+        v_pct = base_pct if voice_volume_pct is None else max(0, min(100, int(voice_volume_pct)))
+        s_pct = base_pct if sfx_volume_pct is None else max(0, min(100, int(sfx_volume_pct)))
+        self._voice_volume = v_pct / 100.0
+        self._sfx_volume = s_pct / 100.0
+        self._volume = max(self._voice_volume, self._sfx_volume)
         self._ready = False
         self._device = None
         self._fmt = None
@@ -302,8 +308,10 @@ class AudioManager(QObject):
         self._ui_pool = [_WarmPcmChannel(self._device, self._fmt, self) for _ in range(4)]
         self._stats_pool = [_WarmPcmChannel(self._device, self._fmt, self) for _ in range(2)]
         self._voice_ch = _WarmPcmChannel(self._device, self._fmt, self)
-        for ch in self._all_channels():
-            ch.apply_master_volume(self._volume)
+        for ch in self._ui_pool + self._stats_pool:
+            ch.apply_master_volume(self._sfx_volume)
+        if self._voice_ch is not None:
+            self._voice_ch.apply_master_volume(self._voice_volume)
 
     def _all_channels(self) -> list[_WarmPcmChannel]:
         chs = list(self._ui_pool) + list(self._stats_pool)
@@ -404,7 +412,15 @@ class AudioManager(QObject):
 
     @property
     def volume_pct(self) -> int:
-        return int(round(self._volume * 100))
+        return int(round(max(self._voice_volume, self._sfx_volume) * 100))
+
+    @property
+    def voice_volume_pct(self) -> int:
+        return int(round(self._voice_volume * 100))
+
+    @property
+    def sfx_volume_pct(self) -> int:
+        return int(round(self._sfx_volume * 100))
 
     def set_enabled(self, on: bool) -> None:
         self._enabled = bool(on)
@@ -412,9 +428,23 @@ class AudioManager(QObject):
             self.stop_all()
 
     def set_volume(self, volume_pct: int) -> None:
-        self._volume = max(0.0, min(1.0, int(volume_pct) / 100.0))
-        for ch in self._all_channels():
-            ch.apply_master_volume(self._volume)
+        self.set_volumes(volume_pct, volume_pct)
+
+    def set_voice_volume(self, volume_pct: int) -> None:
+        self._voice_volume = max(0.0, min(1.0, int(volume_pct) / 100.0))
+        self._volume = max(self._voice_volume, self._sfx_volume)
+        if self._voice_ch is not None:
+            self._voice_ch.apply_master_volume(self._voice_volume)
+
+    def set_sfx_volume(self, volume_pct: int) -> None:
+        self._sfx_volume = max(0.0, min(1.0, int(volume_pct) / 100.0))
+        self._volume = max(self._voice_volume, self._sfx_volume)
+        for ch in self._ui_pool + self._stats_pool:
+            ch.apply_master_volume(self._sfx_volume)
+
+    def set_volumes(self, voice_pct: int, sfx_pct: int) -> None:
+        self.set_voice_volume(voice_pct)
+        self.set_sfx_volume(sfx_pct)
 
     def stop_all(self) -> None:
         self._cancel_sequences()
@@ -438,7 +468,7 @@ class AudioManager(QObject):
         return min(pool, key=lambda c: c.last_play_t)
 
     def play_ui(self, key: str) -> None:
-        if not (self._enabled and self._ready and self._volume > 0.001):
+        if not (self._enabled and self._ready and self._sfx_volume > 0.001):
             return
         fname = UI_SOUNDS.get(key)
         if fname is None:
@@ -455,10 +485,10 @@ class AudioManager(QObject):
             return
         ch = self._pick_channel(self._ui_pool)
         if ch is not None:
-            ch.play(pcm, self._volume, self._UI_VOL_MULT.get(key, 0.88))
+            ch.play(pcm, self._sfx_volume, self._UI_VOL_MULT.get(key, 0.88))
 
     def play_voice(self, key: str) -> None:
-        if not (self._enabled and self._ready and self._volume > 0.001):
+        if not (self._enabled and self._ready and self._voice_volume > 0.001):
             return
         fname = VOICE_SOUNDS.get(key)
         if fname is None or self._voice_ch is None:
@@ -468,10 +498,10 @@ class AudioManager(QObject):
             self._pending_by_file[fname] = ("voice", key)
             return
         # Dedicated single channel: immediately switches voice in RAM without self-overlap
-        self._voice_ch.play(pcm, self._volume, 1.0)
+        self._voice_ch.play(pcm, self._voice_volume, 1.0)
 
     def play_stat(self, key: str) -> None:
-        if not (self._enabled and self._ready and self._volume > 0.001):
+        if not (self._enabled and self._ready and self._sfx_volume > 0.001):
             return
         fname = STATS_SOUNDS.get(key)
         if fname is None:
@@ -482,7 +512,7 @@ class AudioManager(QObject):
             return
         ch = self._pick_channel(self._stats_pool)
         if ch is not None:
-            ch.play(pcm, self._volume, 1.0)
+            ch.play(pcm, self._sfx_volume, 1.0)
 
     def _cancel_sequences(self) -> None:
         for t in self._seq_timers:
@@ -506,7 +536,7 @@ class AudioManager(QObject):
         3) `level_up` fanfare + `on_level_up()` if the stat leveled up.
         """
         self._cancel_sequences()
-        if not (self._enabled and self._ready and self._volume > 0.001):
+        if not (self._enabled and self._ready and self._sfx_volume > 0.001):
             if on_point_anim:
                 on_point_anim()
             if leveled_up and on_level_up:
@@ -539,13 +569,23 @@ class AudioManager(QObject):
 _INSTANCE: AudioManager | None = None
 
 
-def init_audio(parent=None, enabled: bool = True, volume_pct: int = 80) -> AudioManager:
+def init_audio(parent=None, enabled: bool = True, volume_pct: int = 80,
+               voice_volume_pct: int | None = None,
+               sfx_volume_pct: int | None = None) -> AudioManager:
     global _INSTANCE
     if _INSTANCE is None:
-        _INSTANCE = AudioManager(parent=parent, enabled=enabled, volume_pct=volume_pct)
+        _INSTANCE = AudioManager(
+            parent=parent,
+            enabled=enabled,
+            volume_pct=volume_pct,
+            voice_volume_pct=voice_volume_pct,
+            sfx_volume_pct=sfx_volume_pct,
+        )
     else:
         _INSTANCE.set_enabled(enabled)
-        _INSTANCE.set_volume(volume_pct)
+        v_pct = volume_pct if voice_volume_pct is None else voice_volume_pct
+        s_pct = volume_pct if sfx_volume_pct is None else sfx_volume_pct
+        _INSTANCE.set_volumes(v_pct, s_pct)
     return _INSTANCE
 
 
