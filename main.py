@@ -1020,12 +1020,20 @@ class BubbleWindow(QWidget):
         self._place()
         self._ticker.start()
         if getattr(self, "_hold", False) and self._page_idx + 1 >= len(self._pages):
-            self._hide_timer.stop()
+            # Safety auto-dismiss (45s idle) so an ignored Choice Prompt never freezes Morgana's face
+            self._hide_timer.start(45_000)
         else:
             self._hide_timer.start(self._per_page_ms + int(1000 * self._total / self._speed))
 
+    def bump_hold_timeout(self) -> None:
+        """Refresh the 45s safety timeout while the user is actively hovering/navigating choices."""
+        if getattr(self, "_hold", False) and self.isVisible() and not self._closing:
+            if self._page_idx + 1 >= len(self._pages):
+                self._hide_timer.start(45_000)
+
     def show_message(self, text: str, ms: int, hold: bool = False) -> None:
         self._hold = bool(hold)
+        self._need_dismiss_notify = True
         fm = QFontMetrics(self._font)
         max_w = max(240, int(round(self.MAX_TEXT_W * self._ui_scale)))
         if self._use_img:
@@ -1047,7 +1055,7 @@ class BubbleWindow(QWidget):
         if self._page_idx + 1 < len(self._pages):
             self._apply_page(self._page_idx + 1, pop_bounce=True)
             self.page_started.emit()
-        elif not getattr(self, "_hold", False):
+        else:
             self.dismiss()
 
     def dismiss(self) -> None:
@@ -1055,9 +1063,23 @@ class BubbleWindow(QWidget):
         self._hide_timer.stop()
         if self.isVisible() and not self._closing:
             self._closing = True
+            self._need_dismiss_notify = False
             self._show.configure(360.0)
             self._show.target = 0.0
             self._ticker.start()
+            self.dismissed.emit()
+        elif getattr(self, "_need_dismiss_notify", False):
+            self._need_dismiss_notify = False
+            self._closing = False
+            self.dismissed.emit()
+
+    def hideEvent(self, e) -> None:
+        super().hideEvent(e)
+        self._hold = False
+        self._closing = False
+        self._hide_timer.stop()
+        if getattr(self, "_need_dismiss_notify", False):
+            self._need_dismiss_notify = False
             self.dismissed.emit()
 
     def follow(self) -> None:
@@ -1337,7 +1359,7 @@ class BubbleWindow(QWidget):
         if self._page_idx + 1 < len(self._pages):
             self._apply_page(self._page_idx + 1, pop_bounce=True)
             self.page_started.emit()
-        elif not getattr(self, "_hold", False):
+        else:
             self.dismiss()
 
 
@@ -1345,8 +1367,8 @@ class ChoiceOverlay(QWidget):
     """Persona 5 slanted dialogue choice panel tethered cleanly to `BubbleWindow`.
 
     Displays 2-3 slanted black-and-white P5 response strips with crimson hover sweeps,
-    spinning selection stars, keyboard shortcuts (`1`/`2`/`3` and `Esc`), and a compact
-    close tag so the user can dismiss at any time.
+    spinning selection stars, keyboard shortcuts (`1`/`2`/`3`, arrows, `Enter`, `Esc`),
+    and smart placement that never covers Morgana's sprite or the dialogue box.
     """
 
     choice_selected = pyqtSignal(int)
@@ -1448,24 +1470,88 @@ class ChoiceOverlay(QWidget):
         total_h = int(y + close_h + pad_b)
         self.setFixedSize(total_w, total_h)
 
+    @staticmethod
+    def _overlap_area(a: QRect, b: QRect) -> int:
+        inter = a.intersected(b)
+        return max(0, inter.width()) * max(0, inter.height()) if inter.isValid() else 0
+
     def follow(self) -> None:
         if not self.isVisible() and not self._open:
             return
         brect = self._bubble.visible_global_rect()
-        screen = QGuiApplication.screenAt(brect.center()) or QGuiApplication.primaryScreen()
+        pet = self._bubble._pet
+        pet_rect = QRect(
+            pet.x() + PAD - 6,
+            pet.visual_top() - 6,
+            pet.sprite_size + 12,
+            max(pet.sprite_size, pet.visual_bottom() - pet.visual_top()) + 12,
+        )
+        screen = QGuiApplication.screenAt(pet.sprite_center()) or QGuiApplication.primaryScreen()
         area = screen.availableGeometry()
-        gap = 6
-        x = brect.center().x() - self.width() // 2
-        x = max(area.left() + 6, min(x, area.right() - self.width() - 6))
-        y_below = brect.bottom() + gap
-        y_above = brect.top() - gap - self.height()
-        if y_below + self.height() <= area.bottom() - 4:
-            y = y_below
-        elif y_above >= area.top() + 4:
-            y = y_above
+        w, h = self.width(), self.height()
+        gap = 8
+
+        def _clamp_x(cx: int) -> int:
+            return max(area.left() + 6, min(cx, area.right() - w - 6))
+
+        def _clamp_y(cy: int) -> int:
+            return max(area.top() + 6, min(cy, area.bottom() - h - 6))
+
+        cx_mid = _clamp_x(brect.center().x() - w // 2)
+        x_left_both = min(brect.left(), pet_rect.left()) - gap - w
+        x_right_both = max(brect.right(), pet_rect.right()) + gap
+        x_left_pet = pet_rect.left() - gap - w
+        x_right_pet = pet_rect.right() + gap
+        if pet.sprite_center().x() >= area.center().x():
+            side_xs = (x_left_both, x_left_pet, x_right_both, x_right_pet)
         else:
-            y = max(area.top() + 4, min(y_below, area.bottom() - self.height() - 4))
-        self.move(int(x), int(y))
+            side_xs = (x_right_both, x_right_pet, x_left_both, x_left_pet)
+
+        y_above_b = brect.top() - gap - h
+        y_below_b = brect.bottom() + gap
+        y_above_p = pet_rect.top() - gap - h
+        y_below_p = pet_rect.bottom() + gap
+        y_beside_top = _clamp_y(brect.top())
+        y_beside_mid = _clamp_y(brect.center().y() - h // 2)
+
+        candidates: list[tuple[int, int]] = []
+        if not self._bubble._below:
+            # Bubble is ABOVE Morgana (typical bottom-corner layout):
+            # stack choices ABOVE the bubble first so Morgana below is 100% unobstructed!
+            candidates.append((cx_mid, y_above_b))
+            for sx in side_xs:
+                candidates.append((sx, y_beside_top))
+                candidates.append((sx, y_beside_mid))
+            candidates.append((cx_mid, y_below_p))
+        else:
+            # Bubble is BELOW Morgana (top/upper screen layout):
+            # stack choices BELOW the bubble first so Morgana above is 100% unobstructed!
+            candidates.append((cx_mid, y_below_b))
+            for sx in side_xs:
+                candidates.append((sx, y_beside_top))
+                candidates.append((sx, y_beside_mid))
+            candidates.append((cx_mid, y_above_p))
+
+        # 1) Pick the first candidate cleanly inside the screen with ZERO overlap on Morgana & bubble
+        for tx, ty in candidates:
+            if (tx >= area.left() + 4 and tx + w <= area.right() - 4
+                    and ty >= area.top() + 4 and ty + h <= area.bottom() - 4):
+                cand = QRect(tx, ty, w, h)
+                if self._overlap_area(cand, pet_rect) == 0 and self._overlap_area(cand, brect) == 0:
+                    self.move(int(tx), int(ty))
+                    return
+
+        # 2) Fallback on very small screens: clamp into viewport while heavily protecting Morgana's sprite
+        best_pos = (cx_mid, _clamp_y(y_above_b if not self._bubble._below else y_below_b))
+        best_cost = float("inf")
+        for tx, ty in candidates:
+            cx, cy = _clamp_x(tx), _clamp_y(ty)
+            cand = QRect(cx, cy, w, h)
+            cost = 20 * self._overlap_area(cand, pet_rect) + self._overlap_area(cand, brect)
+            if cost < best_cost:
+                best_cost = cost
+                best_pos = (cx, cy)
+        self.move(int(best_pos[0]), int(best_pos[1]))
 
     def _frame(self, dt: float) -> bool:
         self._t += dt
@@ -1493,6 +1579,7 @@ class ChoiceOverlay(QWidget):
     def mouseMoveEvent(self, e) -> None:
         if not self._open:
             return
+        self._bubble.bump_hold_timeout()
         pos = e.position()
         idx = self._hit_row(pos)
         close_hit = self._close_rect.adjusted(-4, -2, 4, 2).contains(pos)
@@ -1531,6 +1618,7 @@ class ChoiceOverlay(QWidget):
     def keyPressEvent(self, e) -> None:
         if not self._open:
             return
+        self._bubble.bump_hold_timeout()
         k = e.key()
         if k == Qt.Key.Key_Escape:
             self.close_choices(silent=False)
@@ -2544,6 +2632,7 @@ class PetController(QObject):
         self.menu.triggered.connect(self._on_menu_action)
         self.menu.user_closed.connect(self._on_menu_user_closed)
         self.menu.closed.connect(self.bubble.follow)
+        self.menu.closed.connect(self.choices.follow)
         self.pomodoro.tick.connect(self._on_pomo_tick)
         self.pomodoro.phase_started.connect(self._on_pomo_phase)
         self.pomodoro.finished.connect(self._on_pomo_finished)
@@ -2605,6 +2694,21 @@ class PetController(QObject):
         self.pet.set_state(self.base_state(), self.forced_expression)
         self.pet.set_talking(False)
         self.pet.set_speaking(False)
+
+    def _ensure_state_healthy(self) -> None:
+        """Self-healing guard: if no bubble or choice prompt is visible, Morgana MUST return to base state."""
+        if not self.bubble.isVisible() and not self.choices.is_open:
+            if self._pending_choices:
+                self._pending_choices = []
+            if self.dialogue_engine.is_active:
+                self.dialogue_engine.cancel()
+            want_state = self.base_state()
+            want_expr = self.forced_expression or STATE_EXPRESSION[want_state]
+            if (self.pet._state != want_state or self.pet._expr != want_expr
+                    or self.pet._speaking or self.pet._talk.target > 0.01):
+                self._restore_state()
+        if self.pet.isVisible() and not self.pet._ticker.active:
+            self.pet._ticker.start()
 
     def _on_bubble_dismissed(self) -> None:
         self._pending_choices = []
@@ -2670,7 +2774,11 @@ class PetController(QObject):
         lowest_k = min(SOCIAL_STAT_KEYS, key=lambda k: totals.get(k, 0))
         top_k = max(SOCIAL_STAT_KEYS, key=lambda k: totals.get(k, 0))
         scr = self.screen_time.today_summary(now)
+        top_cats = scr.get("top_categories") or []
+        top_cat_summary = f"{top_cats[0][1]} ({top_cats[0][3]})" if top_cats else ""
         cur_app = self.awareness.current
+        prev_app = self.awareness.previous
+        now_mono = time.monotonic()
 
         manual = self.manual_timers.snapshot()
         nearest = manual[0] if manual else None
@@ -2710,9 +2818,17 @@ class PetController(QObject):
             "top_stat_label": SOCIAL_STATS[top_k]["label"],
             "active_app_cat": cur_app.category if cur_app else "",
             "active_app_name": cur_app.display_name if cur_app else "",
+            "active_app_topic": cur_app.topic if cur_app else "",
+            "active_app_phrase": cur_app.phrase if cur_app else "",
+            "active_app_dwell": self.awareness.app_dwell_text(now_mono),
+            "prev_app_name": prev_app.display_name if prev_app else "",
+            "prev_app_cat": prev_app.category if prev_app else "",
+            "switched_app_recently": self.awareness.switched_recently(now_mono),
+            "screen_active_s": scr["active_s"],
             "screen_time_text": scr["active_text"],
             "continuous_time_text": scr["continuous_text"],
             "continuous_s": scr["continuous_s"],
+            "top_category_summary": top_cat_summary,
             "focus_running": self.pomodoro.running,
             "focus_phase": self.pomodoro.phase,
             "focus_rem": fmt_mmss(self.pomodoro.remaining()) if self.pomodoro.running else "",
@@ -2730,6 +2846,7 @@ class PetController(QObject):
         self._chatter_timer.start(int(base_ms * random.uniform(0.75, 1.5)))
 
     def _chatter(self) -> None:
+        self._ensure_state_healthy()
         busy = (self.sleep_mode or self.curfew_active or self.menu.is_open
                 or self.bubble.isVisible() or self.choices.is_open or self.dialogue_engine.is_active)
         if not busy:
@@ -2751,6 +2868,7 @@ class PetController(QObject):
             self.particles.emit_zzz()
 
     def _poll_awareness_and_screen_time(self) -> None:
+        self._ensure_state_healthy()
         now_mono = time.monotonic()
         dt_s = max(0.0, min(30.0, now_mono - self._last_awareness_tick))
         self._last_awareness_tick = now_mono
@@ -2761,6 +2879,8 @@ class PetController(QObject):
             return
 
         info = get_active_window() if want_app else None
+        if info is not None:
+            self.awareness.note_window(info, now_mono=now_mono)
         if want_scr:
             idle_s = get_idle_seconds()
             cpos = QCursor.pos()
@@ -2781,8 +2901,6 @@ class PetController(QObject):
             or self.bubble.isVisible() or self.choices.is_open or self.dialogue_engine.is_active
         )
         if not can_speak:
-            if info is not None:
-                self.awareness.current = info
             return
 
         # 1) Screen-Time Break Nudge (launches interactive wellness Choice Prompt!)
@@ -2797,7 +2915,6 @@ class PetController(QObject):
         # 2) Active App / Window Awareness contextual comment (quiet during Focus sprint)
         if want_app and info is not None:
             if self.pomodoro.running and self.pomodoro.phase == PomodoroTimer.FOCUS:
-                self.awareness.current = info
                 return
             trigger = self.awareness.update(info, now_mono=now_mono)
             if trigger is not None:
@@ -2810,6 +2927,11 @@ class PetController(QObject):
     def _start_talk(self, tree_id: str | None = None) -> None:
         if self.menu.is_open:
             self.menu.close_menu(silent=True, emit_user_close=False)
+        # Live-sample the foreground external window before building Talk context
+        if bool(self.settings["app_awareness_enabled"]):
+            fresh = get_active_window()
+            if fresh is not None:
+                self.awareness.note_window(fresh)
         ctx = self._ctx()
         node = (self.dialogue_engine.start_tree(tree_id, ctx) if tree_id
                 else self.dialogue_engine.start_contextual(ctx))
@@ -2835,43 +2957,35 @@ class PetController(QObject):
         res = self.dialogue_engine.choose(index)
         if res is None:
             self.bubble.dismiss()
+            self._restore_state()
             return
         action = res.get("action")
-        reward = res.get("stat_reward")
         node = res.get("node")
-
-        if action:
-            self._execute_choice_action(action)
 
         if node is not None:
             self._present_choice_node(node)
         else:
             self.bubble.dismiss()
+            self._restore_state()
 
-        if reward:
-            stat_k, pts, reason = reward
-            self._award_auto_stat(
-                stat=stat_k,
-                activity=reason,
-                points=int(pts),
-                source="chat",
-                announce=False,
-            )
+        if action:
+            self._execute_choice_action(action)
 
     def _on_choice_cancelled(self) -> None:
         self._pending_choices = []
         self.dialogue_engine.cancel()
         self.bubble.dismiss()
+        self._restore_state()
 
     def _execute_choice_action(self, action: dict) -> None:
         kind = str(action.get("type") or "")
         if kind == "start_focus":
             mins = max(1, int(action.get("minutes", self.settings["focus_min"])))
             rest = int(self.settings["rest_min"])
-            self._start_focus_from_dialog(mins, rest)
+            self._start_focus_from_dialog(mins, rest, silent_say=True)
         elif kind == "start_break":
             mins = max(1, int(action.get("minutes", 5)))
-            self._start_break_timer(mins)
+            self._start_break_timer(mins, silent_say=True)
         elif kind == "record_break":
             self.screen_time.record_break()
             if self.timer_dialog is not None:
@@ -2885,20 +2999,21 @@ class PetController(QObject):
             self.manual_timers.add(mins * 60, lbl)
             self._sync_timer_ui()
         elif kind == "open_tasks":
-            QTimer.singleShot(120, self._open_tasks)
+            QTimer.singleShot(140, lambda: self._open_tasks(announce=False))
         elif kind == "open_notes":
-            QTimer.singleShot(120, self._open_notes)
+            QTimer.singleShot(140, lambda: self._open_notes(announce=False))
         elif kind == "open_new_note":
             tmpl = str(action.get("template") or "blank")
-            def _launch_note(t=tmpl) -> None:
-                self._open_notes()
+            note_title = str(action.get("title") or "")
+            def _launch_note(t=tmpl, nt=note_title) -> None:
+                self._open_notes(announce=False)
                 if self.notes_dialog is not None:
-                    self.notes_dialog.create_from_template(t)
-            QTimer.singleShot(120, _launch_note)
+                    self.notes_dialog.create_from_template(t, title=nt)
+            QTimer.singleShot(140, _launch_note)
         elif kind == "open_stats":
-            QTimer.singleShot(120, self._open_stats)
+            QTimer.singleShot(140, lambda: self._open_stats(announce=False))
         elif kind == "open_briefing":
-            QTimer.singleShot(120, lambda: self._open_briefing(announce=False))
+            QTimer.singleShot(140, lambda: self._open_briefing(announce=False))
         elif kind == "sleep_mode":
             want = bool(action.get("enabled", True))
             if want != self.sleep_mode:
@@ -3109,11 +3224,15 @@ class PetController(QObject):
 
     # -- interaksi pet ---------------------------------------------------------
     def _on_pet_clicked(self) -> None:
-        if self.choices.is_open:
+        had_choice = self.choices.is_open or self.dialogue_engine.is_active
+        if had_choice:
+            self._pending_choices = []
             self.choices.close_choices(silent=True)
             self.dialogue_engine.cancel()
         if self.menu.is_open:
             self.menu.close_menu(silent=False, emit_user_close=True)
+            if had_choice:
+                self.bubble.dismiss()
         else:
             self.menu.open_menu()
             self._say_tuple(self.dialogue.radial_open(self._ctx()), ms=5200)
@@ -3144,9 +3263,11 @@ class PetController(QObject):
         dl = parse_dt(task.get("deadline"))
         on_time = dl is not None and dl >= datetime.now()
         pts = 2 if (task.get("priority") == "high" or on_time) else 1
+        stat_k = self.tasks.stat_of(task)
+        stat_label = SOCIAL_STATS[stat_k]["label"]
         self.tasks.mark_rewarded(task_id)
         awarded, old_lv, new_lv = self._award_auto_stat(
-            stat="proficiency",
+            stat=stat_k,
             activity=f"Task: {task.get('title', 'Task')}",
             points=pts,
             source="task",
@@ -3154,7 +3275,7 @@ class PetController(QObject):
             announce=False,
         )
         if awarded > 0 and new_lv <= old_lv:
-            self._pending_task_reward_note = f"+{awarded} Proficiency"
+            self._pending_task_reward_note = f"+{awarded} {stat_label}"
         elif new_lv > old_lv:
             # Rank Up celebration takes over speech cleanly
             self._pending_task_reward_note = "__RANK_UP__"
@@ -3190,7 +3311,17 @@ class PetController(QObject):
     def _on_note_sent_to_task(self, title: str, deadline_obj) -> None:
         """Create a real Task promoted directly from Notes (`→ TASK` bridge)."""
         dl = deadline_obj if isinstance(deadline_obj, datetime) else None
-        task = self.tasks.add(title, priority="normal", deadline=dl)
+        # Match a natural default Social Stat to the current notebook (editable anytime in Tasks)
+        cat_stat = {
+            "Study": "knowledge",
+            "Work": "proficiency",
+            "Ideas": "charm",
+            "Journal": "kindness",
+            "Personal": "kindness",
+        }
+        note_cat = getattr(self.notes_dialog, "_category", "") if self.notes_dialog is not None else ""
+        stat_k = cat_stat.get(note_cat, "proficiency")
+        task = self.tasks.add(title, priority="normal", deadline=dl, stat=stat_k)
         if task is None:
             return
         if self.tasks_dialog is not None:
@@ -3258,7 +3389,7 @@ class PetController(QObject):
             self.briefing_dialog._btn_tk.setVisible("tasks" in enabled)
             self.briefing_dialog._btn_st.setVisible("stats" in enabled)
 
-    def _open_tasks(self) -> None:
+    def _open_tasks(self, announce: bool = True) -> None:
         was_open = self.tasks_dialog is not None and self.tasks_dialog.isVisible()
         if self.tasks_dialog is None:
             self.tasks_dialog = TasksDialog(self.tasks, on_top=self.on_top, ui_scale=self.ui_scale)
@@ -3271,10 +3402,10 @@ class PetController(QObject):
             self.tasks_dialog.closed.connect(lambda: self._on_dialog_closed("tasks"))
         self._sync_dialog_links()
         self.tasks_dialog.show_near(self.pet.geometry())
-        if not was_open and not self._rebuilding_ui:
+        if announce and not was_open and not self._rebuilding_ui:
             self._say_tuple(self.dialogue.window_open("tasks", self._ctx()), ms=4800)
 
-    def _open_notes(self) -> None:
+    def _open_notes(self, announce: bool = True) -> None:
         was_open = self.notes_dialog is not None and self.notes_dialog.isVisible()
         if self.notes_dialog is None:
             self.notes_dialog = NotesDialog(self.notes, self.tasks, on_top=self.on_top, ui_scale=self.ui_scale)
@@ -3287,7 +3418,7 @@ class PetController(QObject):
             self.notes_dialog.closed.connect(lambda: self._on_dialog_closed("notes"))
         self._sync_dialog_links()
         self.notes_dialog.show_near(self.pet.geometry())
-        if not was_open and not self._rebuilding_ui:
+        if announce and not was_open and not self._rebuilding_ui:
             self._say_tuple(self.dialogue.window_open("notes", self._ctx()), ms=4800)
 
     def _combined_events_result(self, base: CalendarResult | None = None) -> CalendarResult:
@@ -3325,11 +3456,11 @@ class PetController(QObject):
             self._say_tuple(self.dialogue.window_open("events", self._ctx()), ms=5000)
         self._refresh_events(interactive=not self.calendar.has_token())
 
-    def _open_stats(self) -> None:
+    def _open_stats(self, announce: bool = True) -> None:
         was_open = self.stats_dialog is not None and self.stats_dialog.isVisible()
         self._ensure_stats_dialog()
         self.stats_dialog.show_near(self.pet.geometry())
-        if not was_open and not self._rebuilding_ui:
+        if announce and not was_open and not self._rebuilding_ui:
             self._say_tuple(self.dialogue.window_open("stats", self._ctx()), ms=4800)
 
     def _open_timer(self) -> None:
@@ -3708,14 +3839,18 @@ class PetController(QObject):
             )
             self.timer_dialog.update_manual_timers(manual)
 
-    def _start_focus_from_dialog(self, focus_min: int, rest_min: int) -> None:
+    def _start_focus_from_dialog(self, focus_min: int, rest_min: int, silent_say: bool = False) -> None:
         if focus_min != self.settings["focus_min"] or rest_min != self.settings["rest_min"]:
             self.settings.set(focus_min=focus_min, rest_min=rest_min)
         self.pomodoro.focus_s = max(1, int(focus_min * 60))
         self.pomodoro.rest_s = max(1, int(rest_min * 60))
-        self.pomodoro.start()
+        self._suppress_focus_start_say = bool(silent_say)
+        try:
+            self.pomodoro.start()
+        finally:
+            self._suppress_focus_start_say = False
 
-    def _start_break_timer(self, minutes: int = 5) -> None:
+    def _start_break_timer(self, minutes: int = 5, silent_say: bool = False) -> None:
         mins = max(1, int(minutes))
         self.screen_time.record_break()
         self.manual_timers.add(mins * 60, f"Break ({mins}m)")
@@ -3725,6 +3860,8 @@ class PetController(QObject):
         self._sync_briefing_view()
         self.pet.bump(0.85)
         self.particles.emit_hearts(3)
+        if not silent_say:
+            self.say(f"{mins}-minute break timer started! Step away, stretch, and hydrate!", "talking", ms=4800)
 
     def _add_manual_timer(self, total_s: int, label: str) -> None:
         item = self.manual_timers.add(total_s, label)
@@ -3747,6 +3884,8 @@ class PetController(QObject):
     def _on_pomo_phase(self, phase: str) -> None:
         self._sync_timer_ui()
         if phase == PomodoroTimer.FOCUS:
+            if getattr(self, "_suppress_focus_start_say", False):
+                return
             t = fmt_mmss(self.pomodoro.focus_s)
             self.say(random.choice(_FOCUS_START).format(t=t), "action", particle="sparkle")
         else:
@@ -3802,6 +3941,7 @@ class PetController(QObject):
 
     # -- curfew ------------------------------------------------------------------
     def _check_curfew(self) -> None:
+        self._ensure_state_healthy()
         now = datetime.now()
         active = self.curfew_enabled and in_window(now.time(), self.settings.bedtime, self.settings.wake)
         if active:
@@ -4045,11 +4185,19 @@ class PetController(QObject):
             self._rebuilding_ui = False
 
     def set_always_on_top(self, on: bool) -> None:
+        on = bool(on)
+        changed = (on != self.on_top)
         self.on_top = on
         self.act_top.blockSignals(True)
         self.act_top.setChecked(on)
         self.act_top.blockSignals(False)
+        if not changed:
+            return
         was_visible = self.pet.isVisible()
+        if self.choices.is_open:
+            self.choices.close_choices(silent=True)
+        if self.bubble.isVisible():
+            self.bubble.dismiss()
         for w in (self.pet, self.bubble):
             w.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, on)
         self.menu.set_on_top(on)
@@ -4057,6 +4205,7 @@ class PetController(QObject):
         self.choices.set_on_top(on)
         if was_visible:
             self.pet.show()
+        self._ensure_state_healthy()
         for dlg in (self.tasks_dialog, self.notes_dialog, self.events_dialog,
                     self.stats_dialog, self.timer_dialog, self.settings_dialog,
                     self.briefing_dialog):
