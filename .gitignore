@@ -15,6 +15,8 @@ notes.json
 social_stats.json
 local_events.json
 habits.json
+screen_time.json
+dialogue_memory.json
 *.corrupt-*
 pet.log
 *.lock
