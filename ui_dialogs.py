@@ -25,8 +25,8 @@ from PyQt6.QtGui import (QColor, QFont, QFontMetrics, QGuiApplication, QKeySeque
                          QPainter, QPainterPath, QPen, QPixmap, QPolygonF, QRadialGradient,
                          QShortcut, QSyntaxHighlighter, QTextBlock, QTextBlockFormat,
                          QTextCharFormat, QTextCursor, QTextDocument, QTextFormat, QTextListFormat)
-from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QDateTimeEdit, QFrame,
-                             QGridLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDateTimeEdit,
+                             QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget,
                              QListWidgetItem, QMenu, QProgressBar, QPushButton, QScrollArea,
                              QSizePolicy, QSlider, QSpinBox, QStyle, QStyledItemDelegate,
                              QTextEdit, QTimeEdit, QVBoxLayout, QWidget)
@@ -34,16 +34,16 @@ from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QDateTi
 import sprites
 from audio_manager import audio, play_ui, play_voice
 from calendar_service import CalendarResult, events_by_day, human_delta, morgana_briefing
-from lines import build_daily_briefing
+from lines import build_daily_briefing, build_evening_wrapup
 from motion import FrameTicker, Spring, clamp
 from particles import P5_NOTE_GOLD, P5_STAR_COLORS, Particle, draw_particle
-from storage_manager import (DAILY_BLOCK_TARGET, DEFAULT_STAT_POINTS, QUICK_STAT_POINTS,
-                             RADIAL_TAB_KEYS, SETTINGS_DEFAULTS, SOCIAL_STAT_KEYS, SOCIAL_STATS,
-                             STAT_MASTERY_STEP, STAT_RANK_THRESHOLDS, TIME_BLOCKS, HabitStore,
-                             LocalEventStore, NoteStore, SettingsStore, SocialStatsStore,
-                             TaskStore, default_time_block, overall_confidant_level, parse_dt,
-                             stat_level, stat_level_progress, stat_pentagon_fraction,
-                             stat_rank_title)
+from storage_manager import (DAILY_BLOCK_TARGET, DEFAULT_STAT_POINTS, QUICK_HOTKEY_PRESETS,
+                             QUICK_STAT_POINTS, RADIAL_TAB_KEYS, SETTINGS_DEFAULTS,
+                             SOCIAL_STAT_KEYS, SOCIAL_STATS, STAT_MASTERY_STEP,
+                             STAT_RANK_THRESHOLDS, TIME_BLOCKS, HabitStore, LocalEventStore,
+                             NoteStore, SettingsStore, SocialStatsStore, TaskStore,
+                             default_time_block, overall_confidant_level, parse_dt, stat_level,
+                             stat_level_progress, stat_pentagon_fraction, stat_rank_title)
 from theme import (BLACK, DEEP_RED, GOLD, LIGHT_RED, P5_BG, P5_BORDER, P5_BORDER_HI,
                    P5_CARD, P5_GOLD_BG, P5_GOLD_FG, P5_HOVER, P5_MINT_BG, P5_MINT_FG, P5_MUTED,
                    P5_RED_BG, P5_RED_FG, P5_SELECTED, P5_SURFACE, P5_TEXT, RED, RED_HOVER, WHITE,
@@ -399,6 +399,22 @@ class P5CheckBox(QCheckBox):
         p.drawText(QRectF(tx, 0.0, self.width() - tx, self.height()),
                    Qt.AlignmentFlag.AlignVCenter.value | Qt.AlignmentFlag.AlignLeft.value,
                    self.text())
+
+
+class P5ComboBox(QComboBox):
+    """QComboBox with a razor-sharp vector gold chevron indicator."""
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        cx = self.width() - 14.0
+        cy = self.height() * 0.5
+        pen = QPen(GOLD if self.isEnabled() else QColor("#5C5C6E"), 2.0,
+                   Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        p.drawLine(QPointF(cx - 4.0, cy - 2.0), QPointF(cx, cy + 2.5))
+        p.drawLine(QPointF(cx, cy + 2.5), QPointF(cx + 4.0, cy - 2.0))
 
 
 # ---------------------------------------------------------------------------
@@ -3311,12 +3327,13 @@ class SettingsDialog(P5FluidPanel):
     autostart_changed = pyqtSignal(bool)
 
     def __init__(self, store: SettingsStore, get_on_top=None, get_autostart=None,
-                 on_top: bool = True, ui_scale: float = 1.0) -> None:
+                 get_hotkey_status=None, on_top: bool = True, ui_scale: float = 1.0) -> None:
         super().__init__("SETTINGS", QSize(500, 740), on_top=on_top, ui_scale=ui_scale)
         sc = self._ui_scale
         self.store = store
         self._get_on_top = get_on_top
         self._get_autostart = get_autostart
+        self._get_hotkey_status = get_hotkey_status
         self._saving = False
         self._filling = False
         self._add_close_button()
@@ -3419,23 +3436,28 @@ class SettingsDialog(P5FluidPanel):
         self.ui_scale_spin.setSuffix("%")
         self._row(l3, "UI size", self.ui_scale_spin)
         self.briefing_check = P5CheckBox("Show Daily Briefing & Confidant Summary once a day", scale=sc)
+        self.evening_wrapup_check = P5CheckBox("Show Evening Wrap-up recap once per evening", scale=sc)
+        self.wrapup_edit = QTimeEdit()
+        self.wrapup_edit.setDisplayFormat("HH:mm")
         self.auto_reward_check = P5CheckBox("Auto-reward Social Stats from tasks, habits & focus", scale=sc)
         self.auto_open_stats_check = P5CheckBox("Auto-open Social Stats star animation on rewards", scale=sc)
         self.on_top_check = P5CheckBox("Keep Morgana always on top", scale=sc)
         self.autostart_check = P5CheckBox("Start Morgana automatically on boot", scale=sc)
         l3.addWidget(self.briefing_check)
+        l3.addWidget(self.evening_wrapup_check)
+        self._row(l3, "Evening Wrap-up time", self.wrapup_edit)
         l3.addWidget(self.auto_reward_check)
         l3.addWidget(self.auto_open_stats_check)
         l3.addWidget(self.on_top_check)
         l3.addWidget(self.autostart_check)
         cards_lay.addWidget(c3)
 
-        # Card 5: Awareness, Screen Time & Interactive Personality
+        # Card 5: Awareness, Screen Time, Auto-DND & Global Shortcut
         c_aw = _make_card()
         law = QVBoxLayout(c_aw)
         law.setContentsMargins(pad_x, pad_y, pad_x, pad_y)
         law.setSpacing(row_gap)
-        haw = QLabel("AWARENESS, SCREEN TIME & EFFECTS")
+        haw = QLabel("AWARENESS, AUTO-DND & QUICK SHORTCUT")
         haw.setObjectName("section")
         law.addWidget(haw)
         self.awareness_check = P5CheckBox("Active App / Window Awareness (100% local)", scale=sc)
@@ -3446,14 +3468,55 @@ class SettingsDialog(P5FluidPanel):
         self.break_nudge_spin.setSuffix(" min")
         self.particles_check = P5CheckBox("Micro-particles (music notes, stars, hearts, Zzz)", scale=sc)
         self.spontaneous_check = P5CheckBox("Occasional interactive choice conversations", scale=sc)
+        self.dnd_meeting_check = P5CheckBox("Auto-DND during video calls & meetings", scale=sc)
+        self.dnd_fullscreen_check = P5CheckBox("Auto-DND during fullscreen apps & presentations", scale=sc)
+        self.manual_dnd_check = P5CheckBox("Manual Do Not Disturb (silence popups & chatter)", scale=sc)
+        self.hotkey_combo = P5ComboBox()
+        for preset in QUICK_HOTKEY_PRESETS:
+            self.hotkey_combo.addItem(preset, preset)
+        self._hotkey_status_lbl = QLabel("")
+        self._hotkey_status_lbl.setObjectName("tip")
+        self._hotkey_status_lbl.setWordWrap(True)
         law.addWidget(self.awareness_check)
         law.addWidget(self.screen_time_check)
         self._row(law, "Nudge break after nonstop", self.break_nudge_spin)
         law.addWidget(self.particles_check)
         law.addWidget(self.spontaneous_check)
+        law.addWidget(self.dnd_meeting_check)
+        law.addWidget(self.dnd_fullscreen_check)
+        law.addWidget(self.manual_dnd_check)
+        self._row(law, "Quick Command shortcut", self.hotkey_combo)
+        law.addWidget(self._hotkey_status_lbl)
         cards_lay.addWidget(c_aw)
 
-        # Card 6: Radial menu tabs (enable/disable individual tabs)
+        # Card 6: Optional AI Chat Backend (strictly opt-in, off by default)
+        c_ai = _make_card()
+        lai = QVBoxLayout(c_ai)
+        lai.setContentsMargins(pad_x, pad_y, pad_x, pad_y)
+        lai.setSpacing(row_gap)
+        hai = QLabel("OPTIONAL AI CHAT (QUICK COMMAND)")
+        hai.setObjectName("section")
+        lai.addWidget(hai)
+        self.ai_enabled_check = P5CheckBox("Use OpenAI-compatible AI (Ollama / OpenAI) for free chat", scale=sc)
+        self.ai_enabled_check.toggled.connect(self._sync_ai_fields)
+        lai.addWidget(self.ai_enabled_check)
+        self.ai_endpoint_edit = QLineEdit()
+        self.ai_endpoint_edit.setPlaceholderText("http://localhost:11434/v1/chat/completions")
+        self._row(lai, "API Endpoint", self.ai_endpoint_edit, wide=True)
+        self.ai_model_edit = QLineEdit()
+        self.ai_model_edit.setPlaceholderText("llama3.2")
+        self._row(lai, "Model", self.ai_model_edit, wide=True)
+        self.ai_key_edit = QLineEdit()
+        self.ai_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.ai_key_edit.setPlaceholderText("Optional (blank for local Ollama)")
+        self._row(lai, "API Key", self.ai_key_edit, wide=True)
+        ai_tip = QLabel("Off by default. When disabled, Ask & Command runs 100% locally with zero network calls.")
+        ai_tip.setObjectName("tip")
+        ai_tip.setWordWrap(True)
+        lai.addWidget(ai_tip)
+        cards_lay.addWidget(c_ai)
+
+        # Card 7: Radial menu tabs (enable/disable individual tabs)
         c4 = _make_card()
         l4 = QVBoxLayout(c4)
         l4.setContentsMargins(pad_x, pad_y, pad_x, pad_y)
@@ -3520,15 +3583,25 @@ class SettingsDialog(P5FluidPanel):
 
         QShortcut(QKeySequence("Ctrl+S"), self).activated.connect(self._save)
 
-    def _row(self, layout: QVBoxLayout, text: str, widget: QWidget) -> None:
+    def _sync_ai_fields(self, enabled: bool) -> None:
+        for w in (self.ai_endpoint_edit, self.ai_model_edit, self.ai_key_edit):
+            w.setEnabled(bool(enabled))
+
+    def _row(self, layout: QVBoxLayout, text: str, widget: QWidget, wide: bool = False) -> None:
         sc = self._ui_scale
         row = QHBoxLayout()
+        row.setSpacing(_sc(8, sc, 6))
         lbl = QLabel(text)
         lbl.setStyleSheet(f"color: #D6D6E2; font-size: {_sc(14, sc, 11)}px;")
-        row.addWidget(lbl, 1)
-        widget.setMinimumWidth(_sc(112, sc, 92))
         widget.setMinimumHeight(_sc(30, sc, 25))
-        row.addWidget(widget)
+        if wide:
+            lbl.setFixedWidth(_sc(94, sc, 78))
+            row.addWidget(lbl)
+            row.addWidget(widget, 1)
+        else:
+            row.addWidget(lbl, 1)
+            widget.setMinimumWidth(_sc(144, sc, 112))
+            row.addWidget(widget)
         layout.addLayout(row)
 
     def _vol_row(self, layout: QVBoxLayout, text: str, btn_text: str,
@@ -3626,6 +3699,8 @@ class SettingsDialog(P5FluidPanel):
             self.voice_slider.setEnabled(sound_on)
             self.sfx_slider.setEnabled(sound_on)
             self.briefing_check.setChecked(bool(values.get("morning_briefing", SETTINGS_DEFAULTS["morning_briefing"])))
+            self.evening_wrapup_check.setChecked(bool(values.get("evening_wrapup", SETTINGS_DEFAULTS["evening_wrapup"])))
+            self.wrapup_edit.setTime(QTime.fromString(values.get("wrapup_time", SETTINGS_DEFAULTS["wrapup_time"]), "HH:mm"))
             self.auto_reward_check.setChecked(bool(values.get("auto_stat_rewards", SETTINGS_DEFAULTS["auto_stat_rewards"])))
             self.auto_open_stats_check.setChecked(bool(values.get("auto_open_stats_on_reward", SETTINGS_DEFAULTS["auto_open_stats_on_reward"])))
             self.awareness_check.setChecked(bool(values.get("app_awareness_enabled", SETTINGS_DEFAULTS["app_awareness_enabled"])))
@@ -3633,6 +3708,22 @@ class SettingsDialog(P5FluidPanel):
             self.break_nudge_spin.setValue(int(values.get("break_nudge_min", SETTINGS_DEFAULTS["break_nudge_min"])))
             self.particles_check.setChecked(bool(values.get("particles_enabled", SETTINGS_DEFAULTS["particles_enabled"])))
             self.spontaneous_check.setChecked(bool(values.get("spontaneous_choices_enabled", SETTINGS_DEFAULTS["spontaneous_choices_enabled"])))
+            self.dnd_meeting_check.setChecked(bool(values.get("auto_dnd_meetings", SETTINGS_DEFAULTS["auto_dnd_meetings"])))
+            self.dnd_fullscreen_check.setChecked(bool(values.get("auto_dnd_fullscreen", SETTINGS_DEFAULTS["auto_dnd_fullscreen"])))
+            self.manual_dnd_check.setChecked(bool(values.get("manual_dnd", SETTINGS_DEFAULTS["manual_dnd"])))
+            hk = str(values.get("quick_hotkey", SETTINGS_DEFAULTS["quick_hotkey"]))
+            idx = self.hotkey_combo.findData(hk)
+            self.hotkey_combo.setCurrentIndex(idx if idx >= 0 else 0)
+            if self._get_hotkey_status is not None:
+                self._hotkey_status_lbl.setText(f"Global shortcut status: {self._get_hotkey_status()}  (In-app: Ctrl+K)")
+            else:
+                self._hotkey_status_lbl.setText("Press shortcut anywhere to open Ask & Command (In-app: Ctrl+K).")
+            ai_on = bool(values.get("ai_enabled", SETTINGS_DEFAULTS["ai_enabled"]))
+            self.ai_enabled_check.setChecked(ai_on)
+            self.ai_endpoint_edit.setText(str(values.get("ai_endpoint", SETTINGS_DEFAULTS["ai_endpoint"])))
+            self.ai_model_edit.setText(str(values.get("ai_model", SETTINGS_DEFAULTS["ai_model"])))
+            self.ai_key_edit.setText(str(values.get("ai_api_key", SETTINGS_DEFAULTS["ai_api_key"])))
+            self._sync_ai_fields(ai_on)
             enabled = set(values.get("enabled_tabs", RADIAL_TAB_KEYS))
             for key, cb in self.tab_checks.items():
                 cb.setChecked(key in enabled)
@@ -3656,7 +3747,7 @@ class SettingsDialog(P5FluidPanel):
     def _save(self) -> None:
         self._saving = True
         try:
-            for w in (self.bed_edit, self.wake_edit, self.curfew_interval,
+            for w in (self.bed_edit, self.wake_edit, self.wrapup_edit, self.curfew_interval,
                       self.event_window, self.event_interval, self.focus_spin,
                       self.rest_spin, self.ui_scale_spin, self.break_nudge_spin):
                 w.interpretText()
@@ -3665,6 +3756,7 @@ class SettingsDialog(P5FluidPanel):
                 self.status.setText("Keep at least one radial menu tab enabled.")
                 return
             b, w = self.bed_edit.time(), self.wake_edit.time()
+            wu = self.wrapup_edit.time()
             v_vol = int(self.voice_slider.value())
             s_vol = int(self.sfx_slider.value())
             self.store.set(
@@ -3682,6 +3774,8 @@ class SettingsDialog(P5FluidPanel):
                 voice_volume=v_vol,
                 sfx_volume=s_vol,
                 morning_briefing=self.briefing_check.isChecked(),
+                evening_wrapup=self.evening_wrapup_check.isChecked(),
+                wrapup_time=f"{wu.hour():02d}:{wu.minute():02d}",
                 auto_stat_rewards=self.auto_reward_check.isChecked(),
                 auto_open_stats_on_reward=self.auto_open_stats_check.isChecked(),
                 app_awareness_enabled=self.awareness_check.isChecked(),
@@ -3689,9 +3783,19 @@ class SettingsDialog(P5FluidPanel):
                 break_nudge_min=self.break_nudge_spin.value(),
                 particles_enabled=self.particles_check.isChecked(),
                 spontaneous_choices_enabled=self.spontaneous_check.isChecked(),
+                auto_dnd_meetings=self.dnd_meeting_check.isChecked(),
+                auto_dnd_fullscreen=self.dnd_fullscreen_check.isChecked(),
+                manual_dnd=self.manual_dnd_check.isChecked(),
+                quick_hotkey=str(self.hotkey_combo.currentData() or "Off"),
+                ai_enabled=self.ai_enabled_check.isChecked(),
+                ai_endpoint=self.ai_endpoint_edit.text().strip() or SETTINGS_DEFAULTS["ai_endpoint"],
+                ai_model=self.ai_model_edit.text().strip() or SETTINGS_DEFAULTS["ai_model"],
+                ai_api_key=self.ai_key_edit.text().strip(),
                 enabled_tabs=chosen_tabs,
             )
             self.saved.emit()
+            if self._get_hotkey_status is not None:
+                self._hotkey_status_lbl.setText(f"Global shortcut status: {self._get_hotkey_status()}  (In-app: Ctrl+K)")
             if self._get_on_top is not None and self.on_top_check.isChecked() != bool(self._get_on_top()):
                 self.always_on_top_changed.emit(self.on_top_check.isChecked())
             if self._get_autostart is not None and self.autostart_check.isChecked() != bool(self._get_autostart()):
@@ -5877,6 +5981,7 @@ class BriefingDialog(P5FluidPanel):
     open_events = pyqtSignal()
     open_tasks = pyqtSignal()
     open_stats = pyqtSignal()
+    open_wrapup = pyqtSignal()
 
     def __init__(self, on_top: bool = True, ui_scale: float = 1.0) -> None:
         super().__init__("DAILY BRIEFING", QSize(565, 640), on_top=on_top, ui_scale=ui_scale)
@@ -5885,6 +5990,12 @@ class BriefingDialog(P5FluidPanel):
         self._date_hdr = QLabel("")
         self._date_hdr.setObjectName("subhead")
         self.header_bar.addWidget(self._date_hdr)
+
+        wu_btn = self._btn("WRAP-UP", variant="soft", display=True, px=9)
+        wu_btn.setFixedHeight(_sc(24, sc, 20))
+        wu_btn.setToolTip("Open Evening Wrap-up recap")
+        wu_btn.clicked.connect(lambda _c=False: self.open_wrapup.emit())
+        self.header_bar.addWidget(wu_btn)
         self._add_close_button()
 
         # 1) Morgana Confidant Banner
@@ -6713,3 +6824,580 @@ class TimerDialog(P5FluidPanel):
         cont = summary.get("continuous_text", "0m")
         brks = int(summary.get("breaks", 0))
         self._screen_time_lbl.setText(f"{act} today · {cont} nonstop · {brks} breaks")
+
+
+# ---------------------------------------------------------------------------
+# QUICK COMMAND & FREE-FORM ASK BAR (Spotlight / Raycast-style Persona 5 palette)
+# ---------------------------------------------------------------------------
+class QuickCommandDialog(P5FluidPanel):
+    """Floating Persona 5 Quick Command & Free-Form Ask bar (summonable via global shortcut or Tray)."""
+
+    submitted = pyqtSignal(str)
+    action_requested = pyqtSignal(str)
+
+    def __init__(self, on_top: bool = True, ui_scale: float = 1.0) -> None:
+        super().__init__("ASK & COMMAND", QSize(565, 315), on_top=on_top, ui_scale=ui_scale)
+        sc = self._ui_scale
+        self.setFixedSize(_sc(565, sc, 450), _sc(315, sc, 270))
+        self._history: list[str] = []
+        self._hist_idx = -1
+        self._action_target = ""
+
+        # Header status pill (shortcut / DND indicator) + Close
+        self._hdr_badge = QLabel("CTRL+SHIFT+M")
+        self._hdr_badge.setFixedHeight(_sc(22, sc, 18))
+        self._hdr_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._hdr_badge.setStyleSheet(
+            f'background: #1C1C26; color: #FAD02C; border: 1px solid #4A3B12; border-radius: 4px; '
+            f'padding: 0px {_sc(8, sc, 6)}px; font-family: "Barlow Condensed", sans-serif; '
+            f'font-weight: 800; font-size: {_sc(11, sc, 9)}px;'
+        )
+        self.header_bar.addWidget(self._hdr_badge, 0, Qt.AlignmentFlag.AlignVCenter)
+        self._add_close_button()
+
+        # Quick-capture chips row
+        chips_row = QHBoxLayout()
+        chips_row.setSpacing(_sc(5, sc, 4))
+        for label, kind, payload, var in (
+            ("+ TASK",    "prefix", "task ",     "soft"),
+            ("+ NOTE",    "prefix", "note ",     "soft"),
+            ("+ EVENT",   "prefix", "event ",    "soft"),
+            ("FOCUS 25M", "run",    "focus 25",  "primary"),
+            ("5M BREAK",  "run",    "break 5",   "soft"),
+            ("WRAP-UP",   "run",    "wrapup",    "gold"),
+        ):
+            cb = self._btn(label, variant=var, display=True, px=9)
+            cb.setFixedHeight(_sc(24, sc, 20))
+            if kind == "prefix":
+                cb.clicked.connect(lambda _c=False, p=payload: self._prefill(p))
+            else:
+                cb.clicked.connect(lambda _c=False, p=payload: self._run_quick(p))
+            chips_row.addWidget(cb)
+        chips_row.addStretch(1)
+        self.body.addLayout(chips_row)
+
+        # Prominent Spotlight input bar
+        in_row = QHBoxLayout()
+        in_row.setSpacing(_sc(6, sc, 4))
+        self.input_edit = QLineEdit()
+        self.input_edit.setPlaceholderText("Ask Morgana, or type: task <title> at 15:00 · note <idea> · focus 25 · dnd")
+        self.input_edit.setFixedHeight(_sc(38, sc, 30))
+        self.input_edit.returnPressed.connect(self._submit)
+        self.input_edit.installEventFilter(self)
+        in_row.addWidget(self.input_edit, 1)
+
+        send_btn = self._btn("SEND", variant="primary", display=True, px=11)
+        send_btn.setFixedHeight(_sc(38, sc, 30))
+        send_btn.setMinimumWidth(_sc(68, sc, 56))
+        send_btn.clicked.connect(self._submit)
+        in_row.addWidget(send_btn)
+        self.body.addLayout(in_row)
+
+        # Morgana Live Response Card
+        self._resp_frame = _MorganaBriefingFrame(scale=sc)
+        self._resp_frame.set_accent(GOLD)
+        rl = QHBoxLayout(self._resp_frame)
+        rl.setContentsMargins(_sc(24, sc, 18), _sc(10, sc, 8), _sc(12, sc, 9), _sc(10, sc, 8))
+        rl.setSpacing(_sc(11, sc, 8))
+
+        av_lbl = QLabel()
+        av_lbl.setPixmap(_morgana_avatar(_sc(48, sc, 38)))
+        av_lbl.setFixedSize(_sc(48, sc, 38), _sc(48, sc, 38))
+        rl.addWidget(av_lbl, 0, Qt.AlignmentFlag.AlignTop)
+
+        col = QVBoxLayout()
+        col.setSpacing(_sc(6, sc, 4))
+        top_r = QHBoxLayout()
+        top_r.setSpacing(_sc(6, sc, 4))
+
+        m_lbl = QLabel("MORGANA")
+        m_lbl.setStyleSheet(
+            f'background: #0B0B0B; color: #FFFFFF; border: 1.5px solid #FFFFFF; '
+            f'border-radius: 4px; padding: 1px {_sc(7, sc, 5)}px; '
+            f'font-family: "Anton", "Barlow Condensed", sans-serif; font-size: {_sc(12, sc, 10)}px;'
+        )
+        top_r.addWidget(m_lbl)
+
+        self._resp_badge = QLabel("READY")
+        self._resp_badge.setStyleSheet(
+            f'background: #2B2208; color: #FAD02C; border: 1px solid #6C5514; border-radius: 4px; '
+            f'padding: 1px {_sc(7, sc, 5)}px; font-family: "Barlow Condensed", sans-serif; '
+            f'font-weight: 800; font-size: {_sc(11, sc, 9)}px;'
+        )
+        top_r.addWidget(self._resp_badge)
+        top_r.addStretch(1)
+
+        self._jump_btn = self._btn("OPEN", variant="gold", display=True, px=9)
+        self._jump_btn.setFixedHeight(_sc(22, sc, 19))
+        self._jump_btn.clicked.connect(self._on_jump_clicked)
+        self._jump_btn.setVisible(False)
+        top_r.addWidget(self._jump_btn)
+        col.addLayout(top_r)
+
+        self._reply_lbl = QLabel(
+            "What's on your mind? Add a quick task/note, kick off a Focus sprint, toggle Do Not Disturb, "
+            "or just talk to me!"
+        )
+        self._reply_lbl.setWordWrap(True)
+        self._reply_lbl.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self._reply_lbl.setStyleSheet(
+            f'color: #FFFFFF; font-family: "Arsenal", "Optima", "Segoe UI", sans-serif; '
+            f'font-size: {_sc(14, sc, 11)}px; font-weight: bold;'
+        )
+        col.addWidget(self._reply_lbl, 1)
+        rl.addLayout(col, 1)
+        self.body.addWidget(self._resp_frame, 1)
+
+        # Compact hint strip
+        self._hint_lbl = QLabel(
+            "Examples:  \"remind me send report tomorrow 10:00\"  ·  \"note great idea #work\"  ·  "
+            "\"status\"  ·  \"dnd on\"  ·  \"I'm feeling tired\""
+        )
+        self._hint_lbl.setObjectName("tip")
+        self._hint_lbl.setWordWrap(True)
+        self.body.addWidget(self._hint_lbl)
+
+    def eventFilter(self, obj, event) -> bool:
+        if obj is self.input_edit and event.type() == QEvent.Type.KeyPress:
+            key = event.key()
+            if key == Qt.Key.Key_Up and self._history:
+                if self._hist_idx < 0:
+                    self._hist_idx = len(self._history) - 1
+                elif self._hist_idx > 0:
+                    self._hist_idx -= 1
+                self.input_edit.setText(self._history[self._hist_idx])
+                return True
+            if key == Qt.Key.Key_Down and self._history and self._hist_idx >= 0:
+                self._hist_idx += 1
+                if self._hist_idx >= len(self._history):
+                    self._hist_idx = -1
+                    self.input_edit.clear()
+                else:
+                    self.input_edit.setText(self._history[self._hist_idx])
+                return True
+        return super().eventFilter(obj, event)
+
+    def set_header_badge(self, text: str, alert: bool = False) -> None:
+        sc = self._ui_scale
+        self._hdr_badge.setText(text.upper())
+        if alert:
+            self._hdr_badge.setStyleSheet(
+                f'background: #360A10; color: #FF5E6B; border: 1px solid #E60012; border-radius: 4px; '
+                f'padding: 1px {_sc(7, sc, 5)}px; font-family: "Barlow Condensed", sans-serif; '
+                f'font-weight: 800; font-size: {_sc(11, sc, 9)}px;'
+            )
+        else:
+            self._hdr_badge.setStyleSheet(
+                f'background: #1C1C26; color: #FAD02C; border: 1px solid #4A3B12; border-radius: 4px; '
+                f'padding: 1px {_sc(7, sc, 5)}px; font-family: "Barlow Condensed", sans-serif; '
+                f'font-weight: 800; font-size: {_sc(11, sc, 9)}px;'
+            )
+
+    def show_reply(self, text: str, badge: str = "MORGANA", action_label: str = "",
+                   action_target: str = "", accent_red: bool = False) -> None:
+        self._resp_badge.setText((badge or "MORGANA").upper())
+        self._reply_lbl.setText(text)
+        self._resp_frame.set_accent(RED if accent_red else GOLD)
+        self._action_target = action_target or ""
+        if action_label and action_target:
+            self._jump_btn.setText(action_label.upper())
+            self._jump_btn.setVisible(True)
+        else:
+            self._jump_btn.setVisible(False)
+
+    def show_thinking(self, prompt: str) -> None:
+        short = (prompt[:36] + "…") if len(prompt) > 36 else prompt
+        self.show_reply(f"Thinking about \"{short}\"...", badge="THINKING...", accent_red=False)
+
+    def show_spotlight(self) -> None:
+        """Open centered near the top-center of the active cursor screen and focus input immediately."""
+        from PyQt6.QtGui import QCursor as _QCursor
+        screen = QGuiApplication.screenAt(_QCursor.pos()) or QGuiApplication.primaryScreen()
+        area = screen.availableGeometry()
+        x = area.left() + (area.width() - self.width()) // 2
+        y = area.top() + max(32, int(area.height() * 0.16))
+        self.move(x, y)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.input_edit.setFocus()
+        self.input_edit.selectAll()
+
+    def _prefill(self, prefix: str) -> None:
+        self.input_edit.setText(prefix)
+        self.input_edit.setFocus()
+        self.input_edit.end(False)
+
+    def _run_quick(self, cmd: str) -> None:
+        self.input_edit.setText(cmd)
+        self._submit()
+
+    def _submit(self) -> None:
+        txt = self.input_edit.text().strip()
+        if not txt:
+            return
+        if not self._history or self._history[-1] != txt:
+            self._history.append(txt)
+            self._history = self._history[-30:]
+        self._hist_idx = -1
+        self.input_edit.clear()
+        self.submitted.emit(txt)
+        self.input_edit.setFocus()
+
+    def _on_jump_clicked(self) -> None:
+        if self._action_target:
+            self.action_requested.emit(self._action_target)
+
+
+# ---------------------------------------------------------------------------
+# EVENING WRAP-UP RECAP DIALOG (End-of-Day Summary + Task Rollover + 1-Line Journal)
+# ---------------------------------------------------------------------------
+class WrapUpDialog(P5FluidPanel):
+    """Persona 5 Evening Wrap-up companion panel closing the daily loop."""
+
+    rollover_requested = pyqtSignal(list)       # list[str] of task IDs to move to tomorrow
+    reflection_saved = pyqtSignal(str, str)     # (reflection_text, mood_label)
+    open_notes = pyqtSignal()
+    open_tasks = pyqtSignal()
+    open_stats = pyqtSignal()
+
+    MOODS = ("GREAT", "GOOD", "OKAY", "TIRED", "ROUGH")
+
+    def __init__(self, on_top: bool = True, ui_scale: float = 1.0) -> None:
+        super().__init__("EVENING WRAP-UP", QSize(580, 665), on_top=on_top, ui_scale=ui_scale)
+        sc = self._ui_scale
+        self._selected_mood = "GOOD"
+        self._rollover_checks: list[tuple[str, P5CheckBox]] = []
+
+        self._date_hdr = QLabel("")
+        self._date_hdr.setObjectName("subhead")
+        self.header_bar.addWidget(self._date_hdr)
+        self._add_close_button()
+
+        # 1) Morgana Evening Banner
+        self._banner = _MorganaBriefingFrame(scale=sc)
+        self._banner.set_accent(GOLD)
+        bl = QHBoxLayout(self._banner)
+        bl.setContentsMargins(_sc(24, sc, 18), _sc(10, sc, 8), _sc(12, sc, 9), _sc(10, sc, 8))
+        bl.setSpacing(_sc(12, sc, 8))
+
+        av_lbl = QLabel()
+        av_lbl.setPixmap(_morgana_avatar(_sc(52, sc, 40)))
+        av_lbl.setFixedSize(_sc(52, sc, 40), _sc(52, sc, 40))
+        bl.addWidget(av_lbl, 0, Qt.AlignmentFlag.AlignTop)
+
+        scol = QVBoxLayout()
+        scol.setSpacing(_sc(4, sc, 3))
+        top_m = QHBoxLayout()
+        top_m.setSpacing(_sc(6, sc, 4))
+
+        m_lbl = QLabel("MORGANA")
+        m_lbl.setStyleSheet(
+            f'background: #0B0B0B; color: #FFFFFF; border: 1.5px solid #FFFFFF; '
+            f'border-radius: 4px; padding: 1px {_sc(7, sc, 5)}px; '
+            f'font-family: "Anton", "Barlow Condensed", sans-serif; font-size: {_sc(12, sc, 10)}px;'
+        )
+        top_m.addWidget(m_lbl)
+
+        ev_pill = QLabel("EVENING RECAP")
+        ev_pill.setStyleSheet(
+            f'background: #2B2208; color: #FAD02C; border: 1px solid #6C5514; border-radius: 4px; '
+            f'padding: 1px {_sc(7, sc, 5)}px; font-family: "Barlow Condensed", sans-serif; '
+            f'font-weight: 800; font-size: {_sc(11, sc, 9)}px;'
+        )
+        top_m.addWidget(ev_pill)
+
+        self._pts_pill = QLabel("+0 PTS TODAY")
+        self._pts_pill.setStyleSheet(
+            f'background: #360A10; color: #FF5E6B; border: 1px solid #751824; border-radius: 4px; '
+            f'padding: 1px {_sc(7, sc, 5)}px; font-family: "Barlow Condensed", sans-serif; '
+            f'font-weight: 800; font-size: {_sc(11, sc, 9)}px;'
+        )
+        top_m.addWidget(self._pts_pill)
+        top_m.addStretch(1)
+        scol.addLayout(top_m)
+
+        self._headline_lbl = QLabel("SOLID WORK TODAY!")
+        self._headline_lbl.setWordWrap(True)
+        self._headline_lbl.setStyleSheet(
+            f'color: #FAD02C; font-family: "Barlow Condensed", "Anton", sans-serif; '
+            f'font-size: {_sc(15, sc, 12)}px; font-weight: 800;'
+        )
+        scol.addWidget(self._headline_lbl)
+
+        self._advice_lbl = QLabel("")
+        self._advice_lbl.setWordWrap(True)
+        self._advice_lbl.setStyleSheet(
+            f'color: #FFFFFF; font-family: "Arsenal", "Optima", "Segoe UI", sans-serif; '
+            f'font-size: {_sc(13, sc, 10)}px; font-weight: bold;'
+        )
+        scol.addWidget(self._advice_lbl)
+        bl.addLayout(scol, 1)
+        self.body.addWidget(self._banner)
+
+        # 2) 4 KPI summary tiles
+        kpi_row = QHBoxLayout()
+        kpi_row.setSpacing(_sc(7, sc, 5))
+        self._kpis: dict[str, QLabel] = {}
+        for key, title in (("done", "DONE TODAY"), ("habits", "HABITS"),
+                           ("focus", "FOCUS"), ("screen", "SCREEN TIME")):
+            tile = _make_card("subcard")
+            tl = QVBoxLayout(tile)
+            tl.setContentsMargins(_sc(8, sc, 5), _sc(6, sc, 4), _sc(8, sc, 5), _sc(6, sc, 4))
+            tl.setSpacing(2)
+            v_lbl = QLabel("0")
+            v_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            v_lbl.setStyleSheet(
+                f'color: #FFFFFF; font-family: "Anton", "Barlow Condensed", sans-serif; '
+                f'font-size: {_sc(19, sc, 14)}px;'
+            )
+            k_lbl = QLabel(title)
+            k_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            k_lbl.setStyleSheet(
+                f'color: #9292A4; font-family: "Barlow Condensed", sans-serif; '
+                f'font-size: {_sc(10, sc, 8)}px; font-weight: 800;'
+            )
+            tl.addWidget(v_lbl)
+            tl.addWidget(k_lbl)
+            kpi_row.addWidget(tile, 1)
+            self._kpis[key] = v_lbl
+        self.body.addLayout(kpi_row)
+
+        # 3) Scrollable Recap, Rollover & 1-Line Reflection cards
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        s_body = QWidget()
+        s_lay = QVBoxLayout(s_body)
+        s_lay.setContentsMargins(0, 0, _sc(4, sc, 2), 0)
+        s_lay.setSpacing(_sc(8, sc, 6))
+
+        # Card A: Today's Wins & Activity Summary
+        win_card = _make_card()
+        wl = QVBoxLayout(win_card)
+        wl.setContentsMargins(_sc(11, sc, 8), _sc(9, sc, 7), _sc(11, sc, 8), _sc(9, sc, 7))
+        wl.setSpacing(_sc(4, sc, 3))
+        wh = QLabel("TODAY'S WINS & ACTIVITY")
+        wh.setObjectName("section")
+        wl.addWidget(wh)
+        self._wins_lbl = QLabel("")
+        self._wins_lbl.setWordWrap(True)
+        self._wins_lbl.setStyleSheet(f"color: #E4E4F0; font-size: {_sc(13, sc, 10)}px;")
+        wl.addWidget(self._wins_lbl)
+        self._activity_lbl = QLabel("")
+        self._activity_lbl.setObjectName("tip")
+        self._activity_lbl.setWordWrap(True)
+        wl.addWidget(self._activity_lbl)
+        s_lay.addWidget(win_card)
+
+        # Card B: Unfinished Tasks -> Roll Over to Tomorrow
+        ro_card = _make_card()
+        rol = QVBoxLayout(ro_card)
+        rol.setContentsMargins(_sc(11, sc, 8), _sc(9, sc, 7), _sc(11, sc, 8), _sc(9, sc, 7))
+        rol.setSpacing(_sc(6, sc, 4))
+        ro_top = QHBoxLayout()
+        ro_hdr = QLabel("UNFINISHED TASKS — MOVE TO TOMORROW")
+        ro_hdr.setObjectName("section")
+        ro_top.addWidget(ro_hdr)
+        ro_top.addStretch(1)
+        self._sel_all_btn = self._btn("SELECT ALL", variant="ghost", display=True, px=9)
+        self._sel_all_btn.setFixedHeight(_sc(22, sc, 19))
+        self._sel_all_btn.clicked.connect(self._toggle_select_all)
+        ro_top.addWidget(self._sel_all_btn)
+        rol.addLayout(ro_top)
+
+        self._rollover_lay = QVBoxLayout()
+        self._rollover_lay.setSpacing(_sc(4, sc, 3))
+        rol.addLayout(self._rollover_lay)
+
+        ro_act = QHBoxLayout()
+        ro_act.setSpacing(_sc(6, sc, 4))
+        self._rollover_btn = self._btn("MOVE SELECTED → TOMORROW", variant="gold", display=True, px=10)
+        self._rollover_btn.setFixedHeight(_sc(27, sc, 23))
+        self._rollover_btn.clicked.connect(self._on_rollover_clicked)
+        ro_act.addWidget(self._rollover_btn)
+        self._rollover_status = QLabel("")
+        self._rollover_status.setObjectName("tip")
+        ro_act.addWidget(self._rollover_status, 1)
+        rol.addLayout(ro_act)
+        s_lay.addWidget(ro_card)
+
+        # Card C: 1-Line Daily Journal Reflection
+        jr_card = _make_card()
+        jrl = QVBoxLayout(jr_card)
+        jrl.setContentsMargins(_sc(11, sc, 8), _sc(9, sc, 7), _sc(11, sc, 8), _sc(9, sc, 7))
+        jrl.setSpacing(_sc(6, sc, 4))
+        jrh = QLabel("1-LINE REFLECTION → JOURNAL NOTE")
+        jrh.setObjectName("section")
+        jrl.addWidget(jrh)
+
+        mood_row = QHBoxLayout()
+        mood_row.setSpacing(_sc(4, sc, 3))
+        ml = QLabel("MOOD:")
+        ml.setStyleSheet(
+            f'color: #9292A4; font-family: "Barlow Condensed", sans-serif; '
+            f'font-size: {_sc(11, sc, 9)}px; font-weight: 800;'
+        )
+        mood_row.addWidget(ml)
+        self._mood_btns: dict[str, P5FluidButton] = {}
+        for m in self.MOODS:
+            mb = self._btn(m, variant="soft", display=True, px=9)
+            mb.setFixedHeight(_sc(22, sc, 19))
+            mb.clicked.connect(lambda _c=False, k=m: self._set_mood(k))
+            self._mood_btns[m] = mb
+            mood_row.addWidget(mb)
+        mood_row.addStretch(1)
+        jrl.addLayout(mood_row)
+        self._sync_mood_ui()
+
+        ref_row = QHBoxLayout()
+        ref_row.setSpacing(_sc(6, sc, 4))
+        self.reflection_edit = QLineEdit()
+        self.reflection_edit.setPlaceholderText("One win, lesson, or thought to close out today...")
+        self.reflection_edit.setFixedHeight(_sc(34, sc, 28))
+        self.reflection_edit.returnPressed.connect(self._on_save_reflection)
+        ref_row.addWidget(self.reflection_edit, 1)
+
+        save_ref_btn = self._btn("SAVE TO JOURNAL", variant="primary", display=True, px=10)
+        save_ref_btn.setFixedHeight(_sc(34, sc, 28))
+        save_ref_btn.clicked.connect(self._on_save_reflection)
+        ref_row.addWidget(save_ref_btn)
+        jrl.addLayout(ref_row)
+
+        self._ref_status = QLabel("Saves cleanly into your Journal notebook with #journal #wrapup.")
+        self._ref_status.setObjectName("tip")
+        jrl.addWidget(self._ref_status)
+        s_lay.addWidget(jr_card)
+        s_lay.addStretch(1)
+
+        scroll.setWidget(s_body)
+        self.body.addWidget(scroll, 1)
+
+        # Footer quick jumps + primary close
+        foot = QHBoxLayout()
+        foot.setSpacing(6)
+        self._btn_nt = self._btn("NOTES", variant="soft", display=True, px=10)
+        self._btn_nt.setFixedHeight(_sc(28, sc, 24))
+        self._btn_nt.clicked.connect(lambda _c=False: self.open_notes.emit())
+        foot.addWidget(self._btn_nt)
+
+        self._btn_tk = self._btn("TASKS", variant="soft", display=True, px=10)
+        self._btn_tk.setFixedHeight(_sc(28, sc, 24))
+        self._btn_tk.clicked.connect(lambda _c=False: self.open_tasks.emit())
+        foot.addWidget(self._btn_tk)
+
+        self._btn_st = self._btn("STATS", variant="soft", display=True, px=10)
+        self._btn_st.setFixedHeight(_sc(28, sc, 24))
+        self._btn_st.clicked.connect(lambda _c=False: self.open_stats.emit())
+        foot.addWidget(self._btn_st)
+        foot.addStretch(1)
+
+        done_btn = self._btn("GOOD NIGHT!", variant="primary", display=True, px=11)
+        done_btn.setFixedHeight(_sc(28, sc, 24))
+        done_btn.clicked.connect(self.close)
+        foot.addWidget(done_btn)
+        self.body.addLayout(foot)
+
+    def _set_mood(self, mood: str) -> None:
+        self._selected_mood = mood
+        self._sync_mood_ui()
+
+    def _sync_mood_ui(self) -> None:
+        for k, btn in self._mood_btns.items():
+            btn.set_active(k == self._selected_mood, active_variant="gold")
+
+    def set_data(self, payload: dict) -> None:
+        """Populate Evening Wrap-up metrics, unfinished tasks, and daily summary."""
+        sc = self._ui_scale
+        recap = build_evening_wrapup(payload)
+        self._date_hdr.setText(recap["date_banner"])
+        self._headline_lbl.setText(recap["headline"])
+        self._advice_lbl.setText(recap["advice"])
+
+        pts = int(payload.get("today_points", 0))
+        self._pts_pill.setText(f"+{pts} PTS TODAY")
+
+        done_n = int(payload.get("done_today_count", 0))
+        h_done = int(payload.get("habits_done", 0))
+        h_tot = int(payload.get("habits_total", 0))
+        foc_n = int(payload.get("focus_sessions", 0))
+        scr_txt = str(payload.get("screen_time_text") or "0m")
+
+        self._kpis["done"].setText(str(done_n))
+        self._kpis["done"].setStyleSheet(
+            f'color: {"#5CE09A" if done_n > 0 else "#FFFFFF"}; '
+            f'font-family: "Anton", "Barlow Condensed", sans-serif; font-size: {_sc(19, sc, 14)}px;'
+        )
+        self._kpis["habits"].setText(f"{h_done}/{h_tot}" if h_tot else "—")
+        self._kpis["focus"].setText(str(foc_n))
+        self._kpis["screen"].setText(scr_txt)
+
+        done_titles = list(payload.get("done_today_titles") or ())
+        if done_titles:
+            shown = [f"✓ {t[:46]}" for t in done_titles[:5]]
+            if len(done_titles) > 5:
+                shown.append(f"…and {len(done_titles) - 5} more completed today!")
+            self._wins_lbl.setText("\n".join(shown))
+        else:
+            self._wins_lbl.setText("No tasks checked off today yet — even small progress or rest counts!")
+
+        top_cats = list(payload.get("top_categories") or ())
+        brks = int(payload.get("breaks", 0))
+        if top_cats:
+            cat_str = "  ·  ".join(f"{lbl} {dur}" for _k, lbl, _s, dur in top_cats[:4])
+            self._activity_lbl.setText(f"Top activity: {cat_str}  ·  {brks} breaks taken")
+        else:
+            self._activity_lbl.setText(f"Active screen time: {scr_txt}  ·  {brks} breaks taken")
+
+        # Populate unfinished tasks rollover list
+        _clear_layout(self._rollover_lay)
+        self._rollover_checks.clear()
+        pending_items = list(payload.get("pending_items") or ())
+        if not pending_items:
+            ok_lbl = QLabel("All clear! Zero unfinished tasks waiting—tomorrow's slate is wide open.")
+            ok_lbl.setWordWrap(True)
+            ok_lbl.setStyleSheet(f"color: #5CE09A; font-size: {_sc(13, sc, 10)}px; font-weight: bold;")
+            self._rollover_lay.addWidget(ok_lbl)
+            self._rollover_btn.setEnabled(False)
+            self._sel_all_btn.setEnabled(False)
+        else:
+            self._rollover_btn.setEnabled(True)
+            self._sel_all_btn.setEnabled(True)
+            for item in pending_items[:8]:
+                tid = item["id"]
+                tag = item.get("tag") or ""
+                label = f"{item['title'][:46]}" + (f"  [{tag}]" if tag else "")
+                cb = P5CheckBox(label, scale=sc)
+                cb.setChecked(bool(item.get("preselect")))
+                self._rollover_lay.addWidget(cb)
+                self._rollover_checks.append((tid, cb))
+            if len(pending_items) > 8:
+                more = QLabel(f"…and {len(pending_items) - 8} more pending tasks in Tasks")
+                more.setObjectName("tip")
+                self._rollover_lay.addWidget(more)
+
+    def _toggle_select_all(self) -> None:
+        if not self._rollover_checks:
+            return
+        any_unchecked = any(not cb.isChecked() for _, cb in self._rollover_checks)
+        for _, cb in self._rollover_checks:
+            cb.setChecked(any_unchecked)
+
+    def _on_rollover_clicked(self) -> None:
+        chosen = [tid for tid, cb in self._rollover_checks if cb.isChecked()]
+        if not chosen:
+            self._rollover_status.setText("Check at least one task to move to tomorrow.")
+            return
+        self.rollover_requested.emit(chosen)
+        word = "task" if len(chosen) == 1 else "tasks"
+        self._rollover_status.setText(f"Moved {len(chosen)} {word} to tomorrow!")
+
+    def _on_save_reflection(self) -> None:
+        txt = self.reflection_edit.text().strip()
+        if not txt:
+            self._ref_status.setText("Type a short reflection first!")
+            return
+        self.reflection_edit.clear()
+        self.reflection_saved.emit(txt, self._selected_mood)
+        self._ref_status.setText(f"Saved [{self._selected_mood}] reflection to Journal in Notes!")

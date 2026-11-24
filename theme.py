@@ -302,7 +302,7 @@ QToolTip {{
     font-family: "Arsenal", "Segoe UI", sans-serif;
     font-size: {tip}px;
 }}
-QLineEdit, QTextEdit, QDateTimeEdit, QTimeEdit, QSpinBox {{
+QLineEdit, QTextEdit, QDateTimeEdit, QTimeEdit, QSpinBox, QComboBox {{
     background-color: #1A1A22;
     color: #F4F4F8;
     border: 1.5px solid #323240;
@@ -313,9 +313,29 @@ QLineEdit, QTextEdit, QDateTimeEdit, QTimeEdit, QSpinBox {{
     font-size: {inp}px;
     font-family: "Arsenal", "Optima", "Segoe UI", sans-serif;
 }}
-QLineEdit:focus, QTextEdit:focus, QDateTimeEdit:focus, QTimeEdit:focus, QSpinBox:focus {{
+QLineEdit:focus, QTextEdit:focus, QDateTimeEdit:focus, QTimeEdit:focus, QSpinBox:focus, QComboBox:focus {{
     background-color: #14141A;
     border: 1.5px solid #E60012;
+}}
+QComboBox::drop-down {{
+    subcontrol-origin: padding;
+    subcontrol-position: top right;
+    border: none;
+    width: 24px;
+}}
+QComboBox::down-arrow {{
+    image: none;
+    border: none;
+    width: 0px;
+    height: 0px;
+}}
+QComboBox QAbstractItemView {{
+    background-color: #14141B;
+    color: #F4F4F8;
+    border: 1.5px solid #E60012;
+    selection-background-color: #E60012;
+    selection-color: #FFFFFF;
+    outline: none;
 }}
 QLineEdit#titleInput {{
     background-color: transparent;
