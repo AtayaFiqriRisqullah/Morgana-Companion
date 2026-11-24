@@ -167,6 +167,7 @@ _TITLE_RULES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("coding", "GitHub", ("github", "gitlab", "bitbucket", "pull request", "stack overflow",
                           "stackoverflow", "localhost:", "127.0.0.1:", "codepen", "codesandbox",
                           "replit", "leetcode", "hackerrank", "kaggle", "visual studio code")),
+    ("study", "AI Research", ("chatgpt", "claude", "gemini", "perplexity", "notebooklm")),
     ("study", "Study", ("wikipedia", "google scholar", "coursera", "udemy", "edx", "khan academy",
                         "overleaf", "arxiv", "canvas", "classroom", "quizlet", "duolingo",
                         "mdn web docs", "documentation", "docs.python.org", ".pdf")),
@@ -176,7 +177,7 @@ _TITLE_RULES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("meeting", "Meeting", ("google meet", "zoom meeting", "microsoft teams", "webex")),
     ("media", "YouTube", ("youtube",)),
     ("media", "Twitch", ("twitch",)),
-    ("media", "Netflix", ("netflix", "disney+", "crunchyroll", "bilibili", "prime video", "spotify")),
+    ("media", "Netflix", ("netflix", "disney+", "crunchyroll", "bilibili", "prime video", "spotify", "soundcloud")),
     ("social", "Social", ("discord", "whatsapp", "telegram", "reddit", "x.com", "/ x", "twitter",
                           "instagram", "tiktok", "facebook", "messenger", "linkedin")),
     ("gaming", "Gaming", ("persona 5", "persona 3", "persona 4", "steam", "genshin", "valorant",
@@ -188,6 +189,83 @@ _SELF_TITLES = frozenset({
     "timer", "settings", "daily briefing",
 })
 
+_STRIP_SUFFIXES = (
+    " - google chrome", " — google chrome", " - microsoft edge", " — microsoft edge",
+    " - mozilla firefox", " — mozilla firefox", " - brave", " — brave",
+    " - opera", " - vivaldi", " - arc", " - chromium",
+    " - visual studio code", " — visual studio code", " - cursor", " - windsurf",
+    " - youtube", " - twitch", " - google docs", " - notion", " - figma",
+    " | discord", " - discord", " - slack", " - spotify", " - vlc media player",
+    " - adobe acrobat reader", " - adobe acrobat", " - sumatrapdf",
+    " - word", " - excel", " - powerpoint", " - notepad++", " - notepad",
+)
+_GENERIC_TOPICS = frozenset({
+    "", "new tab", "home", "start", "start page", "untitled", "about:blank",
+    "settings", "extensions", "downloads", "history", "bookmarks",
+    "youtube", "twitch", "netflix", "spotify", "discord", "whatsapp", "telegram",
+    "google", "google search", "bing", "duckduckgo", "github", "chatgpt", "claude", "gemini",
+    "chrome", "edge", "firefox", "brave", "steam", "epic games launcher",
+})
+_EMAIL_RE = re.compile(r"\S+@\S+\.\S+")
+_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+_NOTIF_PREFIX_RE = re.compile(r"^(?:\(\d+\+?\)|\[\d+\+?\]|[●•*]+\s*)+\s*")
+
+
+def extract_window_topic(process: str, title: str, display_name: str, category: str) -> str:
+    """Extract a clean, privacy-safe local topic (file, project, video, doc, or page title).
+
+    Strips browser/app suffixes, notification counts, URLs, and emails, returning `""`
+    when only a generic tab/app name is visible.
+    """
+    t = (title or "").strip()
+    if not t:
+        return ""
+    t = _NOTIF_PREFIX_RE.sub("", t).strip()
+    t = _URL_RE.sub("", t).strip()
+    t = _EMAIL_RE.sub("", t).strip()
+
+    # Iteratively strip known app/browser suffixes
+    for _ in range(3):
+        low = t.lower()
+        stripped = False
+        for suf in _STRIP_SUFFIXES:
+            if low.endswith(suf):
+                t = t[:len(t) - len(suf)].strip(" -—|·")
+                stripped = True
+                break
+        if not stripped:
+            break
+
+    # Strip trailing " - <display_name>" if repeated
+    dn_low = (display_name or "").lower()
+    if dn_low and t.lower().endswith(" - " + dn_low):
+        t = t[:len(t) - len(dn_low) - 3].strip()
+    elif dn_low and t.lower().endswith(" | " + dn_low):
+        t = t[:len(t) - len(dn_low) - 3].strip()
+
+    # For IDEs like "main.py - Morgana-Companion", prefer concise "main.py (Morgana-Companion)"
+    if category == "coding" and (" - " in t or " — " in t):
+        sep = " — " if " — " in t else " - "
+        parts = [p.strip() for p in t.split(sep) if p.strip()]
+        if len(parts) >= 2:
+            left, right = parts[0], parts[1]
+            # Strip common VS Code dirty indicator
+            left = left.lstrip("●•* ").strip()
+            if left.lower() not in _GENERIC_TOPICS and right.lower() not in _GENERIC_TOPICS:
+                cand = f"{left} ({right})" if len(left) + len(right) <= 30 else left
+                t = cand
+            elif left:
+                t = left
+
+    # Clean leading/trailing punctuation and collapse spaces
+    t = re.sub(r"\s+", " ", t).strip(" -—|:·")
+    low_t = t.lower()
+    if len(t) < 2 or low_t in _GENERIC_TOPICS or low_t == dn_low:
+        return ""
+    if len(t) > 36:
+        t = t[:35].rstrip() + "…"
+    return t
+
 
 @dataclass(frozen=True)
 class ActiveWindowInfo:
@@ -196,6 +274,14 @@ class ActiveWindowInfo:
     category: str
     display_name: str
     pid: int = 0
+    topic: str = ""
+
+    @property
+    def phrase(self) -> str:
+        """Human-friendly reference combining the active topic and app name when available."""
+        if self.topic and self.topic.lower() != self.display_name.lower():
+            return f"'{self.topic}' in {self.display_name}"
+        return self.display_name
 
 
 def format_duration(seconds: float) -> str:
@@ -233,26 +319,30 @@ def classify_window(process: str, title: str, pid: int = 0) -> ActiveWindowInfo 
         if not clean_title or low_title in ("program manager", "task switching", ""):
             return None
 
+    def _make(cat: str, label: str) -> ActiveWindowInfo:
+        topic = extract_window_topic(stem, clean_title, label, cat)
+        return ActiveWindowInfo(stem or "app", clean_title, cat, label, pid, topic=topic)
+
     # 1) Browsers: inspect page title first for specific activity (GitHub, YouTube, Study, etc.)
     if stem in _BROWSER_PROCS:
         for cat, label, keywords in _TITLE_RULES:
             if any(kw in low_title for kw in keywords):
-                return ActiveWindowInfo(stem, clean_title, cat, label, pid)
+                return _make(cat, label)
         disp = _PROC_MAP.get(stem, ("browsing", stem.title()))[1]
-        return ActiveWindowInfo(stem, clean_title, "browsing", disp, pid)
+        return _make("browsing", disp)
 
     # 2) Known native applications by process stem
     if stem in _PROC_MAP:
         cat, disp = _PROC_MAP[stem]
-        return ActiveWindowInfo(stem, clean_title, cat, disp, pid)
+        return _make(cat, disp)
 
     # 3) Fallback: inspect title keywords for unknown processes (e.g. games, web apps, Linux apps)
     for cat, label, keywords in _TITLE_RULES:
         if any(kw in low_title for kw in keywords):
-            return ActiveWindowInfo(stem or "app", clean_title, cat, label, pid)
+            return _make(cat, label)
 
     disp = stem.replace("_", " ").replace("-", " ").title() if stem else clean_title[:24]
-    return ActiveWindowInfo(stem or "app", clean_title, "other", disp[:28], pid)
+    return _make("other", disp[:28])
 
 
 # ---------------------------------------------------------------------------
@@ -571,11 +661,46 @@ class AppAwarenessMonitor:
 
     def __init__(self) -> None:
         self.current: ActiveWindowInfo | None = None
+        self.previous: ActiveWindowInfo | None = None
+        self._app_since_t = 0.0
+        self._switched_at_t = 0.0
         self._cat_since_t = 0.0
         self._last_cat = ""
         self._commented_for_visit = False
         self._last_global_t = 0.0
         self._last_by_cat: dict[str, float] = {}
+
+    def note_window(self, info: ActiveWindowInfo | None, now_mono: float | None = None) -> None:
+        """Record the latest external window without triggering a remark (keeps Talk context fresh)."""
+        if info is None:
+            return
+        mono = time.monotonic() if now_mono is None else float(now_mono)
+        prev = self.current
+        if prev is None:
+            self.current = info
+            self._app_since_t = mono
+            return
+        if (prev.display_name, prev.category) != (info.display_name, info.category):
+            self.previous = prev
+            self._app_since_t = mono
+            self._switched_at_t = mono
+        self.current = info
+
+    def app_dwell_s(self, now_mono: float | None = None) -> float:
+        if self.current is None or self._app_since_t <= 0.0:
+            return 0.0
+        mono = time.monotonic() if now_mono is None else float(now_mono)
+        return max(0.0, mono - self._app_since_t)
+
+    def app_dwell_text(self, now_mono: float | None = None) -> str:
+        secs = self.app_dwell_s(now_mono)
+        return format_duration(secs) if secs >= 60.0 else ""
+
+    def switched_recently(self, now_mono: float | None = None, window_s: float = 240.0) -> bool:
+        if self.previous is None or self._switched_at_t <= 0.0:
+            return False
+        mono = time.monotonic() if now_mono is None else float(now_mono)
+        return (mono - self._switched_at_t) <= window_s
 
     def update(self, info: ActiveWindowInfo | None,
                now_mono: float | None = None) -> ActiveWindowInfo | None:
@@ -583,7 +708,7 @@ class AppAwarenessMonitor:
         mono = time.monotonic() if now_mono is None else float(now_mono)
         if info is None:
             return None
-        self.current = info
+        self.note_window(info, now_mono=mono)
         cat = info.category
         if cat != self._last_cat:
             self._last_cat = cat

@@ -493,7 +493,8 @@ class ContextualDialogue:
 
         Returns `(text, emotion, voice, particle)`.
         """
-        app = _clip(app_name or "that app", 22)
+        raw_phrase = str(ctx.get("active_app_phrase") or "").strip()
+        app = _clip(raw_phrase or app_name or "that app", 38)
         overdue = int(ctx.get("overdue_count", 0))
         pending = int(ctx.get("pending_tasks", 0))
         hour = int(ctx.get("hour", 12))
