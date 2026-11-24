@@ -1289,6 +1289,7 @@ class NotesDialog(P5FluidPanel):
     open_settings = pyqtSignal()
     open_tasks = pyqtSignal()
     tasks_changed = pyqtSignal()
+    notes_changed = pyqtSignal()
 
     def __init__(self, store: NoteStore, task_store: TaskStore | None = None,
                  on_top: bool = True, ui_scale: float = 1.0) -> None:
@@ -1800,6 +1801,7 @@ class NotesDialog(P5FluidPanel):
         self.store.set_done(self._current_id, done)
         self._sync_flags_ui(bool(note.get("pinned")), done)
         self.refresh()
+        self.notes_changed.emit()
 
     def _save(self, silent: bool = False) -> bool:
         silent = silent is True
@@ -1823,6 +1825,7 @@ class NotesDialog(P5FluidPanel):
             btn.setEnabled(self._current_id is not None)
         if note:
             self._sync_flags_ui(bool(note.get("pinned")), bool(note.get("done")))
+        self.notes_changed.emit()
         if silent:
             return True
         self.refresh()
@@ -1845,6 +1848,7 @@ class NotesDialog(P5FluidPanel):
         self.store.delete(self._current_id)
         self._dirty = False
         self._new()
+        self.notes_changed.emit()
         self._undo.trigger(f"Deleted '{title[:28]}'.")
 
     def _undo_delete(self) -> None:
@@ -1855,6 +1859,7 @@ class NotesDialog(P5FluidPanel):
         if restored is not None:
             self._load(restored)
             self.refresh()
+            self.notes_changed.emit()
             self.status.setText("Note restored.")
 
 
@@ -2162,6 +2167,7 @@ class EventsDialog(P5FluidPanel):
 
     refresh_requested = pyqtSignal(bool)     # True = allow interactive OAuth sign-in
     open_tasks = pyqtSignal()
+    open_notes = pyqtSignal()
     open_settings = pyqtSignal()
 
     def __init__(self, on_top: bool = True, ui_scale: float = 1.0) -> None:
@@ -2182,6 +2188,10 @@ class EventsDialog(P5FluidPanel):
         self._hdr_refresh.setToolTip("Refresh calendar (F5)")
         self._hdr_refresh.clicked.connect(lambda _c=False: self.refresh_requested.emit(True))
         self.header_bar.addWidget(self._hdr_refresh)
+
+        self._notes_btn = self._btn("NOTES", variant="soft", display=True, px=10)
+        self._notes_btn.clicked.connect(lambda _c=False: self.open_notes.emit())
+        self.header_bar.addWidget(self._notes_btn)
 
         self._tasks_btn = self._btn("TASKS", variant="soft", display=True, px=10)
         self._tasks_btn.clicked.connect(lambda _c=False: self.open_tasks.emit())
@@ -2272,7 +2282,7 @@ class EventsDialog(P5FluidPanel):
         # Footer
         foot = QHBoxLayout()
         foot.setSpacing(8)
-        self._foot_tip = QLabel("7-day calendar view")
+        self._foot_tip = QLabel("7-day calendar & note deadlines")
         self._foot_tip.setObjectName("tip")
         self._foot_tip.setWordWrap(True)
         foot.addWidget(self._foot_tip, 1)
@@ -2319,20 +2329,24 @@ class EventsDialog(P5FluidPanel):
             self._selected_day = None
 
         # Header count & footer note
-        total = sum(len(evs) for _, evs in grouped)
+        all_shown = [ev for _, evs in grouped for ev in evs]
+        total = len(all_shown)
+        n_notes = sum(1 for ev in all_shown if ev.source == "note")
+        n_cal = total - n_notes
+        note_suffix = (f" · {n_notes} NOTE" + ("" if n_notes == 1 else "S")) if n_notes else ""
         if res.status == "error":
-            self._count_lbl.setText("OFFLINE")
-            self._foot_tip.setText(f"Calendar sync failed: {res.message}")
+            self._count_lbl.setText(f"OFFLINE{note_suffix}")
+            self._foot_tip.setText(f"Calendar sync failed: {res.message} · Note deadlines still shown.")
         elif res.status == "auth_needed":
-            self._count_lbl.setText("SIGN IN")
-            self._foot_tip.setText("Google Calendar token expired. Click SIGN IN to reconnect.")
+            self._count_lbl.setText(f"SIGN IN{note_suffix}")
+            self._foot_tip.setText("Google Calendar token expired. Click SIGN IN to reconnect · Note deadlines still shown.")
         elif res.is_dummy:
-            self._count_lbl.setText(f"SAMPLE · {total} EVENTS")
-            self._foot_tip.setText("Sample 7-day schedule · place credentials.json next to the app to sync Google Calendar.")
+            self._count_lbl.setText(f"SAMPLE · {total} ITEMS")
+            self._foot_tip.setText("Sample 7-day calendar + your Note deadlines · add credentials.json to sync Google Calendar.")
         else:
-            word = "EVENT" if total == 1 else "EVENTS"
-            self._count_lbl.setText(f"{total} {word} THIS WEEK")
-            self._foot_tip.setText("Google Calendar · 7-day schedule · F5 to refresh")
+            word = "EVENT" if n_cal == 1 else "EVENTS"
+            self._count_lbl.setText(f"{n_cal} {word}{note_suffix}")
+            self._foot_tip.setText("Google Calendar + Note deadlines · 7-day schedule · F5 to refresh")
 
         # Morgana briefing banner
         tag, speech = morgana_briefing(res, now=now)
@@ -2340,7 +2354,7 @@ class EventsDialog(P5FluidPanel):
         self._brief_text.setText(speech)
         self._signin_btn.setVisible(res.status == "auth_needed")
         self._foot_refresh.set_variant("primary" if res.status in ("error", "auth_needed") else "soft")
-        if "HAPPENING NOW" in tag:
+        if "HAPPENING NOW" in tag or "OVERDUE" in tag:
             self._brief_card.set_accent(RED)
             self._brief_tag.setStyleSheet(
                 f'background: #E60012; color: #FFFFFF; border: 1px solid #FFFFFF; '
@@ -2352,6 +2366,14 @@ class EventsDialog(P5FluidPanel):
             self._brief_card.set_accent(P5_MINT_FG)
             self._brief_tag.setStyleSheet(
                 f'background: #10281E; color: #5CE09A; border: 1px solid #245943; '
+                f'border-radius: 4px; padding: 1px {_sc(7, sc, 5)}px; '
+                f'font-family: "Barlow Condensed", "Arsenal", sans-serif; font-weight: 800; '
+                f'font-size: {_sc(11, sc, 9)}px;'
+            )
+        elif "NOTE DEADLINE" in tag:
+            self._brief_card.set_accent(GOLD)
+            self._brief_tag.setStyleSheet(
+                f'background: #2B2208; color: #FAD02C; border: 1px solid #6C5514; '
                 f'border-radius: 4px; padding: 1px {_sc(7, sc, 5)}px; '
                 f'font-family: "Barlow Condensed", "Arsenal", sans-serif; font-weight: 800; '
                 f'font-size: {_sc(11, sc, 9)}px;'
@@ -2382,12 +2404,12 @@ class EventsDialog(P5FluidPanel):
             btn.setFixedHeight(_sc(26, sc, 22))
             btn.set_active(self._selected_day == d)
             n_ev = len(evs)
-            btn.setToolTip(f"{d:%A, %d %b} — {n_ev} event" + ("" if n_ev == 1 else "s"))
+            btn.setToolTip(f"{d:%A, %d %b} — {n_ev} item" + ("" if n_ev == 1 else "s"))
             btn.clicked.connect(lambda _c=False, day=d: self._select_day(day))
             self._day_strip.addWidget(btn, 1)
             self._day_btns[d] = btn
 
-        # Find ongoing & next upcoming event for card highlighting
+        # Find next upcoming event/deadline for card highlighting
         timed = sorted((e for e in res.events if not e.all_day), key=lambda e: e.start)
         next_ev = next((e for e in timed if e.start > now), None)
 
@@ -2418,7 +2440,7 @@ class EventsDialog(P5FluidPanel):
             )
             hdr.addWidget(dlbl)
             hdr.addStretch(1)
-            cnt_txt = f"{len(evs)} EVENT" + ("" if len(evs) == 1 else "S") if evs else "CLEAR"
+            cnt_txt = f"{len(evs)} ITEM" + ("" if len(evs) == 1 else "S") if evs else "CLEAR"
             clbl = QLabel(cnt_txt)
             clbl.setStyleSheet(
                 f'color: {"#FAD02C" if evs else "#66667A"}; '
@@ -2429,7 +2451,7 @@ class EventsDialog(P5FluidPanel):
             self._days_lay.addLayout(hdr)
 
             if not evs:
-                empty = QLabel("No events scheduled." if self._selected_day is None
+                empty = QLabel("No events or note deadlines." if self._selected_day is None
                                else "Your schedule is clear on this day!")
                 empty.setStyleSheet(
                     f'color: #6B6B7F; padding: {_sc(4, sc, 2)}px {_sc(8, sc, 6)}px; '
@@ -2439,22 +2461,24 @@ class EventsDialog(P5FluidPanel):
                 continue
 
             for ev in evs:
-                is_now = (not ev.all_day and ev.start <= now and (ev.end is None or ev.end > now))
+                is_note = ev.source == "note"
+                is_overdue = is_note and ev.start <= now
+                is_now = (not is_note and not ev.all_day and ev.start <= now and (ev.end is None or ev.end > now))
                 is_next = (next_ev is not None and ev is next_ev)
-                is_past = (not ev.all_day and (ev.end or ev.start) <= now and not is_now)
+                is_past = (not is_note and not ev.all_day and (ev.end or ev.start) <= now and not is_now)
 
                 row_card = _make_card("subcard")
-                if is_now:
+                if is_now or is_overdue:
                     row_card.setStyleSheet(
                         "QFrame#subcard { background-color: #2A0C11; border: 1.5px solid #E60012; border-radius: 8px; }"
                     )
-                elif is_next:
+                elif is_next or is_note:
                     row_card.setStyleSheet(
                         "QFrame#subcard { background-color: #221B0A; border: 1.5px solid #6C5514; border-radius: 8px; }"
                     )
                 rl = QHBoxLayout(row_card)
                 rl.setContentsMargins(_sc(10, sc, 7), _sc(7, sc, 5), _sc(10, sc, 7), _sc(7, sc, 5))
-                rl.setSpacing(_sc(10, sc, 7))
+                rl.setSpacing(_sc(8, sc, 6))
 
                 # Time column
                 if ev.all_day:
@@ -2464,6 +2488,13 @@ class EventsDialog(P5FluidPanel):
                         f'border-radius: 4px; padding: 2px 6px; '
                         f'font-family: "Barlow Condensed", sans-serif; font-weight: 800; '
                         f'font-size: {_sc(12, sc, 10)}px;'
+                    )
+                elif is_note:
+                    time_txt = f"DUE {ev.start:%H:%M}" if ev.start.date() == d else f"{ev.start:%d %b %H:%M}"
+                    time_style = (
+                        f'color: {"#FF5E6B" if is_overdue else "#FAD02C"}; '
+                        f'font-family: "Barlow Condensed", "Arsenal", sans-serif; font-weight: 800; '
+                        f'font-size: {_sc(13, sc, 10)}px;'
                     )
                 else:
                     end_s = f"–{ev.end:%H:%M}" if ev.end else ""
@@ -2479,6 +2510,17 @@ class EventsDialog(P5FluidPanel):
                 tlbl.setStyleSheet(time_style)
                 rl.addWidget(tlbl)
 
+                # Source pill for Note Deadlines
+                if is_note:
+                    src_lbl = QLabel("NOTE")
+                    src_lbl.setStyleSheet(
+                        f'background: #360A10; color: #FF7882; border: 1px solid #731823; '
+                        f'border-radius: 4px; padding: 1px {_sc(5, sc, 4)}px; '
+                        f'font-family: "Barlow Condensed", sans-serif; font-weight: 800; '
+                        f'font-size: {_sc(10, sc, 8)}px;'
+                    )
+                    rl.addWidget(src_lbl)
+
                 # Title
                 elbl = QLabel(ev.title)
                 elbl.setWordWrap(True)
@@ -2491,7 +2533,10 @@ class EventsDialog(P5FluidPanel):
 
                 # Status chip
                 badge_txt, badge_css = "", ""
-                if is_now:
+                if is_overdue:
+                    badge_txt = "OVERDUE"
+                    badge_css = "background: #E60012; color: #FFFFFF; border: none;"
+                elif is_now:
                     badge_txt = "NOW"
                     badge_css = "background: #E60012; color: #FFFFFF; border: none;"
                 elif is_next:

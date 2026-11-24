@@ -53,7 +53,8 @@ from PyQt6.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QWidget
 import app_paths
 import autostart
 from audio_manager import init_audio, play_ui
-from calendar_service import CalendarEvent, CalendarResult, CalendarService, format_agenda, human_delta
+from calendar_service import (CalendarEvent, CalendarResult, CalendarService, format_agenda,
+                              human_delta, merge_note_deadlines, note_deadline_events)
 from emotions import EXPRESSIONS, STATE_EXPRESSION, emotion_for_text, voice_for_dialogue
 from motion import FrameTicker, Spring, clamp
 from lines import ContextualDialogue, LineBag, greeting_pool, load_lines
@@ -2264,10 +2265,11 @@ class PetController(QObject):
         manual = self.manual_timers.snapshot()
         nearest = manual[0] if manual else None
 
-        # Calendar snapshot (live events or cached weekly sample)
-        cal_list = self._cal_events or (self._last_cal_result.events if self._last_cal_result else [])
+        # Calendar + Note deadlines snapshot (live events or cached weekly sample)
+        base_cal = self._cal_events or (self._last_cal_result.events if self._last_cal_result else [])
+        cal_list = list(base_cal) + note_deadline_events(notes_all, now=aware_now)
         timed = sorted((e for e in cal_list if not e.all_day), key=lambda e: e.start)
-        ongoing = next((e for e in timed if e.start <= aware_now and (e.end is None or e.end > aware_now)), None)
+        ongoing = next((e for e in timed if e.source != "note" and e.start <= aware_now and (e.end is None or e.end > aware_now)), None)
         next_ev = next((e for e in timed if e.start > aware_now), None)
         next_title, next_delta = "", ""
         if next_ev is not None and (next_ev.start - aware_now) <= timedelta(hours=8):
@@ -2365,6 +2367,7 @@ class PetController(QObject):
             self.notes_dialog._tasks_btn.setVisible("tasks" in enabled)
         if self.events_dialog is not None:
             self.events_dialog._tasks_btn.setVisible("tasks" in enabled)
+            self.events_dialog._notes_btn.setVisible("notes" in enabled)
 
     def _open_tasks(self) -> None:
         was_open = self.tasks_dialog is not None and self.tasks_dialog.isVisible()
@@ -2385,11 +2388,20 @@ class PetController(QObject):
             self.notes_dialog = NotesDialog(self.notes, self.tasks, on_top=self.on_top, ui_scale=self.ui_scale)
             self.notes_dialog.open_settings.connect(self._open_settings_deferred)
             self.notes_dialog.open_tasks.connect(self._open_tasks)
+            self.notes_dialog.notes_changed.connect(self._sync_events_view)
             self.notes_dialog.closed.connect(lambda: self._on_dialog_closed("notes"))
         self._sync_dialog_links()
         self.notes_dialog.show_near(self.pet.geometry())
         if not was_open and not self._rebuilding_ui:
             self._say_tuple(self.dialogue.window_open("notes", self._ctx()), ms=4800)
+
+    def _combined_events_result(self, base: CalendarResult | None = None) -> CalendarResult:
+        src = base if base is not None else (self._last_cal_result or CalendarResult([], "ok"))
+        return merge_note_deadlines(src, self.notes.all())
+
+    def _sync_events_view(self) -> None:
+        if self.events_dialog is not None:
+            self.events_dialog.set_result(self._combined_events_result())
 
     def _open_events(self) -> None:
         was_open = self.events_dialog is not None and self.events_dialog.isVisible()
@@ -2397,11 +2409,12 @@ class PetController(QObject):
             self.events_dialog = EventsDialog(on_top=self.on_top, ui_scale=self.ui_scale)
             self.events_dialog.refresh_requested.connect(self._refresh_events)
             self.events_dialog.open_tasks.connect(self._open_tasks)
+            self.events_dialog.open_notes.connect(self._open_notes)
             self.events_dialog.open_settings.connect(self._open_settings_deferred)
             self.events_dialog.closed.connect(lambda: self._on_dialog_closed("events"))
         self._sync_dialog_links()
-        if self._last_cal_result is not None:
-            self.events_dialog.set_result(self._last_cal_result)
+        if self._last_cal_result is not None or self.notes.with_deadline():
+            self.events_dialog.set_result(self._combined_events_result())
         self.events_dialog.show_near(self.pet.geometry())
         if not was_open and not self._rebuilding_ui:
             self._say_tuple(self.dialogue.window_open("events", self._ctx()), ms=5000)
@@ -2462,7 +2475,7 @@ class PetController(QObject):
             self._say_tuple(self.dialogue.window_open("system", self._ctx()), ms=4200)
             self.system_menu.popup(anchor)
 
-    # -- EVENTS: 7-day Google Calendar --------------------------------------------
+    # -- EVENTS: 7-day Google Calendar + Note Deadlines ---------------------------
     def _refresh_events(self, interactive: bool = True) -> None:
         if not self.calendar.is_configured():
             result = self.calendar.get_upcoming()
@@ -2470,10 +2483,10 @@ class PetController(QObject):
             if self.args.demo_reminders:
                 self._cal_events = result.events
             if self.events_dialog is not None:
-                self.events_dialog.set_result(result)
+                self.events_dialog.set_result(self._combined_events_result(result))
             return
         self._agenda_wanted = interactive
-        if self.events_dialog is not None and self._last_cal_result is None:
+        if self.events_dialog is not None and self._last_cal_result is None and not self.notes.with_deadline():
             self.events_dialog.set_loading(True)
         if interactive and not self.calendar.has_token():
             self.say("Opening your browser to connect Google Calendar (one-time setup). "
@@ -2496,7 +2509,7 @@ class PetController(QObject):
         if result.status == "ok" or (result.is_dummy and self.args.demo_reminders):
             self._cal_events = result.events
         if self.events_dialog is not None:
-            self.events_dialog.set_result(result)
+            self.events_dialog.set_result(self._combined_events_result(result))
         if not self._agenda_wanted:
             return
         if result.status == "auth_needed":     # fetch latar gagal login -> ulangi interaktif
