@@ -18,11 +18,11 @@ from typing import Any
 
 AI_PROVIDERS: tuple[str, ...] = ("gemini", "openai")
 GEMINI_MODELS: tuple[str, ...] = (
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-2.0-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.6-flash",
+    "gemini-3.8-flash",
 )
-DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
 DEFAULT_OPENAI_ENDPOINT = "http://localhost:11434/v1/chat/completions"
 DEFAULT_CALL_USER = "Joker"
 
@@ -322,11 +322,8 @@ def _call_gemini_raw(
     if not api_key:
         return False, "Missing Gemini API key"
     model = (cfg.model or DEFAULT_GEMINI_MODEL).strip() or DEFAULT_GEMINI_MODEL
-    # Strip optional leading "models/" if user pasted full resource name
     if model.startswith("models/"):
         model = model[len("models/"):]
-    safe_model = urllib.parse.quote(model, safe=".-_")
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{safe_model}:generateContent"
 
     contents: list[dict[str, Any]] = []
     for t in turns:
@@ -349,28 +346,47 @@ def _call_gemini_raw(
     if expect_json:
         gen_cfg["responseMimeType"] = "application/json"
 
-    payload: dict[str, Any] = {
+    body_bytes = json.dumps({
         "systemInstruction": {"parts": [{"text": system_prompt}]},
         "contents": contents,
         "generationConfig": gen_cfg,
-    }
+    }).encode("utf-8")
 
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "x-goog-api-key": api_key,
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8", errors="replace"))
-    except urllib.error.HTTPError as err:
-        return False, _extract_http_error(err)
-    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
-        return False, f"Connection error: {exc}"
+    # Try user's selected model first; if Google returns 404 (deprecated model),
+    # fall back cleanly to current production Flash models without failing.
+    candidates_models = [model]
+    for fb_m in ("gemini-3.5-flash-lite", "gemini-3.6-flash"):
+        if fb_m not in candidates_models:
+            candidates_models.append(fb_m)
+
+    data = None
+    last_err = ""
+    for mdl in candidates_models:
+        safe_model = urllib.parse.quote(mdl, safe=".-_")
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{safe_model}:generateContent"
+        req = urllib.request.Request(
+            url,
+            data=body_bytes,
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": api_key,
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            break
+        except urllib.error.HTTPError as err:
+            last_err = _extract_http_error(err)
+            if getattr(err, "code", 0) == 404 and mdl != candidates_models[-1]:
+                continue
+            return False, last_err
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+            return False, f"Connection error: {exc}"
+
+    if data is None:
+        return False, last_err or "Gemini request failed"
 
     candidates = data.get("candidates") or []
     if not candidates:
@@ -379,7 +395,7 @@ def _call_gemini_raw(
         return False, f"Gemini returned no text ({reason})"
 
     parts = ((candidates[0].get("content") or {}).get("parts")) or []
-    # Filter out Gemini 2.5+ internal thinking parts (`thought: true`) cleanly
+    # Filter out Gemini internal thinking parts (`thought: true`) cleanly
     texts = [
         str(p.get("text") or "")
         for p in parts

@@ -2995,7 +2995,7 @@ class PetController(QObject):
         return AIConfig(
             provider=str(self.settings["ai_provider"] or "gemini"),
             api_key=str(self.settings["ai_api_key"] or ""),
-            model=str(self.settings["ai_model"] or "gemini-2.5-flash"),
+            model=str(self.settings["ai_model"] or "gemini-3.5-flash-lite"),
             endpoint=str(self.settings["ai_endpoint"] or ""),
             call_user=str(self.settings["ai_call_user"] or "Joker"),
         )
@@ -3821,7 +3821,7 @@ class PetController(QObject):
         cfg = AIConfig(
             provider=str(data.get("provider") or "gemini"),
             api_key=str(data.get("api_key") or ""),
-            model=str(data.get("model") or "gemini-2.5-flash"),
+            model=str(data.get("model") or "gemini-3.5-flash-lite"),
             endpoint=str(data.get("endpoint") or ""),
             call_user=str(data.get("call_user") or "Joker"),
         )

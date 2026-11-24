@@ -986,7 +986,7 @@ SETTINGS_DEFAULTS = {
     "ai_enabled": False,                # Opt-in AI companion (Google Gemini or OpenAI-compatible)
     "ai_provider": "gemini",            # "gemini" (Google AI Studio) or "openai" (Ollama/OpenAI)
     "ai_endpoint": "http://localhost:11434/v1/chat/completions",
-    "ai_model": "gemini-2.5-flash",
+    "ai_model": "gemini-3.5-flash-lite",
     "ai_api_key": "",
     "ai_call_user": "Joker",            # How Morgana addresses you in AI conversations
     "ai_dialogue_enabled": True,        # Use AI for Talk / Choice Prompts & live app reactions
@@ -1095,13 +1095,16 @@ class SettingsStore:
         if "app_awareness_enabled" not in raw and isinstance(patch.get("enabled_tabs"), list):
             if set(str(x).lower() for x in patch["enabled_tabs"]) == _LEGACY_6_TABS:
                 patch["enabled_tabs"] = list(RADIAL_TAB_KEYS)
-        # Smooth upgrade from v1.4.0 (Ollama-only defaults) -> v1.4.1 (Gemini-first defaults)
+        # Smooth upgrade from v1.4.0/v1.4.1 -> current Gemini 3.5 Flash-Lite
         if "ai_provider" not in raw:
             if bool(raw.get("ai_enabled")):
                 patch["ai_provider"] = "openai"
-            elif str(raw.get("ai_model") or "").strip().lower() == "llama3.2":
+            elif str(raw.get("ai_model") or "").strip().lower() in ("llama3.2", "gemini-2.5-flash", "gemini-2.0-flash"):
                 patch["ai_provider"] = "gemini"
-                patch["ai_model"] = "gemini-2.5-flash"
+                patch["ai_model"] = "gemini-3.5-flash-lite"
+        elif str(patch.get("ai_provider") or raw.get("ai_provider") or "gemini").strip().lower() == "gemini":
+            if str(patch.get("ai_model") or "").strip().lower() in ("gemini-2.5-flash", "gemini-2.0-flash"):
+                patch["ai_model"] = "gemini-3.5-flash-lite"
         self.set(save=False, **patch)
 
     def set(self, save: bool = True, **values) -> None:

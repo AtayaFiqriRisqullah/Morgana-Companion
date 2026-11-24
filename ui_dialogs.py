@@ -3518,7 +3518,7 @@ class SettingsDialog(P5FluidPanel):
         self._row(lai, "API Key", self.ai_key_edit, wide=True)
 
         self.ai_model_edit = QLineEdit()
-        self.ai_model_edit.setPlaceholderText("gemini-2.5-flash")
+        self.ai_model_edit.setPlaceholderText("gemini-3.5-flash-lite")
         self._row(lai, "Model", self.ai_model_edit, wide=True)
 
         self._ai_endpoint_wrap = QWidget()
@@ -3625,7 +3625,7 @@ class SettingsDialog(P5FluidPanel):
         self.ai_key_edit.setPlaceholderText(
             "AIza... (from aistudio.google.com/apikey)" if is_gemini else "Optional (blank for local Ollama)"
         )
-        self.ai_model_edit.setPlaceholderText("gemini-2.5-flash" if is_gemini else "llama3.2")
+        self.ai_model_edit.setPlaceholderText("gemini-3.5-flash-lite" if is_gemini else "llama3.2")
         for w in (self.ai_provider_combo, self.ai_endpoint_edit, self.ai_model_edit,
                   self.ai_key_edit, self.ai_call_user_edit, self.ai_dialogue_check):
             w.setEnabled(on)
@@ -3636,8 +3636,8 @@ class SettingsDialog(P5FluidPanel):
             prov = str(self.ai_provider_combo.currentData() or "gemini")
             cur_model = self.ai_model_edit.text().strip().lower()
             if prov == "gemini" and cur_model in ("", "llama3.2", "llama3", "gpt-4o-mini"):
-                self.ai_model_edit.setText("gemini-2.5-flash")
-            elif prov == "openai" and cur_model in ("", "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"):
+                self.ai_model_edit.setText("gemini-3.5-flash-lite")
+            elif prov == "openai" and (not cur_model or cur_model.startswith("gemini-")):
                 self.ai_model_edit.setText("llama3.2")
         self._sync_ai_fields(self.ai_enabled_check.isChecked())
 
@@ -3649,7 +3649,7 @@ class SettingsDialog(P5FluidPanel):
         self.test_ai_requested.emit({
             "provider": prov,
             "api_key": self.ai_key_edit.text().strip(),
-            "model": self.ai_model_edit.text().strip() or ("gemini-2.5-flash" if prov == "gemini" else "llama3.2"),
+            "model": self.ai_model_edit.text().strip() or ("gemini-3.5-flash-lite" if prov == "gemini" else "llama3.2"),
             "endpoint": self.ai_endpoint_edit.text().strip() or SETTINGS_DEFAULTS["ai_endpoint"],
             "call_user": self.ai_call_user_edit.text().strip() or "Joker",
         })
@@ -3871,7 +3871,7 @@ class SettingsDialog(P5FluidPanel):
                 ai_provider=str(self.ai_provider_combo.currentData() or "gemini"),
                 ai_endpoint=self.ai_endpoint_edit.text().strip() or SETTINGS_DEFAULTS["ai_endpoint"],
                 ai_model=self.ai_model_edit.text().strip() or (
-                    "gemini-2.5-flash" if str(self.ai_provider_combo.currentData() or "gemini") == "gemini" else "llama3.2"
+                    "gemini-3.5-flash-lite" if str(self.ai_provider_combo.currentData() or "gemini") == "gemini" else "llama3.2"
                 ),
                 ai_api_key=self.ai_key_edit.text().strip(),
                 ai_call_user=self.ai_call_user_edit.text().strip() or "Joker",
