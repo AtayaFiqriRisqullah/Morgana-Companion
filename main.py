@@ -46,19 +46,23 @@ from pathlib import Path
 
 from PyQt6.QtCore import (QDir, QLockFile, QObject, QPoint, QPointF, QRect, QRectF, Qt,
                           QTimer, pyqtSignal)
-from PyQt6.QtGui import (QAction, QActionGroup, QColor, QFontMetrics, QGuiApplication, QIcon,
-                         QPainter, QPainterPath, QPen, QPixmap, QPolygonF, QRegion, QTransform)
+from PyQt6.QtGui import (QAction, QActionGroup, QColor, QCursor, QFontMetrics, QGuiApplication,
+                         QIcon, QPainter, QPainterPath, QPen, QPixmap, QPolygonF, QRegion,
+                         QTransform)
 from PyQt6.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QWidget
 
 import app_paths
 import autostart
 from audio_manager import init_audio, play_ui
+from awareness import AppAwarenessMonitor, ScreenTimeStore, get_active_window, get_idle_seconds
 from calendar_service import (CalendarEvent, CalendarResult, CalendarService, events_by_day,
                               format_agenda, human_delta, local_calendar_events,
                               merge_companion_items, note_deadline_events, task_deadline_events)
+from dialogue_engine import DialogueEngine, DialogueMemoryStore
 from emotions import EXPRESSIONS, STATE_EXPRESSION, emotion_for_text, voice_for_dialogue
 from motion import FrameTicker, Spring, clamp
 from lines import (ContextualDialogue, LineBag, build_daily_briefing, greeting_pool, load_lines)
+from particles import ParticleOverlay
 import sprites
 from sprites import EYE_CLOSED, EYE_HALF, EYE_OPEN, MOUTH_BASE, MorganaSprites
 from storage_manager import (RADIAL_TAB_KEYS, SOCIAL_STAT_KEYS, SOCIAL_STATS, HabitStore,
@@ -383,6 +387,7 @@ class PetWindow(QWidget):
     meluncur setelah dilempar) memakai pegas supaya terasa cair."""
 
     clicked = pyqtSignal()                 # klik kiri tanpa drag
+    double_clicked = pyqtSignal()          # double-click kiri: ajak ngobrol interaktif
     moved = pyqtSignal()                   # posisi berubah (bubble & menu mengikuti)
     context_requested = pyqtSignal(QPoint)  # klik kanan
     wall_bounced = pyqtSignal()            # memantul kencang di tepi layar
@@ -805,7 +810,22 @@ class PetWindow(QWidget):
         if self._dragging:
             self.move(self._press_origin + delta)
 
+    def mouseDoubleClickEvent(self, e) -> None:
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._ignore_next_release = True
+            self._press_global = None
+            self._dragging = False
+            self.bump(1.1)
+            self.double_clicked.emit()
+            e.accept()
+            return
+        super().mouseDoubleClickEvent(e)
+
     def mouseReleaseEvent(self, e) -> None:
+        if getattr(self, "_ignore_next_release", False):
+            self._ignore_next_release = False
+            e.accept()
+            return
         if e.button() == Qt.MouseButton.LeftButton and self._press_global is not None:
             was_drag = self._dragging
             self._press_global = None
@@ -999,9 +1019,13 @@ class BubbleWindow(QWidget):
             self._show.velocity = 0.0
         self._place()
         self._ticker.start()
-        self._hide_timer.start(self._per_page_ms + int(1000 * self._total / self._speed))
+        if getattr(self, "_hold", False) and self._page_idx + 1 >= len(self._pages):
+            self._hide_timer.stop()
+        else:
+            self._hide_timer.start(self._per_page_ms + int(1000 * self._total / self._speed))
 
-    def show_message(self, text: str, ms: int) -> None:
+    def show_message(self, text: str, ms: int, hold: bool = False) -> None:
+        self._hold = bool(hold)
         fm = QFontMetrics(self._font)
         max_w = max(240, int(round(self.MAX_TEXT_W * self._ui_scale)))
         if self._use_img:
@@ -1023,10 +1047,11 @@ class BubbleWindow(QWidget):
         if self._page_idx + 1 < len(self._pages):
             self._apply_page(self._page_idx + 1, pop_bounce=True)
             self.page_started.emit()
-        else:
+        elif not getattr(self, "_hold", False):
             self.dismiss()
 
     def dismiss(self) -> None:
+        self._hold = False
         self._hide_timer.stop()
         if self.isVisible() and not self._closing:
             self._closing = True
@@ -1312,8 +1337,325 @@ class BubbleWindow(QWidget):
         if self._page_idx + 1 < len(self._pages):
             self._apply_page(self._page_idx + 1, pop_bounce=True)
             self.page_started.emit()
-        else:
+        elif not getattr(self, "_hold", False):
             self.dismiss()
+
+
+class ChoiceOverlay(QWidget):
+    """Persona 5 slanted dialogue choice panel tethered cleanly to `BubbleWindow`.
+
+    Displays 2-3 slanted black-and-white P5 response strips with crimson hover sweeps,
+    spinning selection stars, keyboard shortcuts (`1`/`2`/`3` and `Esc`), and a compact
+    close tag so the user can dismiss at any time.
+    """
+
+    choice_selected = pyqtSignal(int)
+    cancelled = pyqtSignal()
+
+    def __init__(self, bubble: BubbleWindow) -> None:
+        super().__init__()
+        setup_overlay(self)
+        # ChoiceOverlay intentionally accepts keyboard focus (1/2/3, arrows, Enter, Esc)
+        self.setWindowFlag(Qt.WindowType.WindowDoesNotAcceptFocus, False)
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self._bubble = bubble
+        self._choices: list[str] = []
+        self._ui_scale = 1.0
+        self._hovered = -1
+        self._close_hovered = False
+        self._pops: list[Spring] = []
+        self._hovers: list[Spring] = []
+        self._t = 0.0
+        self._open = False
+        self._row_rects: list[QRectF] = []
+        self._close_rect = QRectF()
+        self._ticker = FrameTicker(self._frame, self)
+
+    @property
+    def is_open(self) -> bool:
+        return self._open and self.isVisible()
+
+    def set_on_top(self, on: bool) -> None:
+        was = self.isVisible()
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, on)
+        if was and self._open:
+            self.show()
+
+    def set_ui_scale(self, scale: float) -> None:
+        self._ui_scale = max(0.75, min(1.5, float(scale)))
+        if self._open and self._choices:
+            self._layout_choices()
+            self.follow()
+
+    def show_choices(self, choices: list[str]) -> None:
+        if not choices:
+            self.close_choices(silent=True)
+            return
+        self._choices = list(choices)
+        self._hovered = -1
+        self._close_hovered = False
+        self._t = 0.0
+        self._open = True
+        self._pops = [Spring(0.0, 260.0, 17.0) for _ in self._choices]
+        self._hovers = [Spring(0.0, 380.0, 26.0) for _ in self._choices]
+        self._layout_choices()
+        self.follow()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.setFocus()
+        self._ticker.start()
+
+    def close_choices(self, silent: bool = True) -> None:
+        if not self._open and not self.isVisible():
+            return
+        self._open = False
+        self._hovered = -1
+        self._close_hovered = False
+        if not silent:
+            play_ui("close")
+        for sp in self._pops:
+            sp.configure(380.0)
+            sp.target = 0.0
+        self._ticker.start()
+
+    def _layout_choices(self) -> None:
+        sc = self._ui_scale
+        font = p5_dialogue_font(max(11, int(round(13.5 * sc))))
+        fm = QFontMetrics(font)
+        max_tw = max((fm.horizontalAdvance(c) for c in self._choices), default=140)
+        row_w = max(int(248 * sc), min(int(430 * sc), max_tw + int(76 * sc)))
+        row_h = max(28, int(round(34 * sc)))
+        gap = max(5, int(round(7 * sc)))
+        pad_l = int(round(28 * sc))
+        pad_r = int(round(18 * sc))
+        pad_t = int(round(8 * sc))
+        close_h = max(18, int(round(20 * sc)))
+        pad_b = int(round(10 * sc))
+
+        self._row_rects = []
+        y = float(pad_t)
+        for i in range(len(self._choices)):
+            # Subtle Persona 5 cascade slant across rows
+            x_off = float(pad_l + i * int(round(6 * sc)))
+            self._row_rects.append(QRectF(x_off, y, float(row_w), float(row_h)))
+            y += row_h + gap
+
+        total_w = int(pad_l + row_w + len(self._choices) * int(round(6 * sc)) + pad_r)
+        close_w = int(round(76 * sc))
+        self._close_rect = QRectF(total_w - pad_r - close_w, y + 1.0, float(close_w), float(close_h))
+        total_h = int(y + close_h + pad_b)
+        self.setFixedSize(total_w, total_h)
+
+    def follow(self) -> None:
+        if not self.isVisible() and not self._open:
+            return
+        brect = self._bubble.visible_global_rect()
+        screen = QGuiApplication.screenAt(brect.center()) or QGuiApplication.primaryScreen()
+        area = screen.availableGeometry()
+        gap = 6
+        x = brect.center().x() - self.width() // 2
+        x = max(area.left() + 6, min(x, area.right() - self.width() - 6))
+        y_below = brect.bottom() + gap
+        y_above = brect.top() - gap - self.height()
+        if y_below + self.height() <= area.bottom() - 4:
+            y = y_below
+        elif y_above >= area.top() + 4:
+            y = y_above
+        else:
+            y = max(area.top() + 4, min(y_below, area.bottom() - self.height() - 4))
+        self.move(int(x), int(y))
+
+    def _frame(self, dt: float) -> bool:
+        self._t += dt
+        moving = False
+        for i, sp in enumerate(self._pops):
+            if self._open:
+                sp.target = 1.0 if self._t >= i * 0.055 else 0.0
+            else:
+                sp.target = 0.0
+            moving |= sp.step(dt)
+        for hs in self._hovers:
+            moving |= hs.step(dt)
+        self.update()
+        if not self._open and all(sp.value < 0.05 for sp in self._pops):
+            self.hide()
+            return False
+        return moving or (self._open and self._hovered >= 0)
+
+    def _hit_row(self, pos: QPointF) -> int:
+        for i, r in enumerate(self._row_rects):
+            if r.adjusted(-6, -2, 6, 2).contains(pos):
+                return i
+        return -1
+
+    def mouseMoveEvent(self, e) -> None:
+        if not self._open:
+            return
+        pos = e.position()
+        idx = self._hit_row(pos)
+        close_hit = self._close_rect.adjusted(-4, -2, 4, 2).contains(pos)
+        if idx != self._hovered:
+            self._hovered = idx
+            if idx >= 0:
+                play_ui("hover")
+                self._ticker.start()
+        self._close_hovered = close_hit
+        for i, hs in enumerate(self._hovers):
+            hs.target = 1.0 if i == idx else 0.0
+        self.setCursor(Qt.CursorShape.PointingHandCursor if (idx >= 0 or close_hit) else Qt.CursorShape.ArrowCursor)
+        self.update()
+
+    def leaveEvent(self, _e) -> None:
+        self._hovered = -1
+        self._close_hovered = False
+        for hs in self._hovers:
+            hs.target = 0.0
+        self.update()
+
+    def mousePressEvent(self, e) -> None:
+        if not self._open or e.button() != Qt.MouseButton.LeftButton:
+            return
+        pos = e.position()
+        if self._close_rect.adjusted(-4, -2, 4, 2).contains(pos):
+            self.close_choices(silent=False)
+            self.cancelled.emit()
+            return
+        idx = self._hit_row(pos)
+        if idx >= 0:
+            play_ui("select")
+            self.close_choices(silent=True)
+            self.choice_selected.emit(idx)
+
+    def keyPressEvent(self, e) -> None:
+        if not self._open:
+            return
+        k = e.key()
+        if k == Qt.Key.Key_Escape:
+            self.close_choices(silent=False)
+            self.cancelled.emit()
+            return
+        if k in (Qt.Key.Key_Up, Qt.Key.Key_Down) and self._choices:
+            step = -1 if k == Qt.Key.Key_Up else 1
+            nxt = (self._hovered + step) % len(self._choices) if self._hovered >= 0 else (0 if step > 0 else len(self._choices) - 1)
+            self._hovered = nxt
+            play_ui("hover")
+            for i, hs in enumerate(self._hovers):
+                hs.target = 1.0 if i == nxt else 0.0
+            self._ticker.start()
+            self.update()
+            return
+        if k in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and 0 <= self._hovered < len(self._choices):
+            idx = self._hovered
+            play_ui("select")
+            self.close_choices(silent=True)
+            self.choice_selected.emit(idx)
+            return
+        if Qt.Key.Key_1 <= k <= Qt.Key.Key_9:
+            idx = int(k - Qt.Key.Key_1)
+            if 0 <= idx < len(self._choices):
+                play_ui("select")
+                self.close_choices(silent=True)
+                self.choice_selected.emit(idx)
+                return
+        super().keyPressEvent(e)
+
+    def paintEvent(self, _event) -> None:
+        if not self._choices:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        sc = self._ui_scale
+        txt_font = p5_dialogue_font(max(11, int(round(13.5 * sc))))
+        num_font = p5_font(max(11, int(round(13 * sc))), italic=False)
+        close_font = p5_font(max(9, int(round(10 * sc))), italic=False)
+        skew = 9.0 * sc
+
+        for i, (label, r) in enumerate(zip(self._choices, self._row_rects)):
+            pv = self._pops[i].value if i < len(self._pops) else 1.0
+            hv = clamp(self._hovers[i].value if i < len(self._hovers) else 0.0)
+            alpha = clamp(pv * 1.6)
+            if alpha <= 0.02:
+                continue
+
+            p.save()
+            p.setOpacity(alpha)
+            slide_x = (1.0 - clamp(pv)) * -26.0 * sc + hv * 7.0 * sc
+            p.translate(slide_x, 0.0)
+
+            poly = QPolygonF([
+                QPointF(r.left() + skew, r.top()),
+                QPointF(r.right(), r.top()),
+                QPointF(r.right() - skew, r.bottom()),
+                QPointF(r.left(), r.bottom()),
+            ])
+
+            # Hard Persona shadow
+            p.save()
+            p.translate(3.5 * sc, 4.0 * sc)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(lerp_color(RED, WHITE, hv))
+            p.drawPolygon(poly)
+            p.restore()
+
+            # Slanted black strip with crimson hover sweep
+            p.setPen(QPen(WHITE if hv > 0.2 else QColor("#D8D8E6"), (2.0 if hv > 0.2 else 1.6) * sc))
+            p.setBrush(lerp_color(BLACK, RED, hv * 0.92))
+            p.drawPolygon(poly)
+
+            # White number badge (`1`, `2`, `3`)
+            badge_w = 22.0 * sc
+            badge = QPolygonF([
+                QPointF(r.left() + skew + 4 * sc, r.top() + 4 * sc),
+                QPointF(r.left() + skew + 4 * sc + badge_w, r.top() + 4 * sc),
+                QPointF(r.left() + 4 * sc + badge_w, r.bottom() - 4 * sc),
+                QPointF(r.left() + 4 * sc, r.bottom() - 4 * sc),
+            ])
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(GOLD if hv > 0.35 else WHITE)
+            p.drawPolygon(badge)
+            p.setFont(num_font)
+            p.setPen(BLACK)
+            p.drawText(badge.boundingRect(), Qt.AlignmentFlag.AlignCenter.value, str(i + 1))
+
+            # Choice text
+            p.setFont(txt_font)
+            p.setPen(WHITE)
+            tx = r.left() + skew + badge_w + 12.0 * sc
+            tw = max(40.0, r.right() - tx - skew - 6.0 * sc)
+            elided = QFontMetrics(txt_font).elidedText(label, Qt.TextElideMode.ElideRight, int(tw))
+            p.drawText(QRectF(tx, r.top(), tw, r.height()),
+                       Qt.AlignmentFlag.AlignLeft.value | Qt.AlignmentFlag.AlignVCenter.value, elided)
+
+            # Spinning Persona star on hover
+            if hv > 0.05:
+                p.save()
+                p.translate(r.left() - 8.0 * sc, r.center().y())
+                p.rotate(self._t * 150.0)
+                st_sc = 0.3 + 0.7 * hv
+                p.scale(st_sc, st_sc)
+                p.setPen(QPen(BLACK, 1.8 * sc))
+                p.setBrush(GOLD)
+                p.drawPolygon(star_polygon(0.0, 0.0, 10.5 * sc, 4.8 * sc, 5))
+                p.restore()
+
+            p.restore()
+
+        # Compact ESC / CLOSE pill
+        if self._open and self._pops and self._pops[0].value > 0.35:
+            p.save()
+            p.setOpacity(clamp(self._pops[0].value))
+            cr = self._close_rect
+            p.setPen(QPen(WHITE if self._close_hovered else QColor("#666678"), 1.2 * sc))
+            p.setBrush(RED if self._close_hovered else QColor(14, 14, 20, 225))
+            p.drawRoundedRect(cr, 4.0, 4.0)
+            p.setFont(close_font)
+            p.setPen(WHITE)
+            p.drawText(cr, Qt.AlignmentFlag.AlignCenter.value, "ESC · CLOSE")
+            p.restore()
+        p.end()
 
 
 # ---------------------------------------------------------------------------
@@ -1410,15 +1752,17 @@ class RadialMenu(QWidget):
         ("events", "EVENTS", "This Week",       -1, 2),
         ("tasks",  "TASKS",  "To-Do List",      +1, 2),
         ("timer",  "TIMER",  "Focus & Timers",  -1, 2),
-        ("notes",  "NOTES",  "Quick Notes",     +1, 2),
-        ("system", "SYSTEM", "Options & Sleep", -1, 2),
+        ("notes",  "NOTES",  "Notebook",        +1, 2),
+        ("talk",   "TALK",   "Chat with Mona",  -1, 1),
         ("stats",  "STATS",  "Social Stats",    +1, 2),
+        ("system", "SYSTEM", "Options & Sleep", -1, 2),
     )
     # Non-overlapping fan slots per side count: list of (abs_ox_left, oy, rot_left_deg)
     _SIDE_SLOTS: dict[int, tuple[tuple[float, float, float], ...]] = {
         1: ((92.0,  -2.0,  +2.0),),
         2: ((86.0, -34.0, +12.0), (86.0, +30.0, -10.0)),
         3: ((80.0, -56.0, +20.0), (94.0,  -4.0,  +2.0), (88.0, +48.0, -11.0)),
+        4: ((76.0, -78.0, +26.0), (96.0, -26.0,  +9.0), (96.0, +26.0,  -7.0), (78.0, +76.0, -22.0)),
     }
 
     def __init__(self, pet: PetWindow) -> None:
@@ -1457,7 +1801,7 @@ class RadialMenu(QWidget):
             right_defs = [d for d in self._TAB_DEFS if d[3] > 0]
 
         built_left: list[MenuButton] = []
-        slots_l = self._SIDE_SLOTS.get(len(left_defs), self._SIDE_SLOTS[3])
+        slots_l = self._SIDE_SLOTS.get(len(left_defs), self._SIDE_SLOTS[4])
         for (key, label, sub, side, hi), (ax, oy, rot_l) in zip(left_defs, slots_l):
             built_left.append(MenuButton(key, label, sub, side, -ax, oy, rot_l, 176, 25, 48, hi, 0.0))
 
@@ -1555,7 +1899,7 @@ class RadialMenu(QWidget):
         self._u_pos = u_x
         self._u = u_btn
         self._u_y = max(u_sprite, u_btn)
-        w, h = int(840 * u_box), int(460 * u_box)
+        w, h = int(840 * u_box), int(540 * u_box)
         self.setFixedSize(w, h)
         self._backdrop.configure(w, h, u_box)
         self._geom = {b.key: self._build_button_cache(b, u_btn) for b in self._buttons}
@@ -2108,12 +2452,18 @@ class PetController(QObject):
         self.sprites = SpriteBank()
         self.pet = PetWindow(self.sprites, args.size)
         self.bubble = BubbleWindow(self.pet)
+        self.particles = ParticleOverlay(self.pet)
+        self.choices = ChoiceOverlay(self.bubble)
         self.menu = RadialMenu(self.pet)
         self.tasks = TaskStore(APP_DIR / "tasks.json")
         self.notes = NoteStore(APP_DIR / "notes.json")
         self.social_stats = SocialStatsStore(APP_DIR / "social_stats.json")
         self.local_events = LocalEventStore(APP_DIR / "local_events.json")
         self.habits = HabitStore(APP_DIR / "habits.json")
+        self.screen_time = ScreenTimeStore(APP_DIR / "screen_time.json")
+        self.awareness = AppAwarenessMonitor()
+        self.dialogue_memory = DialogueMemoryStore(APP_DIR / "dialogue_memory.json")
+        self.dialogue_engine = DialogueEngine(self.dialogue_memory)
         self.settings = SettingsStore(APP_DIR / "settings.json")
         if args.curfew is not None:               # CLI flags override for this session only
             self.settings.set(save=False, bedtime=args.curfew.strftime("%H:%M"))
@@ -2146,7 +2496,9 @@ class PetController(QObject):
         self._agenda_wanted = False            # pengguna menunggu hasil EVENTS
         self._rebuilding_ui = False            # suppress open/close chatter during UI scale/tab sync
         self._last_bump_t = 0.0
+        self._last_awareness_tick = time.monotonic()
         self._pending_task_reward_note = ""
+        self._pending_choices: list[str] = []
         self._menu_hover_action: dict[int, object] = {}
 
         # state karakter
@@ -2167,6 +2519,9 @@ class PetController(QObject):
         )
         self.pet.set_ui_scale(self.ui_scale)
         self.bubble.set_ui_scale(self.ui_scale)
+        self.particles.set_ui_scale(self.ui_scale)
+        self.particles.set_enabled(bool(self.settings["particles_enabled"]))
+        self.choices.set_ui_scale(self.ui_scale)
         self.menu.set_ui_scale(self.ui_scale)
         self.menu.set_enabled_tabs(self.settings["enabled_tabs"])
 
@@ -2175,14 +2530,17 @@ class PetController(QObject):
         self._build_tray()
 
         self.pet.clicked.connect(self._on_pet_clicked)
+        self.pet.double_clicked.connect(self._on_pet_double_clicked)
         self.pet.moved.connect(self._on_pet_moved)
         self.pet.context_requested.connect(self.context_menu.popup)
         self.pet.wall_bounced.connect(self._on_wall_bounced)
-        self.bubble.dismissed.connect(self._restore_state)
-        self.bubble.typing_finished.connect(lambda: self.pet.set_speaking(False))
+        self.bubble.dismissed.connect(self._on_bubble_dismissed)
+        self.bubble.typing_finished.connect(self._on_bubble_typing_finished)
         self.bubble.page_started.connect(lambda: self.pet.set_speaking(True))
         self.bubble.set_menu(self.menu)
         self.bubble.set_avoid_rects(self._visible_dialog_rects)
+        self.choices.choice_selected.connect(self._on_choice_selected)
+        self.choices.cancelled.connect(self._on_choice_cancelled)
         self.menu.triggered.connect(self._on_menu_action)
         self.menu.user_closed.connect(self._on_menu_user_closed)
         self.menu.closed.connect(self.bubble.follow)
@@ -2206,21 +2564,33 @@ class PetController(QObject):
         self._chatter_timer = QTimer(self)
         self._chatter_timer.setSingleShot(True)
         self._chatter_timer.timeout.connect(self._chatter)
+        self._awareness_timer = QTimer(self)       # 5s local active-app & screen-time sampler
+        self._awareness_timer.setInterval(5_000)
+        self._awareness_timer.timeout.connect(self._poll_awareness_and_screen_time)
+        self._sleep_zzz_timer = QTimer(self)       # gentle Zzz particles during sleep/curfew
+        self._sleep_zzz_timer.setInterval(6_500)
+        self._sleep_zzz_timer.timeout.connect(self._sleep_zzz_tick)
 
     # -- siklus hidup -------------------------------------------------------
     def start(self) -> None:
         self._move_to_corner(QGuiApplication.primaryScreen())
         self.pet.show()
+        self.particles.follow()
         self._check_curfew()
         self._curfew_timer.start()
         self._reminder_timer.start()
         self._calendar_timer.start()
+        self._awareness_timer.start()
+        self._sleep_zzz_timer.start()
         self._schedule_chatter()
         QTimer.singleShot(900, self._startup_report)
         QTimer.singleShot(3000, self._refresh_calendar)
 
     def quit(self) -> None:
+        self.screen_time.save()
         self.audio.stop_all()
+        self.particles.hide()
+        self.choices.hide()
         if self.tray is not None:
             self.tray.hide()
         QApplication.quit()
@@ -2236,11 +2606,32 @@ class PetController(QObject):
         self.pet.set_talking(False)
         self.pet.set_speaking(False)
 
+    def _on_bubble_dismissed(self) -> None:
+        self._pending_choices = []
+        if self.choices.is_open:
+            self.choices.close_choices(silent=True)
+        self.dialogue_engine.cancel()
+        self._restore_state()
+
+    def _on_bubble_typing_finished(self) -> None:
+        self.pet.set_speaking(False)
+        if self._pending_choices and self.bubble.isVisible() and not self.bubble._closing:
+            if self.bubble._page_idx + 1 >= len(self.bubble._pages):
+                opts = list(self._pending_choices)
+                self._pending_choices = []
+                self.choices.show_choices(opts)
+
     def say(self, text: str, state: str = "talking", ms: int | None = None,
             emotion: str | None = None, voice: str | bool | None = None,
-            context: str = "") -> None:
+            context: str = "", *, hold: bool = False, keep_choices: bool = False,
+            particle: str = "") -> None:
         """Ucapkan `text`. Ekspresi & voiceline dipilih dari isi kalimat (atau parameter eksplisit);
         mulut bergerak selama balon mengetik."""
+        if not keep_choices:
+            self._pending_choices = []
+            if self.choices.is_open:
+                self.choices.close_choices(silent=True)
+            self.dialogue_engine.cancel()
         if emotion is None:
             emotion = emotion_for_text(text, default=STATE_EXPRESSION.get(state, "neutral"))
         if self.forced_state:
@@ -2252,25 +2643,34 @@ class PetController(QObject):
         if voice is not False:
             vkey = voice if isinstance(voice, str) else voice_for_dialogue(text, emotion, context)
             self.audio.play_voice(vkey)
-        self.bubble.show_message(text, ms or max(4000, 2500 + 55 * len(text)))
+        if particle:
+            self.particles.emit_by_name(particle)
+        self.bubble.show_message(text, ms or max(4000, 2500 + 55 * len(text)), hold=hold)
 
     def _say_tuple(self, triple: tuple[str, str, str], state: str = "talking",
-                   ms: int | None = None) -> None:
+                   ms: int | None = None, particle: str = "") -> None:
         text, emotion, voice = triple
-        self.say(text, state=state, ms=ms, emotion=emotion, voice=voice)
+        self.say(text, state=state, ms=ms, emotion=emotion, voice=voice, particle=particle)
 
     def _ctx(self) -> dict:
-        """Gather live workspace state for context-aware Morgana dialogue."""
+        """Gather live workspace state for context-aware Morgana dialogue & Choice Prompts."""
         now = datetime.now()
         aware_now = now.astimezone()
         all_tasks = self.tasks.all()
         pending = [t for t in all_tasks if not t.get("done")]
         high_pending = [t for t in pending if t.get("priority") == "high"]
-        top_task = (high_pending[0]["title"] if high_pending else (pending[0]["title"] if pending else ""))
+        overdue_tasks = [t for t in pending if parse_dt(t.get("deadline")) is not None and parse_dt(t.get("deadline")) <= now]
+        top_task = (overdue_tasks[0]["title"] if overdue_tasks else
+                    (high_pending[0]["title"] if high_pending else (pending[0]["title"] if pending else "")))
 
-        notes_all = self.notes.all()
+        notes_all = [n for n in self.notes.all() if not n.get("archived")]
         due_notes = self.notes.with_deadline()
         h_done, h_total = self.habits.today_summary()
+        totals = self.social_stats.totals()
+        lowest_k = min(SOCIAL_STAT_KEYS, key=lambda k: totals.get(k, 0))
+        top_k = max(SOCIAL_STAT_KEYS, key=lambda k: totals.get(k, 0))
+        scr = self.screen_time.today_summary(now)
+        cur_app = self.awareness.current
 
         manual = self.manual_timers.snapshot()
         nearest = manual[0] if manual else None
@@ -2297,6 +2697,7 @@ class PetController(QObject):
             "enabled_tabs": list(self.settings["enabled_tabs"]),
             "total_tasks": len(all_tasks),
             "pending_tasks": len(pending),
+            "overdue_count": len(overdue_tasks),
             "high_tasks": len(high_pending),
             "top_task": top_task,
             "notes_count": len(notes_all),
@@ -2304,6 +2705,14 @@ class PetController(QObject):
             "habits_done": h_done,
             "habits_total": h_total,
             "today_blocks": len(self.social_stats.today_entries()),
+            "streak_days": self.social_stats.streak_days(),
+            "lowest_stat_label": SOCIAL_STATS[lowest_k]["label"],
+            "top_stat_label": SOCIAL_STATS[top_k]["label"],
+            "active_app_cat": cur_app.category if cur_app else "",
+            "active_app_name": cur_app.display_name if cur_app else "",
+            "screen_time_text": scr["active_text"],
+            "continuous_time_text": scr["continuous_text"],
+            "continuous_s": scr["continuous_s"],
             "focus_running": self.pomodoro.running,
             "focus_phase": self.pomodoro.phase,
             "focus_rem": fmt_mmss(self.pomodoro.remaining()) if self.pomodoro.running else "",
@@ -2321,9 +2730,180 @@ class PetController(QObject):
         self._chatter_timer.start(int(base_ms * random.uniform(0.75, 1.5)))
 
     def _chatter(self) -> None:
-        if not self.sleep_mode and not self.curfew_active and not self.menu.is_open and not self.bubble.isVisible():
-            self.say(self._bag_general.next())
+        busy = (self.sleep_mode or self.curfew_active or self.menu.is_open
+                or self.bubble.isVisible() or self.choices.is_open or self.dialogue_engine.is_active)
+        if not busy:
+            # 30% chance to spark a multi-turn interactive Choice Prompt if enabled & not in Focus sprint
+            want_choice = (
+                bool(self.settings["spontaneous_choices_enabled"])
+                and not (self.pomodoro.running and self.pomodoro.phase == PomodoroTimer.FOCUS)
+                and random.random() < 0.30
+            )
+            if want_choice:
+                self._start_talk()
+            else:
+                self.say(self._bag_general.next())
         self._schedule_chatter()
+
+    # -- Active App Awareness, Screen Time & Micro-Particles ------------------
+    def _sleep_zzz_tick(self) -> None:
+        if (self.sleep_mode or self.curfew_active) and not self.bubble.isVisible():
+            self.particles.emit_zzz()
+
+    def _poll_awareness_and_screen_time(self) -> None:
+        now_mono = time.monotonic()
+        dt_s = max(0.0, min(30.0, now_mono - self._last_awareness_tick))
+        self._last_awareness_tick = now_mono
+
+        want_app = bool(self.settings["app_awareness_enabled"])
+        want_scr = bool(self.settings["screen_time_enabled"])
+        if not (want_app or want_scr):
+            return
+
+        info = get_active_window() if want_app else None
+        if want_scr:
+            idle_s = get_idle_seconds()
+            cpos = QCursor.pos()
+            self.screen_time.record_tick(
+                dt_s,
+                category=(info.category if info else "other"),
+                idle_s=idle_s,
+                cursor_pos=(cpos.x(), cpos.y()),
+            )
+            if self.timer_dialog is not None and self.timer_dialog.isVisible():
+                self.timer_dialog.update_screen_time(self.screen_time.today_summary())
+            if self.briefing_dialog is not None and self.briefing_dialog.isVisible():
+                self._sync_briefing_view()
+
+        # Avoid interrupting active dialogs, sleep/curfew, or ongoing conversations
+        can_speak = not (
+            self.sleep_mode or self.curfew_active or self.menu.is_open
+            or self.bubble.isVisible() or self.choices.is_open or self.dialogue_engine.is_active
+        )
+        if not can_speak:
+            if info is not None:
+                self.awareness.current = info
+            return
+
+        # 1) Screen-Time Break Nudge (launches interactive wellness Choice Prompt!)
+        if want_scr and not (self.pomodoro.running and self.pomodoro.phase == PomodoroTimer.REST):
+            threshold = int(self.settings["break_nudge_min"])
+            if self.screen_time.should_nudge_break(threshold, now_mono=now_mono):
+                self.screen_time.mark_nudged(now_mono)
+                self.pet.bump(1.1)
+                self._start_talk(tree_id="screen_time_nudge")
+                return
+
+        # 2) Active App / Window Awareness contextual comment (quiet during Focus sprint)
+        if want_app and info is not None:
+            if self.pomodoro.running and self.pomodoro.phase == PomodoroTimer.FOCUS:
+                self.awareness.current = info
+                return
+            trigger = self.awareness.update(info, now_mono=now_mono)
+            if trigger is not None:
+                text, emotion, voice, particle = self.dialogue.app_awareness(
+                    trigger.category, trigger.display_name, self._ctx()
+                )
+                self.say(text, "talking", ms=5600, emotion=emotion, voice=voice, particle=particle)
+
+    # -- Interactive Multi-Turn Persona 5 Choice Prompts ----------------------
+    def _start_talk(self, tree_id: str | None = None) -> None:
+        if self.menu.is_open:
+            self.menu.close_menu(silent=True, emit_user_close=False)
+        ctx = self._ctx()
+        node = (self.dialogue_engine.start_tree(tree_id, ctx) if tree_id
+                else self.dialogue_engine.start_contextual(ctx))
+        if node is None:
+            return
+        self._present_choice_node(node)
+
+    def _present_choice_node(self, node: dict) -> None:
+        has_choices = bool(node.get("has_choices"))
+        self._pending_choices = list(node.get("choices") or []) if has_choices else []
+        self.say(
+            node["text"],
+            state="talking",
+            ms=7500 if not has_choices else 12000,
+            emotion=node.get("emotion"),
+            voice=node.get("voice"),
+            hold=has_choices,
+            keep_choices=True,
+            particle=node.get("particle", ""),
+        )
+
+    def _on_choice_selected(self, index: int) -> None:
+        res = self.dialogue_engine.choose(index)
+        if res is None:
+            self.bubble.dismiss()
+            return
+        action = res.get("action")
+        reward = res.get("stat_reward")
+        node = res.get("node")
+
+        if action:
+            self._execute_choice_action(action)
+
+        if node is not None:
+            self._present_choice_node(node)
+        else:
+            self.bubble.dismiss()
+
+        if reward:
+            stat_k, pts, reason = reward
+            self._award_auto_stat(
+                stat=stat_k,
+                activity=reason,
+                points=int(pts),
+                source="chat",
+                announce=False,
+            )
+
+    def _on_choice_cancelled(self) -> None:
+        self._pending_choices = []
+        self.dialogue_engine.cancel()
+        self.bubble.dismiss()
+
+    def _execute_choice_action(self, action: dict) -> None:
+        kind = str(action.get("type") or "")
+        if kind == "start_focus":
+            mins = max(1, int(action.get("minutes", self.settings["focus_min"])))
+            rest = int(self.settings["rest_min"])
+            self._start_focus_from_dialog(mins, rest)
+        elif kind == "start_break":
+            mins = max(1, int(action.get("minutes", 5)))
+            self._start_break_timer(mins)
+        elif kind == "record_break":
+            self.screen_time.record_break()
+            if self.timer_dialog is not None:
+                self.timer_dialog.update_screen_time(self.screen_time.today_summary())
+            self._sync_briefing_view()
+        elif kind == "snooze_break":
+            self.screen_time.snooze_nudge(int(action.get("minutes", 15)))
+        elif kind == "start_timer":
+            mins = max(1, int(action.get("minutes", 15)))
+            lbl = str(action.get("label") or "Reminder")
+            self.manual_timers.add(mins * 60, lbl)
+            self._sync_timer_ui()
+        elif kind == "open_tasks":
+            QTimer.singleShot(120, self._open_tasks)
+        elif kind == "open_notes":
+            QTimer.singleShot(120, self._open_notes)
+        elif kind == "open_new_note":
+            tmpl = str(action.get("template") or "blank")
+            def _launch_note(t=tmpl) -> None:
+                self._open_notes()
+                if self.notes_dialog is not None:
+                    self.notes_dialog.create_from_template(t)
+            QTimer.singleShot(120, _launch_note)
+        elif kind == "open_stats":
+            QTimer.singleShot(120, self._open_stats)
+        elif kind == "open_briefing":
+            QTimer.singleShot(120, lambda: self._open_briefing(announce=False))
+        elif kind == "sleep_mode":
+            want = bool(action.get("enabled", True))
+            if want != self.sleep_mode:
+                self.sleep_mode = want
+                self._restore_state()
 
     # -- Daily Morning Briefing & Confidant Summary ---------------------------
     def _build_briefing_payload(self) -> dict:
@@ -2387,6 +2967,7 @@ class PetController(QObject):
             "stat_totals": totals,
             "today_points": self.social_stats.today_points(),
             "agenda_rows": agenda_rows,
+            "screen_time": self.screen_time.today_summary(now),
         }
 
     def _sync_briefing_view(self) -> None:
@@ -2432,62 +3013,113 @@ class PetController(QObject):
         self.say(f"{greeting}\n\nYou have {len(pending)} pending {word} today:\n" + "\n".join(lines),
                  "talking", ms=13000, context="startup")
 
-    # -- Auto-reward Social Stats helper -------------------------------------
+    # -- Unified Persona 5 Social Stats Reward Presentation (Particles + Gold Star) --
+    def _ensure_stats_dialog(self) -> SocialStatsDialog:
+        if self.stats_dialog is None:
+            self.stats_dialog = SocialStatsDialog(
+                self.social_stats, habits=self.habits, on_top=self.on_top, ui_scale=self.ui_scale
+            )
+            self.stats_dialog.stat_logged.connect(self._on_stat_logged)
+            self.stats_dialog.habit_toggled.connect(self._on_habit_toggled)
+            self.stats_dialog.open_briefing.connect(lambda: self._open_briefing(announce=False))
+            self.stats_dialog.open_settings.connect(self._open_settings_deferred)
+            self.stats_dialog.closed.connect(lambda: self._on_dialog_closed("stats"))
+        return self.stats_dialog
+
+    def _present_stat_reward(self, stat: str, activity: str, points: int,
+                             old_lv: int, new_lv: int,
+                             prev_totals: dict[str, int] | None = None,
+                             on_normal_speech=None,
+                             auto_open: bool = True) -> None:
+        """Play Persona 5 music-note particles around Morgana, open Social Stats to show the
+        gold star expanding, and fire Rank Up golden starburst + music notes on level up."""
+        leveled_up = new_lv > old_lv
+        label = SOCIAL_STATS.get(stat, {}).get("label", stat.title())
+
+        # Stage 1 (immediate): golden music notes + sparkles around Morgana!
+        self.particles.emit_stat_gain(points=points, leveled_up=leveled_up)
+
+        # Auto-open Social Stats window staged at `prev_totals` so the gold star grows smoothly
+        if auto_open and bool(self.settings["auto_open_stats_on_reward"]) and not self._rebuilding_ui:
+            dlg = self._ensure_stats_dialog()
+            dlg.prepare_reward_animation(stat, prev_totals=prev_totals)
+            if not dlg.isVisible():
+                dlg.show_near(self.pet.geometry())
+            else:
+                dlg.raise_()
+        elif self.stats_dialog is not None and self.stats_dialog.isVisible():
+            self.stats_dialog.prepare_reward_animation(stat, prev_totals=prev_totals)
+
+        def _on_point_anim() -> None:
+            if self.stats_dialog is not None:
+                self.stats_dialog.animate_point_gain(stat=stat, points=points, activity=activity)
+            self._sync_briefing_view()
+            if not leveled_up:
+                self.pet.bump(0.85)
+                if on_normal_speech is not None:
+                    on_normal_speech()
+
+        def _on_level_up() -> None:
+            rank = stat_rank_title(stat, new_lv)
+            if self.stats_dialog is not None:
+                self.stats_dialog.animate_rank_up(stat=stat, old_lv=old_lv, new_lv=new_lv)
+            self._sync_briefing_view()
+            self.particles.emit_rank_up()
+            self.pet.bump(1.35)
+            self.say(f"RANK UP! Your {label} leveled up to Lv {new_lv} ({rank})! "
+                     "All that consistency is really paying off!", "action", ms=7500, context="rank_up")
+
+        self.audio.play_stats_sequence(
+            points=points,
+            leveled_up=leveled_up,
+            on_point_anim=_on_point_anim,
+            on_level_up=_on_level_up if leveled_up else None,
+        )
+
     def _award_auto_stat(self, stat: str, activity: str, points: int,
                          source: str, ref_id: str = "",
                          announce: bool = True) -> tuple[int, int, int]:
-        """Award Social Stat points automatically (if enabled), triggering P5R fanfare on Rank Up."""
+        """Award Social Stat points automatically (if enabled), triggering P5 gold-star animation."""
         if not bool(self.settings["auto_stat_rewards"]):
             return 0, 1, 1
+        prev_totals = self.social_stats.totals()
         entry, old_lv, new_lv = self.social_stats.add(
             stat=stat, activity=activity, points=points, source=source, ref_id=ref_id
         )
         if entry is None:
             return 0, 1, 1
-        leveled_up = new_lv > old_lv
         label = SOCIAL_STATS.get(stat, {}).get("label", stat.title())
 
-        def _on_point_anim() -> None:
-            if self.stats_dialog is not None:
-                self.stats_dialog.refresh()
-                self.stats_dialog.animate_point_gain()
-            self._sync_briefing_view()
-            if announce and not leveled_up:
-                self.pet.bump(0.8)
+        def _speech() -> None:
+            if announce:
                 self.say(f"Auto-reward: +{points} {label} ({clip(activity, 34)})!",
                          "talking", ms=4800, context="stat_log")
 
-        def _on_level_up() -> None:
-            rank = stat_rank_title(stat, new_lv)
-            if self.stats_dialog is not None:
-                self.stats_dialog.refresh()
-                self.stats_dialog.animate_rank_up()
-            self._sync_briefing_view()
-            self.pet.bump(1.3)
-            self.say(f"RANK UP! Your {label} leveled up to Lv {new_lv} ({rank})! "
-                     "All that consistency is really paying off!", "action", ms=7500, context="rank_up")
-
-        if leveled_up or announce:
-            self.audio.play_stats_sequence(
-                points=points,
-                leveled_up=leveled_up,
-                on_point_anim=_on_point_anim,
-                on_level_up=_on_level_up if leveled_up else None,
-            )
-        else:
-            if self.stats_dialog is not None:
-                self.stats_dialog.refresh()
-                self.stats_dialog.animate_point_gain()
-            self._sync_briefing_view()
+        self._present_stat_reward(
+            stat=stat,
+            activity=activity,
+            points=points,
+            old_lv=old_lv,
+            new_lv=new_lv,
+            prev_totals=prev_totals,
+            on_normal_speech=_speech if announce else None,
+            auto_open=True,
+        )
         return points, old_lv, new_lv
 
     # -- interaksi pet ---------------------------------------------------------
     def _on_pet_clicked(self) -> None:
+        if self.choices.is_open:
+            self.choices.close_choices(silent=True)
+            self.dialogue_engine.cancel()
         if self.menu.is_open:
             self.menu.close_menu(silent=False, emit_user_close=True)
         else:
             self.menu.open_menu()
             self._say_tuple(self.dialogue.radial_open(self._ctx()), ms=5200)
+
+    def _on_pet_double_clicked(self) -> None:
+        self._start_talk()
 
     def _on_menu_user_closed(self) -> None:
         if not self._rebuilding_ui:
@@ -2495,6 +3127,7 @@ class PetController(QObject):
 
     def _on_wall_bounced(self) -> None:
         now = time.monotonic()
+        self.particles.emit_anger()
         if now - self._last_bump_t >= 2.5:
             self._last_bump_t = now
             self._say_tuple(self.dialogue.wall_bump(), state="action", ms=3600)
@@ -2532,6 +3165,8 @@ class PetController(QObject):
         self._pending_task_reward_note = ""
         if note == "__RANK_UP__":
             return
+        if not note:
+            self.particles.emit_sparkle(5)
         self._say_tuple(self.dialogue.task_completed(title, remaining, reward_note=note), ms=4600)
 
     def _on_note_completed(self, note_id: str) -> None:
@@ -2552,6 +3187,19 @@ class PetController(QObject):
             announce=True,
         )
 
+    def _on_note_sent_to_task(self, title: str, deadline_obj) -> None:
+        """Create a real Task promoted directly from Notes (`→ TASK` bridge)."""
+        dl = deadline_obj if isinstance(deadline_obj, datetime) else None
+        task = self.tasks.add(title, priority="normal", deadline=dl)
+        if task is None:
+            return
+        if self.tasks_dialog is not None:
+            self.tasks_dialog.refresh()
+        self._sync_events_view()
+        self._sync_briefing_view()
+        self.pet.bump(0.8)
+        self._say_tuple(self.dialogue.note_sent_to_task(task["title"]), ms=4400, particle="sparkle")
+
     def _on_habit_toggled(self, habit_id: str, now_done: bool, entry, old_lv: int, new_lv: int) -> None:
         self._sync_briefing_view()
         if not now_done or entry is None:
@@ -2563,31 +3211,26 @@ class PetController(QObject):
         label = SOCIAL_STATS.get(stat, {}).get("label", stat.title())
         streak = self.habits.streak(habit) if habit else 1
         done_today, total_habits = self.habits.today_summary()
-        leveled_up = new_lv > old_lv
 
-        def _on_point_anim() -> None:
-            if self.stats_dialog is not None:
-                self.stats_dialog.animate_point_gain()
-            if not leveled_up:
-                self.pet.bump(0.85)
-                self._say_tuple(
-                    self.dialogue.habit_completed(title, label, pts, streak, done_today, total_habits),
-                    ms=5000,
-                )
+        # Reconstruct totals prior to this habit check-in so the gold star animates smoothly
+        prev_totals = self.social_stats.totals()
+        prev_totals[stat] = max(0, prev_totals.get(stat, 0) - pts)
 
-        def _on_level_up() -> None:
-            rank = stat_rank_title(stat, new_lv)
-            if self.stats_dialog is not None:
-                self.stats_dialog.animate_rank_up()
-            self.pet.bump(1.3)
-            self.say(f"RANK UP! Your {label} leveled up to Lv {new_lv} ({rank}) from '{clip(title, 26)}'!",
-                     "action", ms=7500, context="rank_up")
+        def _habit_speech() -> None:
+            self._say_tuple(
+                self.dialogue.habit_completed(title, label, pts, streak, done_today, total_habits),
+                ms=5000,
+            )
 
-        self.audio.play_stats_sequence(
+        self._present_stat_reward(
+            stat=stat,
+            activity=title,
             points=pts,
-            leveled_up=leveled_up,
-            on_point_anim=_on_point_anim,
-            on_level_up=_on_level_up if leveled_up else None,
+            old_lv=old_lv,
+            new_lv=new_lv,
+            prev_totals=prev_totals,
+            on_normal_speech=_habit_speech,
+            auto_open=False,   # already triggered inside SocialStatsDialog
         )
 
     def _on_dialog_closed(self, kind: str) -> None:
@@ -2597,6 +3240,8 @@ class PetController(QObject):
 
     def _on_pet_moved(self) -> None:
         self.bubble.follow()
+        self.particles.follow()
+        self.choices.follow()
         self.menu.follow()
 
     def _sync_dialog_links(self) -> None:
@@ -2638,6 +3283,7 @@ class PetController(QObject):
             self.notes_dialog.notes_changed.connect(self._sync_events_view)
             self.notes_dialog.notes_changed.connect(self._sync_briefing_view)
             self.notes_dialog.note_completed.connect(self._on_note_completed)
+            self.notes_dialog.send_to_task.connect(self._on_note_sent_to_task)
             self.notes_dialog.closed.connect(lambda: self._on_dialog_closed("notes"))
         self._sync_dialog_links()
         self.notes_dialog.show_near(self.pet.geometry())
@@ -2681,15 +3327,7 @@ class PetController(QObject):
 
     def _open_stats(self) -> None:
         was_open = self.stats_dialog is not None and self.stats_dialog.isVisible()
-        if self.stats_dialog is None:
-            self.stats_dialog = SocialStatsDialog(
-                self.social_stats, habits=self.habits, on_top=self.on_top, ui_scale=self.ui_scale
-            )
-            self.stats_dialog.stat_logged.connect(self._on_stat_logged)
-            self.stats_dialog.habit_toggled.connect(self._on_habit_toggled)
-            self.stats_dialog.open_briefing.connect(lambda: self._open_briefing(announce=False))
-            self.stats_dialog.open_settings.connect(self._open_settings_deferred)
-            self.stats_dialog.closed.connect(lambda: self._on_dialog_closed("stats"))
+        self._ensure_stats_dialog()
         self.stats_dialog.show_near(self.pet.geometry())
         if not was_open and not self._rebuilding_ui:
             self._say_tuple(self.dialogue.window_open("stats", self._ctx()), ms=4800)
@@ -2702,9 +3340,11 @@ class PetController(QObject):
             self.timer_dialog.focus_stop_requested.connect(self._stop_pomodoro)
             self.timer_dialog.manual_add_requested.connect(self._add_manual_timer)
             self.timer_dialog.manual_cancel_requested.connect(self._cancel_manual_timer)
+            self.timer_dialog.break_requested.connect(self._start_break_timer)
             self.timer_dialog.open_settings.connect(self._open_settings_deferred)
             self.timer_dialog.closed.connect(lambda: self._on_dialog_closed("timer"))
         self._sync_timer_ui()
+        self.timer_dialog.update_screen_time(self.screen_time.today_summary())
         self.timer_dialog.show_near(self.pet.geometry())
         if not was_open and not self._rebuilding_ui:
             self._say_tuple(self.dialogue.window_open("timer", self._ctx()), ms=4800)
@@ -2730,6 +3370,8 @@ class PetController(QObject):
             self._open_tasks()
         elif key == "notes":
             self._open_notes()
+        elif key == "talk":
+            self._start_talk()
         elif key == "stats":
             self._open_stats()
         elif key == "timer":
@@ -2789,30 +3431,24 @@ class PetController(QObject):
     # -- SOCIAL STATS -------------------------------------------------------------
     def _on_stat_logged(self, stat: str, activity: str, pts: int, old_lv: int, new_lv: int) -> None:
         label = SOCIAL_STATS.get(stat, {}).get("label", stat.title())
-        leveled_up = new_lv > old_lv
         self._sync_briefing_view()
 
-        def _on_point_anim() -> None:
-            if self.stats_dialog is not None:
-                self.stats_dialog.animate_point_gain()
-            if not leveled_up:
-                self.pet.bump(0.8)
-                self.say(f"Logged +{pts} {label} ({clip(activity, 36)})! Keep building your momentum!",
-                         "talking", ms=4500, context="stat_log")
+        prev_totals = self.social_stats.totals()
+        prev_totals[stat] = max(0, prev_totals.get(stat, 0) - pts)
 
-        def _on_level_up() -> None:
-            rank = stat_rank_title(stat, new_lv)
-            if self.stats_dialog is not None:
-                self.stats_dialog.animate_rank_up()
-            self.pet.bump(1.3)
-            self.say(f"RANK UP! Your {label} leveled up to Lv {new_lv} ({rank})! "
-                     "All that effort is really paying off!", "action", ms=7500, context="rank_up")
+        def _manual_speech() -> None:
+            self.say(f"Logged +{pts} {label} ({clip(activity, 36)})! Keep building your momentum!",
+                     "talking", ms=4500, context="stat_log")
 
-        self.audio.play_stats_sequence(
+        self._present_stat_reward(
+            stat=stat,
+            activity=activity,
             points=pts,
-            leveled_up=leveled_up,
-            on_point_anim=_on_point_anim,
-            on_level_up=_on_level_up if leveled_up else None,
+            old_lv=old_lv,
+            new_lv=new_lv,
+            prev_totals=prev_totals,
+            on_normal_speech=_manual_speech,
+            auto_open=False,   # already logged inside SocialStatsDialog
         )
 
     # -- pengingat: acara H-2 jam, acara lokal, deadline tugas & catatan ----------
@@ -2875,7 +3511,7 @@ class PetController(QObject):
             messages.append(f"{head} " + " · ".join(countdown) + "\n" + self._bag_agenda.next())
 
         if messages:
-            self.say("\n\n".join(messages), "talking", ms=12000, context="reminder")
+            self.say("\n\n".join(messages), "talking", ms=12000, context="reminder", particle="alert")
             self.pet.bump(1.3)                                      # melompat menarik perhatian
             if not self.audio.enabled:
                 play_beep()
@@ -2886,6 +3522,7 @@ class PetController(QObject):
         m.setStyleSheet(menu_qss(self.ui_scale))
         self.system_menu = m
         self._attach_menu_sfx(m)
+        m.addAction("TALK WITH MORGANA...", lambda: self._start_talk())
         m.addAction("DAILY BRIEFING...", lambda: self._open_briefing(announce=True))
         self.act_sys_status = m.addAction("SYSTEM STATUS (CPU / RAM)", self._act_item)
         self.act_sys_pomo = m.addAction("TIMER & FOCUS...", self._open_timer)
@@ -2978,6 +3615,7 @@ class PetController(QObject):
         self.act_sound.blockSignals(True)
         self.act_sound.setChecked(sound_on)
         self.act_sound.blockSignals(False)
+        self.particles.set_enabled(bool(self.settings["particles_enabled"]))
         enabled_tabs = list(self.settings["enabled_tabs"])
         self.menu.set_enabled_tabs(enabled_tabs)
         self._sync_dialog_links()
@@ -3008,9 +3646,9 @@ class PetController(QObject):
         self.sleep_mode = not self.sleep_mode
         if self.sleep_mode:
             self.say("Sleep Mode is on. Reminders will still run—open SYSTEM again "
-                     "whenever you want to wake me up.", "sleepy", 6000)
+                     "whenever you want to wake me up.", "sleepy", 6000, particle="zzz")
         else:
-            self.say("I'm awake! Sleep Mode is off.", "talking", 3000)
+            self.say("I'm awake! Sleep Mode is off.", "talking", 3000, particle="sparkle")
         self._restore_state()
 
     def _act_item(self) -> None:
@@ -3018,12 +3656,14 @@ class PetController(QObject):
         if snap is None:
             self.say("The psutil package isn't installed yet. Run: pip install psutil")
             return
+        scr = self.screen_time.today_summary()
         text = (f"SYSTEM STATUS\nCPU : {snap.cpu:.0f}%\n"
-                f"RAM : {snap.ram_percent:.0f}% ({snap.ram_used_gb:.1f} / {snap.ram_total_gb:.1f} GB)")
+                f"RAM : {snap.ram_percent:.0f}% ({snap.ram_used_gb:.1f} / {snap.ram_total_gb:.1f} GB)\n"
+                f"SCREEN TIME : {scr['active_text']} today ({scr['continuous_text']} nonstop)")
         heavy = snap.cpu >= 85 or snap.ram_percent >= 90
         if heavy:
             text += "\nCPU/RAM usage is high. Try closing apps you don't need."
-        self.say(text, "action" if heavy else "talking", ms=6500)
+        self.say(text, "action" if heavy else "talking", ms=7000)
 
     # -- Pomodoro & Manual Timers (Persona 5 Timer + HUD) -------------------------
     def _sync_timer_ui(self) -> None:
@@ -3075,18 +3715,29 @@ class PetController(QObject):
         self.pomodoro.rest_s = max(1, int(rest_min * 60))
         self.pomodoro.start()
 
+    def _start_break_timer(self, minutes: int = 5) -> None:
+        mins = max(1, int(minutes))
+        self.screen_time.record_break()
+        self.manual_timers.add(mins * 60, f"Break ({mins}m)")
+        self._sync_timer_ui()
+        if self.timer_dialog is not None:
+            self.timer_dialog.update_screen_time(self.screen_time.today_summary())
+        self._sync_briefing_view()
+        self.pet.bump(0.85)
+        self.particles.emit_hearts(3)
+
     def _add_manual_timer(self, total_s: int, label: str) -> None:
         item = self.manual_timers.add(total_s, label)
         self.pet.bump(0.8)
         self.say(f"Timer set: {clip(item.label, 38)} ({fmt_hms(item.total_s)}). "
-                 "I'll remind you as soon as time's up!", "talking", ms=4500)
+                 "I'll remind you as soon as time's up!", "talking", ms=4500, particle="sparkle")
 
     def _cancel_manual_timer(self, timer_id: str) -> None:
         self.manual_timers.cancel(timer_id)
 
     def _on_manual_timer_fired(self, label: str, total_s: int) -> None:
         self.say(f"Time's up! Your timer '{clip(label, 42)}' ({fmt_hms(total_s)}) just finished!",
-                 "action", ms=11000, context="timer_up")
+                 "action", ms=11000, context="timer_up", particle="alert")
         self.pet.bump(1.4)
         play_beep()
 
@@ -3097,9 +3748,12 @@ class PetController(QObject):
         self._sync_timer_ui()
         if phase == PomodoroTimer.FOCUS:
             t = fmt_mmss(self.pomodoro.focus_s)
-            self.say(random.choice(_FOCUS_START).format(t=t), "action")
+            self.say(random.choice(_FOCUS_START).format(t=t), "action", particle="sparkle")
         else:
             t = fmt_mmss(self.pomodoro.rest_s)
+            self.screen_time.record_break()
+            if self.timer_dialog is not None:
+                self.timer_dialog.update_screen_time(self.screen_time.today_summary())
             self.pet.bump(1.2)
             play_beep()
             focus_mins = max(1, int(round(self.pomodoro.focus_s / 60.0)))
@@ -3116,7 +3770,7 @@ class PetController(QObject):
             msg = random.choice(_FOCUS_REST).format(t=t)
             if awarded > 0:
                 msg += f" (+{awarded} Knowledge!)"
-            self.say(msg)
+            self.say(msg, particle="music")
 
     def _on_pomo_finished(self) -> None:
         self._sync_timer_ui()
@@ -3193,6 +3847,7 @@ class PetController(QObject):
         self.context_menu = m
         self._attach_menu_sfx(m)
 
+        m.addAction("TALK WITH MORGANA...", lambda: self._start_talk())
         m.addAction("DAILY BRIEFING...", lambda: self._open_briefing(announce=True))
         m.addSeparator()
 
@@ -3297,6 +3952,8 @@ class PetController(QObject):
         if reason == QSystemTrayIcon.ActivationReason.Trigger:   # klik kiri pada ikon tray
             if self.pet.isVisible():
                 self.menu.hide()
+                self.choices.close_choices(silent=True)
+                self.particles.hide()
                 self.bubble.dismiss()
                 self.pet.hide()
             else:
@@ -3326,6 +3983,8 @@ class PetController(QObject):
         self.menu.hide()
         self.pet.set_sprite_size(px)
         self.bubble.follow()
+        self.particles.follow()
+        self.choices.follow()
 
     def set_ui_scale(self, pct: int, save: bool = True, reopen_settings: bool = False) -> None:
         """Scale dialogue textbox, radial menu, popup menus, and dialog windows live."""
@@ -3340,6 +3999,8 @@ class PetController(QObject):
 
         self.pet.set_ui_scale(self.ui_scale)
         self.bubble.set_ui_scale(self.ui_scale)
+        self.particles.set_ui_scale(self.ui_scale)
+        self.choices.set_ui_scale(self.ui_scale)
         self.menu.set_ui_scale(self.ui_scale)
         qss = menu_qss(self.ui_scale)
         self.system_menu.setStyleSheet(qss)
@@ -3392,6 +4053,8 @@ class PetController(QObject):
         for w in (self.pet, self.bubble):
             w.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, on)
         self.menu.set_on_top(on)
+        self.particles.set_on_top(on)
+        self.choices.set_on_top(on)
         if was_visible:
             self.pet.show()
         for dlg in (self.tasks_dialog, self.notes_dialog, self.events_dialog,
