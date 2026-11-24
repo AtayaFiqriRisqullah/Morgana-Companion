@@ -214,9 +214,17 @@ class ContextualDialogue:
             word = "note" if due_notes == 1 else "notes"
             pool.append((f"You have {due_notes} {word} with an active deadline—want to check Notes?", "worried", "oh_asking"))
 
-        # Live Social Stats context (only if Stats tab is enabled)
+        # Live Social Stats & Daily Habits context (only if Stats tab is enabled)
         blocks = int(ctx.get("today_blocks", 0))
+        h_done = int(ctx.get("habits_done", 0))
+        h_total = int(ctx.get("habits_total", 0))
         if "stats" in tabs:
+            if h_total > 0 and h_done < h_total:
+                left = h_total - h_done
+                hw = "habit" if left == 1 else "habits"
+                pool.append((f"You still have {left} daily {hw} left today ({h_done}/{h_total})! Want to check Stats?", "neutral", "naa"))
+            elif h_total > 0 and h_done >= h_total:
+                pool.append((f"All {h_total} daily habits cleared today! Your Social Stats are thriving!", "excited", "oh_excited"))
             if blocks >= 3:
                 pool.append((f"Whoa, {blocks} blocks logged today! Look at you leveling up!", "excited", "oh_excited"))
             elif blocks == 0 and hour >= 13:
@@ -438,20 +446,42 @@ class ContextualDialogue:
                 ("All tuned up! Ready when you are.", "smug", "hmm"),
             ])
 
+        if kind == "briefing":
+            return self._pick("close_briefing", [
+                ("Briefing locked in! Let's make today count!", "excited", "oh_excited"),
+                ("You've got the game plan—let's tackle the day together!", "smug", "hmm"),
+            ])
+
         return ("Alright, all closed!", "neutral", "hmm")
 
-    def task_completed(self, title: str, remaining: int) -> tuple[str, str, str]:
+    def task_completed(self, title: str, remaining: int, reward_note: str = "") -> tuple[str, str, str]:
         t = _clip(title, 32)
+        suffix = f" ({reward_note})" if reward_note else ""
         if remaining == 0:
             return self._pick("task_done_all", [
-                (f"Ooh, '{t}' was the last one! Every single task is done—awesome work!", "excited", "oh_excited"),
-                (f"Boom! '{t}' cleared—your whole task list is spotless!", "excited", "oh_excited"),
+                (f"Ooh, '{t}' was the last one{suffix}! Every single task is done—awesome work!", "excited", "oh_excited"),
+                (f"Boom! '{t}' cleared{suffix}—your whole task list is spotless!", "excited", "oh_excited"),
             ])
         word = "more" if remaining == 1 else "left"
         return self._pick("task_done", [
-            (f"Nice! '{t}' checked off—{remaining} {word} to go!", "wink", "hmm"),
-            (f"Whoa, look at that progress! '{t}' is done!", "excited", "oh_excited"),
-            (f"One down! '{t}' is off the board—keep that momentum rolling!", "smug", "hmm"),
+            (f"Nice! '{t}' checked off{suffix}—{remaining} {word} to go!", "wink", "hmm"),
+            (f"Whoa, look at that progress! '{t}' is done{suffix}!", "excited", "oh_excited"),
+            (f"One down! '{t}' is off the board{suffix}—keep that momentum rolling!", "smug", "hmm"),
+        ])
+
+    def habit_completed(self, title: str, stat_label: str, pts: int, streak: int,
+                        done_today: int, total_habits: int) -> tuple[str, str, str]:
+        t = _clip(title, 30)
+        s_txt = f" ({streak}-day streak!)" if streak >= 2 else ""
+        if total_habits > 0 and done_today >= total_habits:
+            return self._pick("habit_done_all", [
+                (f"Whoa! '{t}' done (+{pts} {stat_label}){s_txt}—ALL daily habits cleared today!", "excited", "oh_excited"),
+                (f"Every single daily habit finished! '{t}' (+{pts} {stat_label}){s_txt}—unstoppable!", "excited", "oh_excited"),
+            ])
+        return self._pick("habit_done", [
+            (f"Nice habit check-in! '{t}' earned +{pts} {stat_label}{s_txt}!", "smug", "hmm"),
+            (f"Consistency pays off! +{pts} {stat_label} for '{t}'{s_txt}!", "wink", "hmm"),
+            (f"Ooh, '{t}' checked off—+{pts} {stat_label}{s_txt}! Keep the streak alive!", "excited", "oh_excited"),
         ])
 
     def wall_bump(self) -> tuple[str, str, str]:
@@ -460,3 +490,102 @@ class ContextualDialogue:
             ("Whoa! Easy there—I'm a companion, not a stress ball!", "shout", "uwooh"),
             ("Uwooh! Careful! My scarf almost flew off!", "uneasy", "uwooh"),
         ])
+
+
+# ---------------------------------------------------------------------------
+# Daily Morning Briefing & Confidant Summary (Qt-free)
+# ---------------------------------------------------------------------------
+def build_daily_briefing(ctx: dict) -> dict:
+    """Build structured Persona 5 Daily Morning Briefing & Confidant Summary data.
+
+    Expects keys in `ctx`:
+      hour (int), date_banner (str), today_events (list[str]), overdue_count (int),
+      overdue_top (str), due_today_count (int), pending_tasks (int), high_tasks (int),
+      habits_done (int), habits_total (int), streak_days (int), lowest_stat_label (str),
+      top_stat_label (str), confidant_lv (int), confidant_max (int).
+    """
+    hour = int(ctx.get("hour", 9))
+    if 4 <= hour < 12:
+        period = "MORNING"
+        headline = "GOOD MORNING! READY TO SEIZE THE DAY?"
+    elif 12 <= hour < 17:
+        period = "AFTERNOON"
+        headline = "AFTERNOON BRIEFING — STAY SHARP!"
+    elif 17 <= hour < 22:
+        period = "EVENING"
+        headline = "EVENING CHECK-IN — STRONG FINISH!"
+    else:
+        period = "LATE NIGHT"
+        headline = "LATE-NIGHT BRIEFING — WRAP UP & REST!"
+
+    ev_count = len(ctx.get("today_events") or ())
+    overdue = int(ctx.get("overdue_count", 0))
+    overdue_top = _clip(ctx.get("overdue_top", ""), 30)
+    due_today = int(ctx.get("due_today_count", 0))
+    pending_tasks = int(ctx.get("pending_tasks", 0))
+    habits_done = int(ctx.get("habits_done", 0))
+    habits_total = int(ctx.get("habits_total", 0))
+    habits_left = max(0, habits_total - habits_done)
+    streak = int(ctx.get("streak_days", 0))
+    lowest_stat = ctx.get("lowest_stat_label", "Knowledge")
+    conf_lv = int(ctx.get("confidant_lv", 5))
+    conf_max = int(ctx.get("confidant_max", 25))
+
+    # Build concise spoken summary for Morgana's dialogue bubble
+    bits: list[str] = []
+    if ev_count:
+        bits.append(f"{ev_count} {'event' if ev_count == 1 else 'events'} today")
+    if overdue:
+        bits.append(f"{overdue} overdue")
+    elif due_today:
+        bits.append(f"{due_today} due today")
+    if pending_tasks:
+        bits.append(f"{pending_tasks} pending {'task' if pending_tasks == 1 else 'tasks'}")
+    if habits_total:
+        bits.append(f"{habits_done}/{habits_total} daily habits")
+
+    if overdue:
+        emotion, voice = "worried", "hoi"
+        spoken = (f"{headline.split('—')[0].strip()} Watch out: you have {', '.join(bits)}—"
+                  f"let's clear '{overdue_top}' first!" if overdue_top
+                  else f"Heads up! Today's briefing: {', '.join(bits)}. Let's handle those overdue items first!")
+    elif bits:
+        emotion, voice = ("excited", "oh_excited") if streak >= 3 else ("wink", "naa")
+        spoken = f"Daily briefing! You've got {', '.join(bits)}."
+        if streak >= 2:
+            spoken += f" Awesome {streak}-day streak—let's keep it alive!"
+        else:
+            spoken += " Let's make today count!"
+    else:
+        emotion, voice = "wink", "naa"
+        spoken = (f"Clear board today! Confidant Rank {conf_lv}/{conf_max}—"
+                  f"great chance to build a custom habit or train your {lowest_stat}!")
+
+    # Build personalized Confidant Advice inside the Briefing panel
+    if overdue:
+        advice = (f"Priority alert! '{overdue_top or 'An overdue item'}' is waiting on you. "
+                  f"Knock out your overdue deadlines first, then protect your {streak}-day streak!"
+                  if streak >= 2 else
+                  f"Priority alert! Clear '{overdue_top or 'your overdue deadlines'}' early so the rest of your day stays stress-free.")
+    elif habits_total > 0 and habits_left > 0:
+        advice = (f"You have {habits_left} daily {'habit' if habits_left == 1 else 'habits'} left today! "
+                  f"Your {lowest_stat} could use a boost—check off a habit or run a Focus block to level it up.")
+    elif habits_total > 0 and habits_left == 0:
+        advice = (f"All {habits_total} daily habits cleared today! Incredible consistency—"
+                  f"your {lowest_stat} is next in line if you want a bonus rank push.")
+    elif streak >= 3:
+        advice = (f"You're on a {streak}-day activity streak (Confidant Lv {conf_lv}/{conf_max})! "
+                  f"Train {lowest_stat} today to keep your pentagon balanced.")
+    else:
+        advice = (f"Your {lowest_stat} is currently trailing your other stats. "
+                  f"Add a custom Daily Habit or finish a Focus session today to earn automatic Social Stat points!")
+
+    return {
+        "period": period,
+        "date_banner": ctx.get("date_banner", ""),
+        "headline": headline,
+        "spoken": spoken,
+        "emotion": emotion,
+        "voice": voice,
+        "advice": advice,
+    }
