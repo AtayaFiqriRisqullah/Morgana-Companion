@@ -15,19 +15,21 @@ from __future__ import annotations
 
 import math
 import random
+import re
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from PyQt6.QtCore import (QDate, QDateTime, QEvent, QPoint, QPointF, QRect, QRectF, QSize, Qt,
                           QTime, QTimer, pyqtSignal)
-from PyQt6.QtGui import (QColor, QFontMetrics, QGuiApplication, QKeySequence, QLinearGradient,
+from PyQt6.QtGui import (QColor, QFont, QFontMetrics, QGuiApplication, QKeySequence, QLinearGradient,
                          QPainter, QPainterPath, QPen, QPixmap, QPolygonF, QRadialGradient,
-                         QShortcut, QTextCursor)
+                         QShortcut, QSyntaxHighlighter, QTextBlock, QTextBlockFormat,
+                         QTextCharFormat, QTextCursor, QTextDocument, QTextFormat, QTextListFormat)
 from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QDateTimeEdit, QFrame,
                              QGridLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget,
                              QListWidgetItem, QMenu, QProgressBar, QPushButton, QScrollArea,
                              QSizePolicy, QSlider, QSpinBox, QStyle, QStyledItemDelegate,
-                             QTextBrowser, QTextEdit, QTimeEdit, QVBoxLayout, QWidget)
+                             QTextEdit, QTimeEdit, QVBoxLayout, QWidget)
 
 import sprites
 from audio_manager import audio, play_ui, play_voice
@@ -64,22 +66,22 @@ NOTE_TEMPLATES: dict[str, tuple[str, str, str]] = {
     "blank": ("", "", "Personal"),
     "meeting": (
         "Meeting Notes — {date}",
-        "## Agenda\n- \n\n## Key Points\n- \n\n## Decisions & Follow-ups\n- [ ] \n\n#meeting",
+        "## Agenda\n- Main topic to discuss\n\n## Key Points\n- Key takeaway\n\n## Decisions & Follow-ups\n- [ ] Action item\n\n#meeting",
         "Work",
     ),
     "study": (
         "Study Summary — {date}",
-        "## Core Concept\n\n\n## Key Takeaways (In My Own Words)\n- \n- \n\n## Questions to Review\n- \n\n#study",
+        "## Core Concept\nSummarize the main idea here.\n\n## Key Takeaways (In My Own Words)\n- First insight\n- Second insight\n\n## Questions to Review\n- What needs a closer look?\n\n#study",
         "Study",
     ),
     "idea": (
         "Idea Sketch — {date}",
-        "## Spark\n\n\n## Why It Matters\n- \n\n## Rough First Steps\n- \n\n#ideas",
+        "## Spark\nDescribe the core idea in one sentence.\n\n## Why It Matters\n- Problem it solves\n\n## Rough First Steps\n- [ ] Quick prototype or research\n\n#ideas",
         "Ideas",
     ),
     "journal": (
         "Daily Reflection — {date}",
-        "## Wins Today\n- \n\n## What I Learned\n- \n\n## Focus for Tomorrow\n- \n\n#journal",
+        "## Wins Today\n- Something that went well\n\n## What I Learned\n- A quick lesson or insight\n\n## Focus for Tomorrow\n- Top priority for tomorrow\n\n#journal",
         "Journal",
     ),
 }
@@ -1614,17 +1616,783 @@ class TasksDialog(P5FluidPanel):
 
 
 # ---------------------------------------------------------------------------
-# NOTES DIALOG (2-column Persona 5 workspace: full-height editor + fast sidebar)
+# P5RichNoteEditor: Live WYSIWYG Rich-Text Markdown Editor (Bear / Notion / Obsidian style)
+# ---------------------------------------------------------------------------
+_NOTE_TAG_HL_RE = re.compile(r"(?<![\w/#])#[A-Za-z][A-Za-z0-9_-]{0,23}")
+_MD_ESC_TAG_RE = re.compile(r"(?m)^\\#([A-Za-z][A-Za-z0-9_-]{0,23})")
+_MD_CODE_SPAN_RE = re.compile(r"`([^`\n]+)`")
+_MD_CODE_ESC_RE = re.compile(r"\\([#\-+*_[\]()>])")
+_MD_BOLD_END_RE = re.compile(r"\*\*([^*\n]+)\*\*$")
+_MD_ITALIC_END_RE = re.compile(r"(?<!\*)\*([^*\n]+)\*$")
+_MD_CODE_END_RE = re.compile(r"`([^`\n]+)`$")
+
+
+def _is_code_char_format(cf: QTextCharFormat) -> bool:
+    if cf.fontFixedPitch():
+        return True
+    fams = cf.fontFamilies()
+    if isinstance(fams, (list, tuple)):
+        return any("mono" in str(f).lower() or "consolas" in str(f).lower() for f in fams)
+    return "mono" in str(fams or "").lower()
+
+
+def _is_quote_block_format(bf: QTextBlockFormat) -> bool:
+    try:
+        return int(bf.property(QTextFormat.Property.BlockQuoteLevel) or 0) > 0
+    except Exception:
+        return False
+
+
+class P5TagHighlighter(QSyntaxHighlighter):
+    """Visual-only styling for `#tags`, checked checklists, and blockquotes without mutating Markdown."""
+
+    def __init__(self, doc: QTextDocument) -> None:
+        super().__init__(doc)
+        self._tag_fmt = QTextCharFormat()
+        self._tag_fmt.setForeground(GOLD)
+        self._tag_fmt.setFontWeight(QFont.Weight.Bold)
+
+        self._tag_checked_fmt = QTextCharFormat(self._tag_fmt)
+        self._tag_checked_fmt.setFontStrikeOut(True)
+
+        self._checked_fmt = QTextCharFormat()
+        self._checked_fmt.setForeground(QColor("#7D7D92"))
+        self._checked_fmt.setFontStrikeOut(True)
+
+        self._checked_code_fmt = QTextCharFormat()
+        self._checked_code_fmt.setFontStrikeOut(True)
+
+        self._quote_fmt = QTextCharFormat()
+        self._quote_fmt.setForeground(QColor("#C6C6DC"))
+        self._quote_fmt.setFontItalic(True)
+
+    def highlightBlock(self, text: str) -> None:
+        if not text:
+            return
+        block = self.currentBlock()
+        bf = block.blockFormat()
+        is_checked = (
+            block.textList() is not None
+            and bf.marker() == QTextBlockFormat.MarkerType.Checked
+        )
+        is_quote = _is_quote_block_format(bf)
+
+        if is_checked or is_quote:
+            blk_pos = block.position()
+            it = block.begin()
+            while not it.atEnd():
+                frag = it.fragment()
+                if frag.isValid():
+                    start = frag.position() - blk_pos
+                    length = frag.length()
+                    if _is_code_char_format(frag.charFormat()):
+                        if is_checked:
+                            self.setFormat(start, length, self._checked_code_fmt)
+                    else:
+                        self.setFormat(start, length, self._checked_fmt if is_checked else self._quote_fmt)
+                it += 1
+
+        if "#" in text and bf.headingLevel() == 0:
+            tf = self._tag_checked_fmt if is_checked else self._tag_fmt
+            for m in _NOTE_TAG_HL_RE.finditer(text):
+                self.setFormat(m.start(), m.end() - m.start(), tf)
+
+
+class P5RichNoteEditor(QTextEdit):
+    """Live WYSIWYG Persona 5 Markdown editor: edit directly inside the rendered rich note.
+
+    Supports:
+      * Seamless GitHub-Flavored Markdown load/save roundtrip (`set_markdown_content` /
+        `to_markdown_content`) preserving 100% compatibility with existing `notes.json`.
+      * Live Markdown-as-you-type shortcuts (`# `, `## `, `### `, `- `, `[] `, `[ ] `, `> `,
+        `---`+Enter, `**bold**`, `*italic*`, `` `code` ``).
+      * Interactive clickable checkboxes (`☐` ↔ `☑`) painted in Persona 5 crimson/gold style,
+        plus `Ctrl+Enter` to toggle the current checklist item.
+      * Natural `Enter` / `Backspace` handling (headings reset to normal text on Enter;
+        empty list/checklist/quote lines exit cleanly on Enter or Backspace).
+      * Clean dark-theme paste stripping external HTML colors/backgrounds.
+    """
+
+    checkbox_toggled = pyqtSignal(bool)
+
+    def __init__(self, scale: float = 1.0, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._sc = max(0.75, min(1.5, float(scale)))
+        self._base_pt = max(10.0, round(11.0 * self._sc, 1))
+        self._internal = False
+        self.setObjectName("noteBody")
+        self.setAcceptRichText(True)
+        self.setTabChangesFocus(False)
+        self.viewport().setMouseTracking(True)
+        base_f = ui_font(_sc(14, self._sc, 11), bold=False)
+        base_f.setPointSizeF(self._base_pt)
+        self.document().setDefaultFont(base_f)
+        self.document().setDefaultStyleSheet(
+            "hr { background-color: #3E2028; border: none; height: 1px; }"
+            "a { color: #FAD02C; }"
+        )
+        self.document().setDocumentMargin(10.0 * self._sc)
+        self._tag_hl = P5TagHighlighter(self.document())
+        self.set_markdown_content("")
+
+    # -- format helpers ----------------------------------------------------------
+    def _normal_char_format(self) -> QTextCharFormat:
+        cf = QTextCharFormat()
+        cf.setFont(ui_font(_sc(14, self._sc, 11), bold=False))
+        cf.setFontPointSize(self._base_pt)
+        cf.setFontWeight(QFont.Weight.Normal)
+        cf.setFontItalic(False)
+        cf.setFontStrikeOut(False)
+        cf.setFontFixedPitch(False)
+        cf.setForeground(P5_TEXT)
+        cf.clearBackground()
+        return cf
+
+    def _heading_char_format(self, level: int) -> QTextCharFormat:
+        cf = self._normal_char_format()
+        cf.setFontWeight(QFont.Weight.Bold)
+        if level == 1:
+            cf.setFontPointSize(round(self._base_pt * 1.42, 1))
+            cf.setForeground(WHITE)
+        elif level == 2:
+            cf.setFontPointSize(round(self._base_pt * 1.22, 1))
+            cf.setForeground(GOLD)
+        else:
+            cf.setFontPointSize(round(self._base_pt * 1.08, 1))
+            cf.setForeground(QColor("#FF5E6B"))
+        return cf
+
+    def _code_char_format(self) -> QTextCharFormat:
+        cf = self._normal_char_format()
+        cf.setFontFamilies(["Cascadia Mono", "Consolas", "JetBrains Mono", "DejaVu Sans Mono", "monospace"])
+        cf.setFontFixedPitch(True)
+        cf.setFontPointSize(max(9.0, round(self._base_pt * 0.94, 1)))
+        cf.setForeground(GOLD)
+        cf.setBackground(QColor("#222230"))
+        return cf
+
+    @staticmethod
+    def _select_block_text(block: QTextBlock) -> QTextCursor:
+        """Select strictly this block's characters without touching the previous block break."""
+        c = QTextCursor(block)
+        c.movePosition(QTextCursor.MoveOperation.StartOfBlock)
+        c.movePosition(QTextCursor.MoveOperation.EndOfBlock, QTextCursor.MoveMode.KeepAnchor)
+        return c
+
+    @staticmethod
+    def _is_quote(bf: QTextBlockFormat) -> bool:
+        return _is_quote_block_format(bf)
+
+    @staticmethod
+    def _is_code_fmt(cf: QTextCharFormat) -> bool:
+        return _is_code_char_format(cf)
+
+    # -- Markdown load / save roundtrip ------------------------------------------
+    _EMPTY_LIST_RE = re.compile(r"(?m)^([ \t]*(?:[-*+]|\d+\.)(?: \[[ xX]\])?)[ \t]*$")
+
+    def set_markdown_content(self, md: str) -> None:
+        self._internal = True
+        was_blocked = self.blockSignals(True)
+        doc = self.document()
+        doc.setUndoRedoEnabled(False)
+        try:
+            text = (md or "").strip("\r\n")
+            if text:
+                # Guard Qt6 md4c importer quirk where empty list items (`- `, `- [ ] `) swallow the next block
+                safe_md = self._EMPTY_LIST_RE.sub(lambda m: f"{m.group(1)} \u200b", text)
+                doc.setMarkdown(safe_md, QTextDocument.MarkdownFeature.MarkdownDialectGitHub)
+                self._restyle_document()
+            else:
+                doc.clear()
+                cur = self.textCursor()
+                cur.setBlockFormat(QTextBlockFormat())
+                cur.setBlockCharFormat(self._normal_char_format())
+                cur.setCharFormat(self._normal_char_format())
+                self.setTextCursor(cur)
+                self.setCurrentCharFormat(self._normal_char_format())
+            c = self.textCursor()
+            c.movePosition(QTextCursor.MoveOperation.Start)
+            self.setTextCursor(c)
+        finally:
+            doc.setUndoRedoEnabled(True)
+            self.blockSignals(was_blocked)
+            self._internal = False
+            self._tag_hl.rehighlight()
+            self.viewport().update()
+
+    def to_markdown_content(self) -> str:
+        """Export clean, standard GitHub-Flavored Markdown compatible with `notes.json`."""
+        raw = self.document().toMarkdown(QTextDocument.MarkdownFeature.MarkdownDialectGitHub)
+        raw = raw.replace("\u200b", "")
+        # Unescape `#tag` at start of line (Qt escapes `#` even without a trailing space)
+        raw = _MD_ESC_TAG_RE.sub(r"#\1", raw)
+        # Clean Qt6 spurious backslash escapes inside inline code spans (`\## ` -> `## `)
+        raw = _MD_CODE_SPAN_RE.sub(lambda m: "`" + _MD_CODE_ESC_RE.sub(r"\1", m.group(1)) + "`", raw)
+        # Unescape mid-line ` \+ ` produced by Qt6 Markdown writer
+        raw = raw.replace(" \\+ ", " + ")
+        # Normalize Qt's `- - -` horizontal rule back to crisp `---`
+        lines = ["---" if ln.strip() in ("- - -", "* * *") else ln.rstrip() for ln in raw.splitlines()]
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        while lines and not lines[-1].strip():
+            lines.pop()
+        return "\n".join(lines)
+
+    def _restyle_document(self) -> None:
+        """Apply cohesive Persona 5 dark typography to every block parsed from Markdown."""
+        sc = self._sc
+        doc = self.document()
+        block = doc.begin()
+        while block.isValid():
+            # Strip temporary empty-list sentinel cleanly while keeping the list/checkbox block intact
+            if block.text() == "\u200b":
+                sc0 = self._select_block_text(block)
+                sc0.removeSelectedText()
+
+            bf = QTextBlockFormat(block.blockFormat())
+            level = bf.headingLevel()
+            if level > 0 and block.textList() is not None:
+                block.textList().remove(block)
+                bf = QTextBlockFormat(block.blockFormat())
+            is_list = block.textList() is not None
+            is_quote = self._is_quote(bf)
+            marker = bf.marker()
+
+            # Fix Qt6 parser quirk where non-list blocks after checklists inherit MarkerType
+            if not is_list and marker != QTextBlockFormat.MarkerType.NoMarker:
+                bf.setMarker(QTextBlockFormat.MarkerType.NoMarker)
+
+            cur = self._select_block_text(block)
+
+            if level > 0:
+                bf.setTopMargin((10.0 if level == 1 else (8.0 if level == 2 else 6.0)) * sc)
+                bf.setBottomMargin(3.0 * sc)
+                hcf = self._heading_char_format(level)
+                cur.setBlockFormat(bf)
+                cur.setBlockCharFormat(hcf)
+                if cur.hasSelection():
+                    cur.mergeCharFormat(hcf)
+            else:
+                if is_quote:
+                    bf.setLeftMargin(18.0 * sc)
+                    bf.setRightMargin(8.0 * sc)
+                    bf.setTopMargin(4.0 * sc)
+                    bf.setBottomMargin(4.0 * sc)
+                else:
+                    bf.setTopMargin((2.5 if is_list else 2.0) * sc)
+                    bf.setBottomMargin((2.5 if is_list else 3.0) * sc)
+                cur.setBlockFormat(bf)
+                cur.setBlockCharFormat(self._normal_char_format())
+
+                # Preserve inline bold/italic/code while enforcing clean Persona 5 colors & font size
+                # (Visual-only checked strikethrough & blockquote italic are handled by P5TagHighlighter
+                # so `to_markdown_content()` stays 100% pure Markdown without extra `~~` or `*` wrappers.)
+                it = block.begin()
+                while not it.atEnd():
+                    frag = it.fragment()
+                    if frag.isValid():
+                        fc = QTextCursor(doc)
+                        fc.setPosition(frag.position())
+                        fc.setPosition(frag.position() + frag.length(), QTextCursor.MoveMode.KeepAnchor)
+                        if self._is_code_fmt(frag.charFormat()):
+                            fc.mergeCharFormat(self._code_char_format())
+                        else:
+                            ncf = QTextCharFormat()
+                            ncf.setFontPointSize(self._base_pt)
+                            ncf.setForeground(P5_TEXT)
+                            fc.mergeCharFormat(ncf)
+                    it += 1
+            block = block.next()
+
+    # -- Paste hygiene (never paste white backgrounds / broken external styles) --
+    def insertFromMimeData(self, source) -> None:
+        if source is not None and source.hasText():
+            self.insertPlainText(source.text())
+
+    # -- Custom Persona 5 painting: crimson quote bar & crisp checkboxes ---------
+    def _checkbox_rect_for_block(self, block: QTextBlock) -> QRectF | None:
+        if not block.isValid() or block.textList() is None:
+            return None
+        marker = block.blockFormat().marker()
+        if marker not in (QTextBlockFormat.MarkerType.Unchecked, QTextBlockFormat.MarkerType.Checked):
+            return None
+        c = QTextCursor(block)
+        cr = self.cursorRect(c)
+        bs = max(12.0, round(14.0 * self._sc))
+        bx = cr.left() - bs - max(7.0, 8.0 * self._sc)
+        by = cr.top() + (cr.height() - bs) / 2.0
+        return QRectF(bx, by, bs, bs)
+
+    def _checkbox_block_at(self, pos: QPoint) -> QTextBlock | None:
+        vp_h = self.viewport().height()
+        block = self.cursorForPosition(QPoint(0, max(0, pos.y() - 24))).block()
+        while block.isValid():
+            cr = self.cursorRect(QTextCursor(block))
+            if cr.top() > vp_h + 20:
+                break
+            box = self._checkbox_rect_for_block(block)
+            if box is not None and box.adjusted(-6, -5, 6, 5).contains(QPointF(pos)):
+                return block
+            block = block.next()
+        return None
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        p = QPainter(self.viewport())
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        vp_h = self.viewport().height()
+        sc = self._sc
+
+        block = self.cursorForPosition(QPoint(0, 0)).block()
+        if block.previous().isValid():
+            block = block.previous()
+        while block.isValid():
+            first_cr = self.cursorRect(QTextCursor(block))
+            if first_cr.top() > vp_h + 24:
+                break
+            bf = block.blockFormat()
+
+            # 1) Crimson Persona 5 vertical accent bar for blockquotes
+            if self._is_quote(bf):
+                end_c = QTextCursor(block)
+                end_c.movePosition(QTextCursor.MoveOperation.EndOfBlock)
+                last_cr = self.cursorRect(end_c)
+                bar_x = max(6.0, first_cr.left() - 12.0 * sc)
+                bar_top = float(first_cr.top() + 2)
+                bar_h = max(float(first_cr.height() - 4), float(last_cr.bottom() - first_cr.top() - 4))
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(RED)
+                p.drawRoundedRect(QRectF(bar_x, bar_top, 3.2 * sc, bar_h), 1.5, 1.5)
+
+            # 2) Crisp Persona 5 interactive rounded checkboxes covering Qt's default glyph
+            box = self._checkbox_rect_for_block(block)
+            if box is not None:
+                checked = bf.marker() == QTextBlockFormat.MarkerType.Checked
+                # Erase Qt's entire built-in checkbox marker region cleanly with exact #noteBody surface
+                erase_left = max(2.0, box.left() - 8.0 * sc)
+                erase_right = max(box.right() + 2.0, float(first_cr.left()) - 2.0)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor("#121217"))
+                p.drawRect(QRectF(erase_left, float(first_cr.top()) - 1.0,
+                                  erase_right - erase_left, float(first_cr.height()) + 2.0))
+                if checked:
+                    p.setPen(QPen(WHITE, 1.3))
+                    p.setBrush(RED)
+                    p.drawRoundedRect(box, 3.5, 3.5)
+                    c = box.center()
+                    r = box.width() * 0.28
+                    path = QPainterPath()
+                    path.moveTo(c.x() - r * 1.15, c.y() + r * 0.1)
+                    path.lineTo(c.x() - r * 0.25, c.y() + r * 1.0)
+                    path.lineTo(c.x() + r * 1.25, c.y() - r * 0.95)
+                    p.setPen(QPen(WHITE, max(1.7, 1.9 * sc), Qt.PenStyle.SolidLine,
+                                  Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+                    p.setBrush(Qt.BrushStyle.NoBrush)
+                    p.drawPath(path)
+                else:
+                    p.setPen(QPen(QColor("#9292A6"), 1.4))
+                    p.setBrush(P5_BG)
+                    p.drawRoundedRect(box, 3.5, 3.5)
+            block = block.next()
+        p.end()
+
+    # -- Interactive checkbox click & hover cursor -------------------------------
+    def _toggle_block_checkbox(self, block: QTextBlock) -> bool:
+        if not block.isValid() or block.textList() is None:
+            return False
+        bf = QTextBlockFormat(block.blockFormat())
+        marker = bf.marker()
+        if marker not in (QTextBlockFormat.MarkerType.Unchecked, QTextBlockFormat.MarkerType.Checked):
+            return False
+        now_checked = marker == QTextBlockFormat.MarkerType.Unchecked
+        bf.setMarker(QTextBlockFormat.MarkerType.Checked if now_checked else QTextBlockFormat.MarkerType.Unchecked)
+
+        cur = QTextCursor(block)
+        cur.beginEditBlock()
+        cur.setBlockFormat(bf)
+        cur.endEditBlock()
+        self._tag_hl.rehighlightBlock(block)
+        play_ui("select" if now_checked else "cancel")
+        self.viewport().update()
+        self.checkbox_toggled.emit(now_checked)
+        return True
+
+    def mouseMoveEvent(self, e) -> None:
+        hit = self._checkbox_block_at(e.position().toPoint())
+        self.viewport().setCursor(Qt.CursorShape.PointingHandCursor if hit is not None else Qt.CursorShape.IBeamCursor)
+        super().mouseMoveEvent(e)
+
+    def mousePressEvent(self, e) -> None:
+        if e.button() == Qt.MouseButton.LeftButton:
+            hit = self._checkbox_block_at(e.position().toPoint())
+            if hit is not None:
+                self._toggle_block_checkbox(hit)
+                e.accept()
+                return
+        super().mousePressEvent(e)
+
+    # -- Block reset & conversion helpers ----------------------------------------
+    def _restore_offset(self, cur: QTextCursor, orig_off: int, cf: QTextCharFormat) -> None:
+        blk = cur.block()
+        cur.setPosition(blk.position() + min(orig_off, len(blk.text())))
+        self.setTextCursor(cur)
+        self.setCurrentCharFormat(cf)
+
+    def _reset_block_to_normal(self, cur: QTextCursor) -> None:
+        orig_off = cur.position() - cur.block().position()
+        lst = cur.currentList()
+        if lst is not None:
+            lst.remove(cur.block())
+        bf = QTextBlockFormat()
+        bf.setTopMargin(2.0 * self._sc)
+        bf.setBottomMargin(3.0 * self._sc)
+        ncf = self._normal_char_format()
+        scur = self._select_block_text(cur.block())
+        scur.setBlockFormat(bf)
+        scur.setBlockCharFormat(ncf)
+        if scur.hasSelection():
+            scur.mergeCharFormat(ncf)
+        self._restore_offset(cur, orig_off, ncf)
+        self._tag_hl.rehighlightBlock(cur.block())
+        self.viewport().update()
+
+    def _apply_heading(self, cur: QTextCursor, level: int) -> None:
+        orig_off = cur.position() - cur.block().position()
+        lst = cur.currentList()
+        if lst is not None:
+            lst.remove(cur.block())
+        bf = QTextBlockFormat()
+        bf.setHeadingLevel(level)
+        bf.setTopMargin((10.0 if level == 1 else (8.0 if level == 2 else 6.0)) * self._sc)
+        bf.setBottomMargin(3.0 * self._sc)
+        hcf = self._heading_char_format(level)
+        scur = self._select_block_text(cur.block())
+        scur.setBlockFormat(bf)
+        scur.setBlockCharFormat(hcf)
+        if scur.hasSelection():
+            scur.mergeCharFormat(hcf)
+        self._restore_offset(cur, orig_off, hcf)
+        self._tag_hl.rehighlightBlock(cur.block())
+
+    def _apply_list(self, cur: QTextCursor, checklist: bool = False, checked: bool = False) -> None:
+        orig_off = cur.position() - cur.block().position()
+        if cur.currentList() is None:
+            lf = QTextListFormat()
+            lf.setStyle(QTextListFormat.Style.ListDisc)
+            cur.createList(lf)
+        bf0 = QTextBlockFormat(cur.blockFormat())
+        bf0.setHeadingLevel(0)
+        bf0.clearProperty(QTextFormat.Property.BlockQuoteLevel)
+        bf0.setLeftMargin(0.0)
+        bf0.setTopMargin(2.5 * self._sc)
+        bf0.setBottomMargin(2.5 * self._sc)
+        if checklist:
+            bf0.setMarker(QTextBlockFormat.MarkerType.Checked if checked else QTextBlockFormat.MarkerType.Unchecked)
+        else:
+            bf0.setMarker(QTextBlockFormat.MarkerType.NoMarker)
+        ncf = self._normal_char_format()
+        scur = self._select_block_text(cur.block())
+        scur.setBlockFormat(bf0)
+        scur.setBlockCharFormat(ncf)
+        if scur.hasSelection():
+            scur.mergeCharFormat(ncf)
+        self._restore_offset(cur, orig_off, ncf)
+        self._tag_hl.rehighlightBlock(cur.block())
+        self.viewport().update()
+
+    def _apply_blockquote(self, cur: QTextCursor) -> None:
+        orig_off = cur.position() - cur.block().position()
+        lst = cur.currentList()
+        if lst is not None:
+            lst.remove(cur.block())
+        bf = QTextBlockFormat()
+        bf.setProperty(QTextFormat.Property.BlockQuoteLevel, 1)
+        bf.setLeftMargin(18.0 * self._sc)
+        bf.setRightMargin(8.0 * self._sc)
+        bf.setTopMargin(4.0 * self._sc)
+        bf.setBottomMargin(4.0 * self._sc)
+        ncf = self._normal_char_format()
+        scur = self._select_block_text(cur.block())
+        scur.setBlockFormat(bf)
+        scur.setBlockCharFormat(ncf)
+        if scur.hasSelection():
+            scur.mergeCharFormat(ncf)
+        self._restore_offset(cur, orig_off, ncf)
+        self._tag_hl.rehighlightBlock(cur.block())
+        self.viewport().update()
+
+    # -- Live Markdown-as-you-type keyboard ergonomics ---------------------------
+    def _try_inline_markdown_convert(self) -> None:
+        cur = self.textCursor()
+        if cur.hasSelection():
+            return
+        block = cur.block()
+        if block.blockFormat().headingLevel() > 0:
+            return
+        pos_in_blk = cur.positionInBlock()
+        prefix = block.text()[:pos_in_blk]
+        if len(prefix) < 3:
+            return
+
+        for kind, regex in (("bold", _MD_BOLD_END_RE), ("code", _MD_CODE_END_RE), ("italic", _MD_ITALIC_END_RE)):
+            m = regex.search(prefix)
+            if not m:
+                continue
+            inner = m.group(1)
+            if not inner or inner.startswith(" ") or inner.endswith(" "):
+                continue
+            start_pos = block.position() + m.start()
+            end_pos = block.position() + m.end()
+            ec = QTextCursor(self.document())
+            ec.beginEditBlock()
+            ec.setPosition(start_pos)
+            ec.setPosition(end_pos, QTextCursor.MoveMode.KeepAnchor)
+            if kind == "bold":
+                cf = self._normal_char_format()
+                cf.setFontWeight(QFont.Weight.Bold)
+            elif kind == "italic":
+                cf = self._normal_char_format()
+                cf.setFontItalic(True)
+            else:
+                cf = self._code_char_format()
+            ec.insertText(inner, cf)
+            ec.endEditBlock()
+            self.setTextCursor(ec)
+            self.setCurrentCharFormat(self._normal_char_format())
+            return
+
+    def keyPressEvent(self, e) -> None:
+        key = e.key()
+        mods = e.modifiers()
+        cur = self.textCursor()
+        block = cur.block()
+        bf = block.blockFormat()
+
+        # Ctrl+Enter toggles current checklist checkbox
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and (mods & Qt.KeyboardModifier.ControlModifier):
+            if self._toggle_block_checkbox(block):
+                e.accept()
+                return
+
+        # Live block Markdown triggers when pressing Space after `#`, `##`, `-`, `[]`, `>`
+        if key == Qt.Key.Key_Space and not cur.hasSelection():
+            if bf.headingLevel() == 0 and cur.currentList() is None and not self._is_quote(bf):
+                prefix = block.text()[:cur.positionInBlock()]
+                if prefix in ("#", "##", "###", "-", "*", "[]", "[ ]", "[x]", "[X]", ">"):
+                    cur.beginEditBlock()
+                    cur.setPosition(block.position())
+                    cur.setPosition(block.position() + len(prefix), QTextCursor.MoveMode.KeepAnchor)
+                    cur.removeSelectedText()
+                    if prefix == "#":
+                        self._apply_heading(cur, 1)
+                    elif prefix == "##":
+                        self._apply_heading(cur, 2)
+                    elif prefix == "###":
+                        self._apply_heading(cur, 3)
+                    elif prefix in ("-", "*"):
+                        self._apply_list(cur, checklist=False)
+                    elif prefix in ("[]", "[ ]"):
+                        self._apply_list(cur, checklist=True, checked=False)
+                    elif prefix in ("[x]", "[X]"):
+                        self._apply_list(cur, checklist=True, checked=True)
+                    elif prefix == ">":
+                        self._apply_blockquote(cur)
+                    cur.endEditBlock()
+                    e.accept()
+                    return
+
+        # Natural Enter behavior: divider on `---`, exit heading / empty list / quote cleanly
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and not (mods & Qt.KeyboardModifier.ShiftModifier):
+            stripped = block.text().strip()
+            if stripped in ("---", "***") and bf.headingLevel() == 0 and cur.currentList() is None:
+                cur.beginEditBlock()
+                cur.movePosition(QTextCursor.MoveOperation.StartOfBlock)
+                cur.movePosition(QTextCursor.MoveOperation.EndOfBlock, QTextCursor.MoveMode.KeepAnchor)
+                cur.removeSelectedText()
+                cur.insertHtml("<hr/>")
+                nbf = QTextBlockFormat()
+                nbf.setTopMargin(2.0 * self._sc)
+                nbf.setBottomMargin(3.0 * self._sc)
+                ncf = self._normal_char_format()
+                cur.insertBlock(nbf, ncf)
+                cur.setBlockCharFormat(ncf)
+                cur.endEditBlock()
+                self.setTextCursor(cur)
+                self.setCurrentCharFormat(ncf)
+                e.accept()
+                return
+            if bf.headingLevel() > 0:
+                cur.beginEditBlock()
+                nbf = QTextBlockFormat()
+                nbf.setTopMargin(2.0 * self._sc)
+                nbf.setBottomMargin(3.0 * self._sc)
+                ncf = self._normal_char_format()
+                cur.insertBlock(nbf, ncf)
+                cur.setBlockCharFormat(ncf)
+                cur.endEditBlock()
+                self.setTextCursor(cur)
+                self.setCurrentCharFormat(ncf)
+                e.accept()
+                return
+            if (cur.currentList() is not None or self._is_quote(bf)) and not stripped:
+                cur.beginEditBlock()
+                self._reset_block_to_normal(cur)
+                cur.endEditBlock()
+                e.accept()
+                return
+            if cur.currentList() is not None and bf.marker() in (
+                QTextBlockFormat.MarkerType.Unchecked, QTextBlockFormat.MarkerType.Checked
+            ):
+                super().keyPressEvent(e)
+                nc = self.textCursor()
+                nbf = QTextBlockFormat(nc.blockFormat())
+                nbf.setMarker(QTextBlockFormat.MarkerType.Unchecked)
+                ncf = self._normal_char_format()
+                nc.setBlockFormat(nbf)
+                nc.setBlockCharFormat(ncf)
+                nc.setCharFormat(ncf)
+                self.setTextCursor(nc)
+                self.setCurrentCharFormat(ncf)
+                self.viewport().update()
+                return
+
+        # Natural Backspace at column 0 converts Heading / List / Quote back to normal text
+        if key == Qt.Key.Key_Backspace and not cur.hasSelection() and cur.positionInBlock() == 0:
+            if bf.headingLevel() > 0 or cur.currentList() is not None or self._is_quote(bf):
+                cur.beginEditBlock()
+                self._reset_block_to_normal(cur)
+                cur.endEditBlock()
+                e.accept()
+                return
+
+        super().keyPressEvent(e)
+        if e.text() in ("*", "`"):
+            self._try_inline_markdown_convert()
+
+    # -- Direct WYSIWYG toolbar actions ------------------------------------------
+    def toggle_heading(self, level: int = 2) -> None:
+        cur = self.textCursor()
+        cur.beginEditBlock()
+        if cur.blockFormat().headingLevel() == level:
+            self._reset_block_to_normal(cur)
+        else:
+            self._apply_heading(cur, level)
+        cur.endEditBlock()
+        self.setFocus()
+
+    def toggle_bold(self) -> None:
+        cur = self.textCursor()
+        want = self.fontWeight() < QFont.Weight.Bold
+        cf = QTextCharFormat()
+        cf.setFontWeight(QFont.Weight.Bold if want else QFont.Weight.Normal)
+        if cur.hasSelection():
+            cur.mergeCharFormat(cf)
+        self.mergeCurrentCharFormat(cf)
+        self.setFocus()
+
+    def toggle_italic(self) -> None:
+        cur = self.textCursor()
+        want = not self.fontItalic()
+        cf = QTextCharFormat()
+        cf.setFontItalic(want)
+        if cur.hasSelection():
+            cur.mergeCharFormat(cf)
+        self.mergeCurrentCharFormat(cf)
+        self.setFocus()
+
+    def toggle_inline_code(self) -> None:
+        cur = self.textCursor()
+        is_code = self._is_code_fmt(self.currentCharFormat())
+        cf = self._normal_char_format() if is_code else self._code_char_format()
+        if cur.hasSelection():
+            cur.mergeCharFormat(cf)
+        self.mergeCurrentCharFormat(cf)
+        self.setFocus()
+
+    def toggle_bullet_list(self) -> None:
+        cur = self.textCursor()
+        cur.beginEditBlock()
+        is_bullet = (
+            cur.currentList() is not None
+            and cur.blockFormat().marker() == QTextBlockFormat.MarkerType.NoMarker
+        )
+        if is_bullet:
+            self._reset_block_to_normal(cur)
+        else:
+            self._apply_list(cur, checklist=False)
+        cur.endEditBlock()
+        self.setFocus()
+
+    def toggle_checklist(self) -> None:
+        cur = self.textCursor()
+        cur.beginEditBlock()
+        is_check = (
+            cur.currentList() is not None
+            and cur.blockFormat().marker() in (
+                QTextBlockFormat.MarkerType.Unchecked, QTextBlockFormat.MarkerType.Checked
+            )
+        )
+        if is_check:
+            self._reset_block_to_normal(cur)
+        else:
+            self._apply_list(cur, checklist=True, checked=False)
+        cur.endEditBlock()
+        self.setFocus()
+
+    def toggle_blockquote(self) -> None:
+        cur = self.textCursor()
+        cur.beginEditBlock()
+        if self._is_quote(cur.blockFormat()):
+            self._reset_block_to_normal(cur)
+        else:
+            self._apply_blockquote(cur)
+        cur.endEditBlock()
+        self.setFocus()
+
+    def insert_divider(self) -> None:
+        cur = self.textCursor()
+        cur.beginEditBlock()
+        if cur.block().text().strip():
+            cur.movePosition(QTextCursor.MoveOperation.EndOfBlock)
+            cur.insertBlock(QTextBlockFormat(), self._normal_char_format())
+        cur.insertHtml("<hr/>")
+        cur.insertBlock(QTextBlockFormat(), self._normal_char_format())
+        cur.endEditBlock()
+        self.setTextCursor(cur)
+        self.setCurrentCharFormat(self._normal_char_format())
+        self.setFocus()
+
+    def active_formats(self) -> dict[str, bool]:
+        cur = self.textCursor()
+        bf = cur.blockFormat()
+        cf = self.currentCharFormat()
+        in_list = cur.currentList() is not None
+        mk = bf.marker()
+        is_check = in_list and mk in (QTextBlockFormat.MarkerType.Unchecked, QTextBlockFormat.MarkerType.Checked)
+        return {
+            "h2": bf.headingLevel() > 0,
+            "bold": cf.fontWeight() >= QFont.Weight.Bold and bf.headingLevel() == 0,
+            "italic": cf.fontItalic() and not self._is_quote(bf),
+            "code": self._is_code_fmt(cf),
+            "bullet": in_list and not is_check,
+            "check": is_check,
+            "quote": self._is_quote(bf),
+        }
+
+
+# ---------------------------------------------------------------------------
+# NOTES DIALOG (2-column Persona 5 workspace: Live Rich WYSIWYG editor + fast sidebar)
 # ---------------------------------------------------------------------------
 class NotesDialog(P5FluidPanel):
     """Frictionless Persona 5 Note-Taking workspace (distinct from Tasks).
 
-    Built around proven desktop note UX (Apple Notes / Bear / Obsidian / Evernote):
+    Built around proven desktop note UX (Apple Notes / Bear / Obsidian Live Preview):
+      * Live WYSIWYG rich Markdown editor by default — edit headings, bold, italic, code,
+        blockquotes, `#tags`, and clickable checkboxes directly without switching modes.
+      * Optional `RAW MD` source toggle (`Ctrl+E`) synced both ways with live rich view.
       * Zero-friction capture with instant debounced auto-save (no Save button friction).
       * Notebooks (`Personal`, `Study`, `Work`, `Ideas`, `Journal`) + automatic `#tag` discovery.
-      * Quick Templates (`Meeting`, `Study`, `Idea`, `Journal`) & Markdown Write/Preview toggle.
-      * 1-click `→ TASK` bridge: turn any highlighted line or note title into a Task without
-        duplicating to-do checklists or deadlines inside Notes.
+      * Quick Templates (`Meeting`, `Study`, `Idea`, `Journal`) & 1-click `→ TASK` bridge.
       * Clean Archive + Undo Delete + legacy deadline migration banner for older `notes.json`.
     """
 
@@ -1649,7 +2417,7 @@ class NotesDialog(P5FluidPanel):
         self._filter = "all"
         self._active_tag = ""
         self._sort_idx = 0
-        self._preview_mode = False
+        self._raw_mode = False
         self._loading = False
         self._dirty = False
         self._undo_note: dict | None = None
@@ -1788,14 +2556,14 @@ class NotesDialog(P5FluidPanel):
         eh.addWidget(self._del_btn)
         el.addLayout(eh)
 
-        # Row 2: Editor actions (PREVIEW, → TASK bridge, ARCHIVE) + reading stats
+        # Row 2: Editor actions (RAW MD toggle, → TASK bridge, ARCHIVE) + reading stats
         act = QHBoxLayout()
         act.setSpacing(_sc(5, sc, 4))
-        self._prev_btn = self._btn("PREVIEW", variant="soft", display=True, px=9)
-        self._prev_btn.setFixedHeight(_sc(26, sc, 22))
-        self._prev_btn.setToolTip("Toggle Markdown Preview / Edit (Ctrl+E)")
-        self._prev_btn.clicked.connect(self._toggle_preview)
-        act.addWidget(self._prev_btn)
+        self._raw_btn = self._btn("RAW MD", variant="soft", display=True, px=9)
+        self._raw_btn.setFixedHeight(_sc(26, sc, 22))
+        self._raw_btn.setToolTip("Switch between Live Rich editor and Raw Markdown source (Ctrl+E)")
+        self._raw_btn.clicked.connect(self._toggle_raw_mode)
+        act.addWidget(self._raw_btn)
 
         self._to_task_btn = self._btn("→ TASK", variant="gold", display=True, px=9)
         self._to_task_btn.setFixedHeight(_sc(26, sc, 22))
@@ -1854,51 +2622,58 @@ class NotesDialog(P5FluidPanel):
         self._legacy_bar.setVisible(False)
         el.addWidget(self._legacy_bar)
 
-        # Spacious Markdown note editor & toggleable rich preview
-        self.content_edit = QTextEdit()
-        self.content_edit.setObjectName("noteBody")
-        self.content_edit.setAcceptRichText(False)
+        # Default Live WYSIWYG rich Markdown editor (edit formatted notes directly!)
+        self.content_edit = P5RichNoteEditor(scale=sc)
         self.content_edit.setPlaceholderText(
-            "Start writing... Supports Markdown (**bold**, ## headings, - lists, `code`) and #tags.\n"
-            "Highlight any action item and click '→ TASK' to send it straight to Tasks."
+            "Start writing... Formatted live as you type!\n"
+            "Try ## heading, **bold**, *italic*, `code`, - bullet, [] checklist, > quote, --- divider, or #tags."
         )
         self.content_edit.textChanged.connect(self._on_content_changed)
+        self.content_edit.checkbox_toggled.connect(self._on_checkbox_toggled)
+        self.content_edit.cursorPositionChanged.connect(self._sync_toolbar_state)
+        self.content_edit.currentCharFormatChanged.connect(lambda _f: self._sync_toolbar_state())
         el.addWidget(self.content_edit, 1)
 
-        self.preview_view = QTextBrowser()
-        self.preview_view.setObjectName("notePreview")
-        self.preview_view.setOpenExternalLinks(True)
-        self.preview_view.setVisible(False)
-        el.addWidget(self.preview_view, 1)
+        # Optional Raw Markdown source editor (synced 2-way via RAW MD / Ctrl+E)
+        self.raw_edit = QTextEdit()
+        self.raw_edit.setObjectName("noteRaw")
+        self.raw_edit.setAcceptRichText(False)
+        self.raw_edit.setPlaceholderText("Raw Markdown source...")
+        self.raw_edit.textChanged.connect(self._on_content_changed)
+        self.raw_edit.setVisible(False)
+        el.addWidget(self.raw_edit, 1)
 
         # Undo strip
         self._undo = UndoBar(scale=sc)
         self._undo.undo_clicked.connect(self._undo_delete)
         el.addWidget(self._undo)
 
-        # Bottom Markdown formatting toolbar + true auto-save indicator + COPY MD
+        # Bottom live formatting toolbar + true auto-save indicator + COPY MD
         bf = QHBoxLayout()
         bf.setSpacing(6)
         self._fmt_pill = _make_card("toolbarPill")
         pl = QHBoxLayout(self._fmt_pill)
         pl.setContentsMargins(4, 3, 4, 3)
         pl.setSpacing(1)
-        for label, ic, tip, fn in (
-            ("H2", "", "Heading (## )", lambda: self._insert_line_prefix("## ")),
-            ("B",  "", "Bold (**text**, Ctrl+B)", lambda: self._wrap_selection("**", "**", "bold")),
-            ("I",  "", "Italic (*text*, Ctrl+I)", lambda: self._wrap_selection("*", "*", "italic")),
-            ("<>", "", "Inline code (`code`)", lambda: self._wrap_selection("`", "`", "code")),
-            ("•",  "", "Bullet list (- )", lambda: self._insert_line_prefix("- ")),
-            ("☐",  "", "Checklist (- [ ] )", lambda: self._insert_line_prefix("- [ ] ")),
-            ("”",  "", "Blockquote (> )", lambda: self._insert_line_prefix("> ")),
-            ("—",  "", "Section divider", lambda: self._insert_snippet("\n---\n")),
-            ("",   "clock", "Insert timestamp", self._insert_timestamp),
+        self._fmt_btns: dict[str, P5FluidButton] = {}
+        for key, label, ic, tip, fn in (
+            ("h2",     "H2", "", "Heading (## )", self._fmt_heading),
+            ("bold",   "B",  "", "Bold (Ctrl+B)", self._fmt_bold),
+            ("italic", "I",  "", "Italic (Ctrl+I)", self._fmt_italic),
+            ("code",   "<>", "", "Inline code (Ctrl+`)", self._fmt_code),
+            ("bullet", "•",  "", "Bullet list (- )", self._fmt_bullet),
+            ("check",  "☐",  "", "Checklist ([] / Ctrl+Enter to toggle)", self._fmt_checklist),
+            ("quote",  "”",  "", "Blockquote (> )", self._fmt_quote),
+            ("",       "—",  "", "Section divider (---)", self._fmt_divider),
+            ("",       "",   "clock", "Insert timestamp", self._insert_timestamp),
         ):
             tb_btn = self._btn(label, variant="ghost", icon=ic, px=10)
             tb_btn.setFixedSize(_sc(25, sc, 21), _sc(25, sc, 21))
             tb_btn.setToolTip(tip)
             tb_btn.clicked.connect(lambda _c=False, f=fn: f())
             pl.addWidget(tb_btn)
+            if key:
+                self._fmt_btns[key] = tb_btn
         bf.addWidget(self._fmt_pill)
 
         self.status = QLabel("Auto-saves as you type")
@@ -1919,10 +2694,11 @@ class NotesDialog(P5FluidPanel):
         QShortcut(QKeySequence("Ctrl+S"), self).activated.connect(self._save)
         QShortcut(QKeySequence("Ctrl+N"), self).activated.connect(lambda: self._new())
         QShortcut(QKeySequence("Ctrl+F"), self).activated.connect(self.search_edit.setFocus)
-        QShortcut(QKeySequence("Ctrl+E"), self).activated.connect(self._toggle_preview)
+        QShortcut(QKeySequence("Ctrl+E"), self).activated.connect(self._toggle_raw_mode)
         QShortcut(QKeySequence("Ctrl+P"), self).activated.connect(self._toggle_pin)
-        QShortcut(QKeySequence("Ctrl+B"), self).activated.connect(lambda: self._wrap_selection("**", "**", "bold"))
-        QShortcut(QKeySequence("Ctrl+I"), self).activated.connect(lambda: self._wrap_selection("*", "*", "italic"))
+        QShortcut(QKeySequence("Ctrl+B"), self).activated.connect(self._fmt_bold)
+        QShortcut(QKeySequence("Ctrl+I"), self).activated.connect(self._fmt_italic)
+        QShortcut(QKeySequence("Ctrl+`"), self).activated.connect(self._fmt_code)
         QShortcut(QKeySequence("Ctrl+,"), self).activated.connect(lambda: self.open_settings.emit())
 
         # Fast debounced auto-save (650 ms after typing stops)
@@ -2014,68 +2790,74 @@ class NotesDialog(P5FluidPanel):
         self._tags_lay.addStretch(1)
         self._tags_scroll.setVisible(True)
 
-    # -- Markdown formatting & preview -------------------------------------------
-    def _set_preview_mode(self, on: bool) -> None:
-        self._preview_mode = bool(on)
-        self.content_edit.setVisible(not self._preview_mode)
-        self.preview_view.setVisible(self._preview_mode)
-        self._fmt_pill.setEnabled(not self._preview_mode)
-        self._prev_btn.set_active(self._preview_mode, active_variant="primary")
-        self._prev_btn.setText("EDIT" if self._preview_mode else "PREVIEW")
-        if self._preview_mode:
-            self._render_preview()
+    # -- Live WYSIWYG formatting & optional RAW MD source toggle -----------------
+    def _active_editor(self) -> QTextEdit:
+        return self.raw_edit if self._raw_mode else self.content_edit
 
-    def _toggle_preview(self) -> None:
-        self._set_preview_mode(not self._preview_mode)
+    def _current_markdown(self) -> str:
+        if self._raw_mode:
+            return self.raw_edit.toPlainText()
+        return self.content_edit.to_markdown_content()
 
-    def _render_preview(self) -> None:
-        raw = self.content_edit.toPlainText()
-        title = self.title_edit.text().strip() or "(Untitled)"
-        # Convert simple checkboxes to clean unicode glyphs before Qt Markdown rendering
-        md_lines = []
-        for ln in raw.splitlines():
-            s = ln.lstrip()
-            indent = ln[:len(ln) - len(s)]
-            if s.startswith("- [ ] ") or s.startswith("[ ] "):
-                body = s.split("] ", 1)[1]
-                md_lines.append(f"{indent}- ☐ {body}")
-            elif s.lower().startswith("- [x] ") or s.lower().startswith("[x] "):
-                body = s.split("] ", 1)[1]
-                md_lines.append(f"{indent}- ☑ ~~{body}~~")
+    def _current_plain_text(self) -> str:
+        if self._raw_mode:
+            return self.raw_edit.toPlainText()
+        return self.content_edit.toPlainText()
+
+    def _set_raw_mode(self, on: bool) -> None:
+        on = bool(on)
+        if on == self._raw_mode:
+            return
+        was_loading = self._loading
+        self._loading = True
+        try:
+            if on:
+                md = self.content_edit.to_markdown_content()
+                self.raw_edit.blockSignals(True)
+                self.raw_edit.setPlainText(md)
+                self.raw_edit.blockSignals(False)
             else:
-                md_lines.append(ln)
-        doc_md = f"# {title}\n\n" + ("\n".join(md_lines) if md_lines else "*Empty note — click EDIT to start writing.*")
-        self.preview_view.document().setDefaultStyleSheet(
-            "body { color: #EAEAF2; line-height: 1.45; }"
-            "h1 { color: #FFFFFF; font-size: 20px; border-bottom: 1px solid #3A1A22; padding-bottom: 4px; }"
-            "h2 { color: #FAD02C; font-size: 16px; margin-top: 10px; }"
-            "h3 { color: #FF5E6B; font-size: 14px; }"
-            "code { background-color: #20202C; color: #FAD02C; padding: 1px 4px; }"
-            "pre { background-color: #1A1A24; color: #EAEAF2; padding: 8px; }"
-            "blockquote { color: #C0C0D4; border-left: 3px solid #E60012; margin-left: 4px; padding-left: 8px; }"
-            "a { color: #FAD02C; }"
-        )
-        self.preview_view.setMarkdown(doc_md)
+                md = self.raw_edit.toPlainText()
+                self.content_edit.set_markdown_content(md)
+            self._raw_mode = on
+            self.content_edit.setVisible(not on)
+            self.raw_edit.setVisible(on)
+            self._raw_btn.set_active(on, active_variant="gold")
+            self._raw_btn.setText("RICH" if on else "RAW MD")
+        finally:
+            self._loading = was_loading
+        self._sync_toolbar_state()
+        self._update_word_and_tag_meta()
+        self._active_editor().setFocus()
+
+    def _toggle_raw_mode(self) -> None:
+        self._set_raw_mode(not self._raw_mode)
+
+    def _sync_toolbar_state(self) -> None:
+        if self._raw_mode:
+            for btn in self._fmt_btns.values():
+                btn.set_active(False, active_variant="gold")
+            return
+        fmts = self.content_edit.active_formats()
+        for key, btn in self._fmt_btns.items():
+            btn.set_active(bool(fmts.get(key)), active_variant="gold")
 
     def _insert_snippet(self, snippet: str) -> None:
-        if self._preview_mode:
-            self._set_preview_mode(False)
-        cur = self.content_edit.textCursor()
+        ed = self._active_editor()
+        cur = ed.textCursor()
         cur.insertText(snippet)
-        self.content_edit.setFocus()
+        ed.setFocus()
 
     def _insert_line_prefix(self, prefix: str) -> None:
-        if self._preview_mode:
-            self._set_preview_mode(False)
-        cur = self.content_edit.textCursor()
+        ed = self._active_editor()
+        cur = ed.textCursor()
         cur.movePosition(QTextCursor.MoveOperation.StartOfBlock)
         cur.insertText(prefix)
-        self.content_edit.setFocus()
+        ed.setFocus()
 
     def _wrap_selection(self, left: str, right: str, placeholder: str) -> None:
-        if self._preview_mode:
-            self._set_preview_mode(False)
-        cur = self.content_edit.textCursor()
+        ed = self._active_editor()
+        cur = ed.textCursor()
         sel = cur.selectedText()
         if sel:
             cur.insertText(f"{left}{sel}{right}")
@@ -2084,14 +2866,70 @@ class NotesDialog(P5FluidPanel):
             cur.insertText(f"{left}{placeholder}{right}")
             cur.setPosition(pos + len(left))
             cur.setPosition(pos + len(left) + len(placeholder), QTextCursor.MoveMode.KeepAnchor)
-            self.content_edit.setTextCursor(cur)
-        self.content_edit.setFocus()
+            ed.setTextCursor(cur)
+        ed.setFocus()
+
+    def _fmt_heading(self) -> None:
+        if self._raw_mode:
+            self._insert_line_prefix("## ")
+        else:
+            self.content_edit.toggle_heading(2)
+            self._sync_toolbar_state()
+
+    def _fmt_bold(self) -> None:
+        if self._raw_mode:
+            self._wrap_selection("**", "**", "bold")
+        else:
+            self.content_edit.toggle_bold()
+            self._sync_toolbar_state()
+
+    def _fmt_italic(self) -> None:
+        if self._raw_mode:
+            self._wrap_selection("*", "*", "italic")
+        else:
+            self.content_edit.toggle_italic()
+            self._sync_toolbar_state()
+
+    def _fmt_code(self) -> None:
+        if self._raw_mode:
+            self._wrap_selection("`", "`", "code")
+        else:
+            self.content_edit.toggle_inline_code()
+            self._sync_toolbar_state()
+
+    def _fmt_bullet(self) -> None:
+        if self._raw_mode:
+            self._insert_line_prefix("- ")
+        else:
+            self.content_edit.toggle_bullet_list()
+            self._sync_toolbar_state()
+
+    def _fmt_checklist(self) -> None:
+        if self._raw_mode:
+            self._insert_line_prefix("- [ ] ")
+        else:
+            self.content_edit.toggle_checklist()
+            self._sync_toolbar_state()
+
+    def _fmt_quote(self) -> None:
+        if self._raw_mode:
+            self._insert_line_prefix("> ")
+        else:
+            self.content_edit.toggle_blockquote()
+            self._sync_toolbar_state()
+
+    def _fmt_divider(self) -> None:
+        if self._raw_mode:
+            self._insert_snippet("\n---\n")
+        else:
+            self.content_edit.insert_divider()
+            self._sync_toolbar_state()
 
     def _insert_timestamp(self) -> None:
         self._insert_snippet(f"[{datetime.now():%d %b %H:%M}] ")
 
     def _update_word_and_tag_meta(self) -> None:
-        txt = self.content_edit.toPlainText()
+        txt = self._current_plain_text()
         n = len(txt.split())
         read_m = max(1, (n + 199) // 200) if n else 0
         read_s = f" · ~{read_m}m read" if n >= 40 else ""
@@ -2105,8 +2943,15 @@ class NotesDialog(P5FluidPanel):
             self._note_tags_lbl.setText("Tip: type #tag anywhere in your note to organize & filter.")
             self._note_tags_lbl.setStyleSheet("")
 
+    def _on_checkbox_toggled(self, _checked: bool) -> None:
+        self._sync_toolbar_state()
+        self._on_edited()
+
     def _on_content_changed(self) -> None:
+        if self._loading:
+            return
         self._update_word_and_tag_meta()
+        self._sync_toolbar_state()
         self._on_edited()
 
     def _on_edited(self, *_args) -> None:
@@ -2119,7 +2964,7 @@ class NotesDialog(P5FluidPanel):
     def _debounced_autosave(self) -> None:
         if not self._dirty:
             return
-        if self.title_edit.text().strip() or self.content_edit.toPlainText().strip():
+        if self.title_edit.text().strip() or self._current_plain_text().strip():
             if self._save(silent=True):
                 self.refresh()
                 self.status.setText(f"Auto-saved · {datetime.now():%H:%M}")
@@ -2127,10 +2972,10 @@ class NotesDialog(P5FluidPanel):
     # -- Notes -> Tasks bridge & Clipboard --------------------------------------
     def _promote_to_task(self) -> None:
         """Convert highlighted text (or current note title) into a real Task in Tasks."""
-        sel = self.content_edit.textCursor().selectedText().replace("\u2029", " ").strip()
+        sel = self._active_editor().textCursor().selectedText().replace("\u2029", " ").strip()
         if sel:
             # Strip leading markdown list/checkbox markers cleanly
-            for prefix in ("- [ ] ", "[ ] ", "- ", "• ", "* "):
+            for prefix in ("- [ ] ", "- [x] ", "- [X] ", "[ ] ", "- ", "• ", "* "):
                 if sel.startswith(prefix):
                     sel = sel[len(prefix):].strip()
                     break
@@ -2138,7 +2983,7 @@ class NotesDialog(P5FluidPanel):
         else:
             title = self.title_edit.text().strip()
             if not title:
-                first_line = (self.content_edit.toPlainText().strip().splitlines() or [""])[0].strip()
+                first_line = (self._current_plain_text().strip().splitlines() or [""])[0].strip()
                 title = first_line[:120]
         if not title:
             self.status.setText("Write or highlight something first to send to Tasks.")
@@ -2177,7 +3022,7 @@ class NotesDialog(P5FluidPanel):
 
     def _copy_markdown(self) -> None:
         title = self.title_edit.text().strip()
-        body = self.content_edit.toPlainText().strip()
+        body = self._current_markdown().strip()
         payload = f"# {title}\n\n{body}".strip() if title else body
         if not payload:
             self.status.setText("Nothing to copy yet.")
@@ -2190,8 +3035,18 @@ class NotesDialog(P5FluidPanel):
     # -- note list ---------------------------------------------------------------
     def _card_meta(self, note: dict) -> tuple[str, str, str, list[str]]:
         raw = note.get("content") or ""
-        # Strip basic markdown prefixes for crisp 2-line preview
-        clean_lines = [ln.lstrip("#>-•* ").strip() for ln in raw.splitlines() if ln.strip()]
+        # Strip Markdown prefixes & inline formatting tokens for crisp 2-line preview cards
+        clean_lines = []
+        for ln in raw.splitlines():
+            s = ln.strip()
+            if not s or s in ("---", "***", "- - -"):
+                continue
+            s = re.sub(r"^(?:[-*+]\s+\[[ xX]\]\s+|\[[ xX]\]\s+|#{1,6}\s+|[>\-•*]+\s+)", "", s)
+            s = re.sub(r"\*\*([^*]+)\*\*|__([^_]+)__|~~([^~]+)~~|`([^`]+)`|\*([^*]+)\*",
+                       lambda m: next(g for g in m.groups() if g is not None), s)
+            s = s.strip()
+            if s:
+                clean_lines.append(s)
         preview = " ".join(clean_lines)[:95] or "Empty note"
         date_txt = _fmt_short_date(note.get("updated") or note.get("created"))
         tags = self.store.note_tags(note)
@@ -2297,8 +3152,14 @@ class NotesDialog(P5FluidPanel):
         self._sync_category_ui()
         self.title_edit.setText(note.get("title", ""))
         self.title_edit.setCursorPosition(0)
-        self.content_edit.setPlainText(note.get("content", ""))
+        body = note.get("content", "")
+        self.content_edit.set_markdown_content(body)
+        if self._raw_mode:
+            self.raw_edit.blockSignals(True)
+            self.raw_edit.setPlainText(body)
+            self.raw_edit.blockSignals(False)
         self._update_word_and_tag_meta()
+        self._sync_toolbar_state()
 
         # Legacy deadline banner for smooth transition from v1.1/v1.2 notes
         dl = parse_dt(note.get("deadline"))
@@ -2315,8 +3176,6 @@ class NotesDialog(P5FluidPanel):
         self._sync_flags_ui(bool(note.get("pinned")), bool(note.get("archived")))
         self._loading = False
         self._dirty = False
-        if self._preview_mode:
-            self._render_preview()
         upd = _fmt_short_date(note.get("updated") or note.get("created"))
         self.status.setText(f"Updated {upd}" if upd else "Auto-saves as you type")
 
@@ -2324,7 +3183,7 @@ class NotesDialog(P5FluidPanel):
         self._autosave_timer.stop()
         if self._dirty:
             self._save(silent=True)
-        self._set_preview_mode(False)
+        self._set_raw_mode(False)
         self._loading = True
         self._current_id = None
         tmpl_title, tmpl_body, tmpl_cat = NOTE_TEMPLATES.get(template_key, NOTE_TEMPLATES["blank"])
@@ -2333,8 +3192,12 @@ class NotesDialog(P5FluidPanel):
         self._sync_category_ui()
         final_title = (custom_title or "").strip() or (tmpl_title.format(date=date_str) if tmpl_title else "")
         self.title_edit.setText(final_title)
-        self.content_edit.setPlainText(tmpl_body)
+        self.content_edit.set_markdown_content(tmpl_body)
+        self.raw_edit.blockSignals(True)
+        self.raw_edit.setPlainText(tmpl_body)
+        self.raw_edit.blockSignals(False)
         self._update_word_and_tag_meta()
+        self._sync_toolbar_state()
         self._legacy_dl_note_id = None
         self._legacy_bar.setVisible(False)
         for btn in (self._pin_btn, self._arch_btn, self._del_btn):
@@ -2383,7 +3246,7 @@ class NotesDialog(P5FluidPanel):
         silent = silent is True
         self._autosave_timer.stop()
         title = self.title_edit.text().strip()
-        content = self.content_edit.toPlainText().strip()
+        content = self._current_markdown().strip()
         if not title and not content:
             if not silent:
                 self.status.setText("Add a title or content first.")

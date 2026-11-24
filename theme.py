@@ -354,18 +354,23 @@ QTextEdit#noteBody {{
     color: #EAEAF0;
 }}
 QTextEdit#noteBody:focus {{
+    background-color: #121217;
     border: 1px solid #4A1921;
 }}
-QTextBrowser#notePreview {{
-    background-color: #121217;
+QTextEdit#noteRaw {{
+    background-color: #101015;
     border: 1px solid #2C2C3A;
     border-radius: 8px;
-    padding: 10px 14px;
-    font-size: {inp}px;
-    color: #EAEAF2;
-    font-family: "Arsenal", "Optima", "Segoe UI", sans-serif;
+    padding: 8px 10px;
+    font-size: {srch}px;
+    color: #D8D8E6;
+    font-family: "Cascadia Mono", "Consolas", "JetBrains Mono", "DejaVu Sans Mono", monospace;
     selection-background-color: #E60012;
     selection-color: #FFFFFF;
+}}
+QTextEdit#noteRaw:focus {{
+    background-color: #101015;
+    border: 1px solid #FAD02C;
 }}
 QListWidget {{
     background-color: transparent;
