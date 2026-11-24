@@ -174,7 +174,7 @@ _TITLE_RULES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("writing", "Docs", ("google docs", "google sheets", "google slides", "notion", "medium",
                          "substack", "wordpress", "grammarly")),
     ("creative", "Design", ("figma", "canva", "dribbble", "behance", "photopea", "excalidraw", "miro")),
-    ("meeting", "Meeting", ("google meet", "zoom meeting", "microsoft teams", "webex")),
+    ("meeting", "Meeting", ("google meet", "zoom meeting", "microsoft teams", "webex", "jitsi meet", "huddle")),
     ("media", "YouTube", ("youtube",)),
     ("media", "Twitch", ("twitch",)),
     ("media", "Netflix", ("netflix", "disney+", "crunchyroll", "bilibili", "prime video", "spotify", "soundcloud")),
@@ -186,7 +186,7 @@ _TITLE_RULES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
 
 _SELF_TITLES = frozenset({
     "morgana", "morgana companion", "tasks", "notes", "events", "social stats",
-    "timer", "settings", "daily briefing",
+    "timer", "settings", "daily briefing", "evening wrap-up", "ask & command", "quick command",
 })
 
 _STRIP_SUFFIXES = (
@@ -275,6 +275,7 @@ class ActiveWindowInfo:
     display_name: str
     pid: int = 0
     topic: str = ""
+    is_fullscreen: bool = False
 
     @property
     def phrase(self) -> str:
@@ -298,7 +299,8 @@ def format_duration(seconds: float) -> str:
     return f"{m}m"
 
 
-def classify_window(process: str, title: str, pid: int = 0) -> ActiveWindowInfo | None:
+def classify_window(process: str, title: str, pid: int = 0,
+                    is_fullscreen: bool = False) -> ActiveWindowInfo | None:
     """Classify a foreground `(process, title)` pair into an `ActiveWindowInfo`.
 
     Returns `None` for Morgana Companion's own windows or empty desktop chrome.
@@ -321,7 +323,10 @@ def classify_window(process: str, title: str, pid: int = 0) -> ActiveWindowInfo 
 
     def _make(cat: str, label: str) -> ActiveWindowInfo:
         topic = extract_window_topic(stem, clean_title, label, cat)
-        return ActiveWindowInfo(stem or "app", clean_title, cat, label, pid, topic=topic)
+        return ActiveWindowInfo(
+            stem or "app", clean_title, cat, label, pid,
+            topic=topic, is_fullscreen=bool(is_fullscreen),
+        )
 
     # 1) Browsers: inspect page title first for specific activity (GitHub, YouTube, Study, etc.)
     if stem in _BROWSER_PROCS:
@@ -348,7 +353,69 @@ def classify_window(process: str, title: str, pid: int = 0) -> ActiveWindowInfo 
 # ---------------------------------------------------------------------------
 # OS-level foreground window & idle-time inspection
 # ---------------------------------------------------------------------------
-def _win32_active_window() -> tuple[str, str, int] | None:
+_WIN32_SHELL_CLASSES = frozenset({
+    "progman", "workerw", "shell_traywnd", "shell_secondarytraywnd", "windows.ui.core.corewindow",
+})
+
+
+def _win32_is_fullscreen(user32, hwnd) -> bool:
+    """Return True if `hwnd` covers its full monitor or Windows reports Presentation/Fullscreen state."""
+    import ctypes
+    from ctypes import wintypes
+
+    try:
+        # 1) Windows Shell notification state (catches D3D fullscreen games & PowerPoint presentation mode)
+        state = ctypes.c_int(0)
+        if ctypes.windll.shell32.SHQueryUserNotificationState(ctypes.byref(state)) == 0:
+            # 2=QUNS_BUSY, 3=QUNS_RUNNING_D3D_FULL_SCREEN, 4=QUNS_PRESENTATION_MODE
+            if state.value in (2, 3, 4):
+                return True
+    except Exception:
+        pass
+
+    try:
+        # 2) Foreground window rect vs monitor rect (exclude desktop shell chrome)
+        cls_buf = ctypes.create_unicode_buffer(64)
+        user32.GetClassNameW(hwnd, cls_buf, len(cls_buf))
+        if cls_buf.value.strip().lower() in _WIN32_SHELL_CLASSES:
+            return False
+
+        wrect = wintypes.RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(wrect)):
+            return False
+
+        MONITOR_DEFAULTTONEAREST = 2
+        hmon = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+        if not hmon:
+            return False
+
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD),
+                ("rcMonitor", wintypes.RECT),
+                ("rcWork", wintypes.RECT),
+                ("dwFlags", wintypes.DWORD),
+            ]
+
+        mi = MONITORINFO()
+        mi.cbSize = ctypes.sizeof(MONITORINFO)
+        if not user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+            return False
+        m = mi.rcMonitor
+        if (m.right - m.left) <= 0 or (m.bottom - m.top) <= 0:
+            return False
+        tol = 2
+        return (
+            wrect.left <= m.left + tol
+            and wrect.top <= m.top + tol
+            and wrect.right >= m.right - tol
+            and wrect.bottom >= m.bottom - tol
+        )
+    except Exception:
+        return False
+
+
+def _win32_active_window() -> tuple[str, str, int, bool] | None:
     try:
         import ctypes
         from ctypes import wintypes
@@ -380,12 +447,13 @@ def _win32_active_window() -> tuple[str, str, int] | None:
                         proc_name = pbuf.value
                 finally:
                     kernel32.CloseHandle(hproc)
-        return proc_name, title, int(pid.value)
+        is_fs = _win32_is_fullscreen(user32, hwnd)
+        return proc_name, title, int(pid.value), is_fs
     except Exception:
         return None
 
 
-def _linux_active_window() -> tuple[str, str, int] | None:
+def _linux_active_window() -> tuple[str, str, int, bool] | None:
     if not os.environ.get("DISPLAY") or not shutil.which("xprop"):
         return None
     try:
@@ -398,7 +466,7 @@ def _linux_active_window() -> tuple[str, str, int] | None:
             return None
         wid = m.group(0)
         r2 = subprocess.run(
-            ["xprop", "-id", wid, "WM_CLASS", "_NET_WM_NAME", "WM_NAME", "_NET_WM_PID"],
+            ["xprop", "-id", wid, "WM_CLASS", "_NET_WM_NAME", "WM_NAME", "_NET_WM_PID", "_NET_WM_STATE"],
             capture_output=True, text=True, timeout=0.4, check=False,
         )
         out = r2.stdout or ""
@@ -416,7 +484,8 @@ def _linux_active_window() -> tuple[str, str, int] | None:
         mp = re.search(r"_NET_WM_PID\(CARDINAL\)\s*=\s*(\d+)", out)
         if mp:
             pid = int(mp.group(1))
-        return proc_name, title, pid
+        is_fs = "_NET_WM_STATE_FULLSCREEN" in out
+        return proc_name, title, pid, is_fs
     except Exception:
         return None
 
@@ -430,7 +499,7 @@ def get_active_window() -> ActiveWindowInfo | None:
         raw = _linux_active_window()
     if raw is None:
         return None
-    return classify_window(raw[0], raw[1], raw[2])
+    return classify_window(raw[0], raw[1], raw[2], is_fullscreen=raw[3])
 
 
 def _win32_idle_seconds() -> float | None:
