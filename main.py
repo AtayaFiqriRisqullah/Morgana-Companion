@@ -467,8 +467,8 @@ class PetWindow(QWidget):
 
     def visual_bottom(self) -> int:
         if self._hud or self._badge:
-            return self.y() + self.hud_top_local() + self.hud_height() + 5
-        return self.y() + PAD + int(round(self._sprite_size * 0.95)) + 3
+            return self.y() + self.hud_top_local() + self.hud_height() + 2
+        return self.y() + PAD + int(round(self._sprite_size * 0.93))
 
     def set_state(self, state: str, emotion: str | None = None) -> None:
         """Ganti gaya gerak (state) dan ekspresi wajah. Tanpa `emotion`, dipakai ekspresi dasar state."""
@@ -1065,21 +1065,41 @@ class BubbleWindow(QWidget):
         w = self.width()
         tag_over = 0 if self._use_img else self.TAG_OVER
         shadow = 0 if self._use_img else self.SHADOW
-        gap = 8
+        gap = 4
+        menu_open = self._menu is not None and self._menu.is_open
+        has_hud = bool(self._pet._hud or self._pet._badge)
 
         # Default: strictly BELOW Morgana (clearing HUD badge AND open radial menu wedges)
         bottom_barrier = self._pet.visual_bottom()
         top_barrier = self._pet.visual_top()
-        if self._menu is not None and self._menu.is_open:
+        if menu_open:
             bottom_barrier = max(bottom_barrier, self._menu.wedges_global_bottom())
             top_barrier = min(top_barrier, self._menu.wedges_global_top())
 
         vis_top_below = self.M + (self._tail_h if not self._use_img else 0)
         vis_bot_below = self.M + tag_over + self._tail_h + self._bh + shadow
-        y_below = bottom_barrier + gap - vis_top_below
-
         vis_top_above = self.M
         vis_bot_above = self.M + tag_over + self._bh + self._tail_h + shadow
+        vis_h = self._bh + tag_over + shadow
+
+        x = max(area.left(), min(center.x() - w // 2, area.right() - w))
+
+        def _optical_tuck(cand_x: int) -> int:
+            """Tuck slightly into textbox.png's transparent top-center notch ONLY when the
+            left-side tilted MORGANA nameplate stays completely clear of Morgana & HUD."""
+            if not self._use_img or menu_open:
+                return 0
+            nameplate_right = cand_x + self.M + int(round(212.0 * self._s))
+            if has_hud:
+                hud_left = center.x() - int(round(92.0 * self._ui_scale))
+                return int(round(14.0 * self._s)) if nameplate_right <= hud_left else 0
+            pet_left = center.x() - int(round(self._pet.sprite_size * 0.34))
+            return int(round(20.0 * self._s)) if nameplate_right <= pet_left else 0
+
+        def _y_below_for(cand_x: int) -> int:
+            return bottom_barrier + gap - vis_top_below - _optical_tuck(cand_x)
+
+        y_below = _y_below_for(x)
         y_above = top_barrier - gap - vis_bot_above
 
         if y_below + vis_bot_below <= area.bottom() - 4:
@@ -1089,31 +1109,69 @@ class BubbleWindow(QWidget):
             self._below = False
             y = y_above
         else:
-            # Tiny screen fallback: pick whichever side has more open space
             space_below = area.bottom() - bottom_barrier
             space_above = top_barrier - area.top()
             self._below = space_below >= space_above
             y = max(area.top() - vis_top_above,
                     min(y_below if self._below else y_above, area.bottom() - vis_bot_below))
 
-        x = center.x() - w // 2
-        x = max(area.left(), min(x, area.right() - w))
+        # Avoid overlapping open dialog windows while STAYING TETHERED to Morgana
+        # (never teleport across a wide dialog far away from Morgana).
+        obstacles = self._avoid_rects_fn() if self._avoid_rects_fn is not None else []
+        if obstacles:
+            def _tethered(cand_x: int) -> bool:
+                left_e = cand_x + self.M
+                right_e = left_e + self._bw + shadow
+                return (left_e - 24) <= center.x() <= (right_e + 24)
 
-        # Avoid overlapping any open dialog window horizontally when space permits
-        if self._avoid_rects_fn is not None:
-            vis_y = y + (vis_top_below if self._below else vis_top_above)
-            vis_h = self._bh + tag_over + shadow
-            cand = QRect(x + self.M, vis_y, self._bw + shadow, vis_h)
-            for obstacle in self._avoid_rects_fn():
-                if cand.intersects(obstacle):
-                    # Try shifting clear to the right of the dialog, else to the left
-                    rx = obstacle.right() + gap - self.M
-                    lx = obstacle.left() - gap - self._bw - shadow - self.M
-                    if rx + w <= area.right() and not QRect(rx + self.M, vis_y, self._bw + shadow, vis_h).intersects(obstacle):
-                        x = rx
-                    elif lx >= area.left() and not QRect(lx + self.M, vis_y, self._bw + shadow, vis_h).intersects(obstacle):
-                        x = lx
-                    break
+            def _vis_rect(cand_x: int, cand_y: int, below: bool) -> QRect:
+                vy = cand_y + (vis_top_below if below else vis_top_above)
+                return QRect(cand_x + self.M, vy, self._bw + shadow, vis_h)
+
+            def _clear(cand_x: int, cand_y: int, below: bool) -> bool:
+                if cand_x < area.left() or cand_x + w > area.right():
+                    return False
+                if below and cand_y + vis_bot_below > area.bottom() - 2:
+                    return False
+                if not below and cand_y + vis_top_above < area.top() + 2:
+                    return False
+                vr = _vis_rect(cand_x, cand_y, below)
+                return all(not vr.intersects(ob) for ob in obstacles)
+
+            if not _clear(x, y, self._below):
+                hit = next((ob for ob in obstacles if _vis_rect(x, y, self._below).intersects(ob)), None)
+                placed = False
+                if hit is not None:
+                    rx = hit.right() + gap - self.M
+                    lx = hit.left() - gap - self._bw - shadow - self.M
+                    # 1) Try small tethered horizontal shift on the current vertical side
+                    for cx in (rx, lx):
+                        if _tethered(cx):
+                            cy = _y_below_for(cx) if self._below else y_above
+                            if _clear(cx, cy, self._below):
+                                x, y = cx, cy
+                                placed = True
+                                break
+                    # 2) Try flipping to the opposite side of Morgana (above <-> below)
+                    if not placed:
+                        alt_below = not self._below
+                        for cx in (x, rx, lx):
+                            if _tethered(cx):
+                                cy = _y_below_for(cx) if alt_below else y_above
+                                if _clear(cx, cy, alt_below):
+                                    x, y, self._below = cx, cy, alt_below
+                                    placed = True
+                                    break
+                    # 3) Fallback: stay tightly anchored to Morgana, nudged cleanly away from dialog
+                    if not placed:
+                        if center.x() >= hit.center().x():
+                            cx = min(area.right() - w, max(x, rx))
+                        else:
+                            cx = max(area.left(), min(x, lx))
+                        if _tethered(cx):
+                            x = cx
+                            if self._below:
+                                y = min(_y_below_for(x), area.bottom() - vis_bot_below)
 
         self._tail_x = max(self.M + 24, min(center.x() - x, w - self.M - self.SHADOW - 34))
         self.move(x, y)
@@ -1569,7 +1627,7 @@ class RadialMenu(QWidget):
             poly = self._geom[b.key][3]
             for hv in (0.0, 1.0):
                 br = self._xf(b, pop=1.0, hover=hv, wobble=False).map(poly).boundingRect()
-                max_y = max(max_y, br.bottom() + 10.0 * u)
+                max_y = max(max_y, br.bottom() + 4.0 * u)
         return self.y() + int(math.ceil(max_y))
 
     def wedges_global_top(self) -> int:
