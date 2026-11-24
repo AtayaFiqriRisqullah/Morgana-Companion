@@ -108,20 +108,30 @@ class JsonListStore:
 
 
 class TaskStore(JsonListStore):
-    """Tugas: {"id", "title", "done", "priority", "deadline", "notified", "rewarded", "created", "done_at"}."""
+    """Tugas: {"id", "title", "done", "priority", "stat", "deadline", "notified", "rewarded", "created", "done_at"}."""
+
+    @staticmethod
+    def stat_of(task: dict | None) -> str:
+        """Return valid Social Stat key for a task (defaults to 'proficiency' for legacy tasks)."""
+        raw = str((task or {}).get("stat") or "").strip().lower()
+        return raw if raw in SOCIAL_STATS else "proficiency"
 
     def add(self, title: str, priority: str = "normal",
-            deadline: datetime | None = None) -> dict | None:
+            deadline: datetime | None = None,
+            stat: str = "proficiency") -> dict | None:
         title = (title or "").strip()
         if not title:
             return None
         prio = "high" if priority == "high" else "normal"
+        st = (stat or "").strip().lower()
+        st = st if st in SOCIAL_STATS else "proficiency"
         dl_str = deadline.isoformat(timespec="minutes") if deadline else None
         task = {
             "id": uuid.uuid4().hex[:12],
             "title": title,
             "done": False,
             "priority": prio,
+            "stat": st,
             "deadline": dl_str,
             "notified": False,
             "rewarded": False,
@@ -137,6 +147,15 @@ class TaskStore(JsonListStore):
         if task is None:
             return False
         task["priority"] = "high" if priority == "high" else "normal"
+        self.save()
+        return True
+
+    def set_stat(self, task_id: str, stat: str) -> bool:
+        task = self.get(task_id)
+        st = (stat or "").strip().lower()
+        if task is None or st not in SOCIAL_STATS:
+            return False
+        task["stat"] = st
         self.save()
         return True
 

@@ -812,7 +812,7 @@ class TaskRowDelegate(QStyledItemDelegate):
         painter.drawText(QPointF(tx, card.top() + 10 + fm.ascent()),
                          fm.elidedText(title, Qt.TextElideMode.ElideRight, int(tw)))
 
-        # Second line: optional HIGH chip + status chip + optional DUE/OVERDUE chip + creation time
+        # Second line: optional HIGH chip + Social Stat chip + DUE/status chip + creation time
         sc = self._sc
         ph = 16.0 * sc
         py = card.top() + 33.0 * sc
@@ -828,6 +828,18 @@ class TaskRowDelegate(QStyledItemDelegate):
             painter.setPen(P5_RED_FG)
             painter.drawText(pill, Qt.AlignmentFlag.AlignCenter.value, "HIGH")
             x_cur = pill.right() + 6
+
+        stat_short = index.data(ROLE_CAT) or ""
+        if stat_short:
+            stw = pfm.horizontalAdvance(stat_short) + 12.0 * sc
+            stpill = QRectF(x_cur, py, stw, ph)
+            painter.setPen(QPen(QColor("#524518") if not done else P5_BORDER, 0.9))
+            painter.setBrush(QColor("#221C09") if not done else P5_BG)
+            painter.drawRoundedRect(stpill, 4.0, 4.0)
+            painter.setFont(self._pill_font)
+            painter.setPen(GOLD if not done else P5_MUTED)
+            painter.drawText(stpill, Qt.AlignmentFlag.AlignCenter.value, stat_short)
+            x_cur = stpill.right() + 6
 
         if due_txt and not done:
             dw = pfm.horizontalAdvance(due_txt) + 14.0 * sc
@@ -1067,17 +1079,21 @@ class TasksDialog(P5FluidPanel):
     task_reward_eligible = pyqtSignal(str)    # emits task_id when marked done
 
     def __init__(self, store: TaskStore, on_top: bool = True, ui_scale: float = 1.0) -> None:
-        super().__init__("TASKS", QSize(535, 635), on_top=on_top, ui_scale=ui_scale)
+        super().__init__("TASKS", QSize(560, 660), on_top=on_top, ui_scale=ui_scale)
         sc = self._ui_scale
         self.store = store
         self._filter = "all"
         self._new_high = False
         self._new_due_on = False
+        self._new_stat = "proficiency"
         self._undo_items: list[dict] = []
 
         # Header quick actions
         self._count_lbl = QLabel("")
-        self._count_lbl.setObjectName("subhead")
+        self._count_lbl.setStyleSheet(
+            f'color: #FFE46B; font-family: "Barlow Condensed", "Anton", sans-serif; '
+            f'font-size: {_sc(12, sc, 10)}px; font-weight: 800; letter-spacing: 0.5px;'
+        )
         self.header_bar.addWidget(self._count_lbl)
 
         self._notes_btn = self._btn("NOTES", variant="soft", display=True, px=10)
@@ -1119,6 +1135,37 @@ class TasksDialog(P5FluidPanel):
         add_btn.clicked.connect(self._add)
         add_row.addWidget(add_btn)
         self.body.addLayout(add_row)
+
+        # Social Stat selector strip for new tasks (KNO / GUT / PRO / CHA / KIN)
+        stat_row = QHBoxLayout()
+        stat_row.setSpacing(_sc(4, sc, 3))
+        st_lbl = QLabel("STAT")
+        st_lbl.setStyleSheet(
+            f'color: #FAD02C; font-family: "Barlow Condensed", "Anton", sans-serif; '
+            f'font-size: {_sc(11, sc, 9)}px; font-weight: 800; letter-spacing: 0.6px;'
+        )
+        stat_row.addWidget(st_lbl)
+        self._stat_chips: dict[str, P5FluidButton] = {}
+        stat_tips = {
+            "knowledge": "Knowledge — study, reading, research",
+            "guts": "Guts — tough chores, workouts, facing delays",
+            "proficiency": "Proficiency — coding, craft, work tasks",
+            "charm": "Charm — design, communication, presentations",
+            "kindness": "Kindness — helping others, self-care, organizing",
+        }
+        for sk in ("knowledge", "guts", "proficiency", "charm", "kindness"):
+            sb = self._btn(SOCIAL_STATS[sk]["short"], variant="soft", display=True, px=9)
+            sb.setFixedHeight(_sc(24, sc, 20))
+            sb.setToolTip(stat_tips.get(sk, SOCIAL_STATS[sk]["label"]))
+            sb.clicked.connect(lambda _c=False, k=sk: self._set_new_stat(k))
+            self._stat_chips[sk] = sb
+            stat_row.addWidget(sb)
+        self._stat_chips[self._new_stat].set_active(True, active_variant="gold")
+        stat_row.addStretch(1)
+        self._stat_hint_lbl = QLabel("Proficiency")
+        self._stat_hint_lbl.setObjectName("tip")
+        stat_row.addWidget(self._stat_hint_lbl)
+        self.body.addLayout(stat_row)
 
         # Collapsible inline deadline card (applies to new task OR selected task(s))
         self._due_box = _make_card("subcard")
@@ -1198,6 +1245,8 @@ class TasksDialog(P5FluidPanel):
         self.list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.list.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked
                                   | QAbstractItemView.EditTrigger.EditKeyPressed)
+        self.list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.list.customContextMenuRequested.connect(self._open_task_context_menu)
         self._delegate = TaskRowDelegate(self.list, scale=sc)
         self.list.setItemDelegate(self._delegate)
         self.list.itemChanged.connect(self._on_item_changed)
@@ -1213,25 +1262,32 @@ class TasksDialog(P5FluidPanel):
 
         # Footer actions
         foot = QHBoxLayout()
-        foot.setSpacing(6)
-        tip = QLabel("Space: done · F2: rename · Del")
+        foot.setSpacing(_sc(5, sc, 4))
+        tip = QLabel("Space: done · Right-click: stat")
         tip.setObjectName("tip")
         foot.addWidget(tip, 1)
 
-        tog_due = self._btn("SET DUE", variant="soft", icon="clock", display=True, px=9)
+        tog_due = self._btn("DUE", variant="soft", icon="clock", display=True, px=9)
         tog_due.setFixedHeight(_sc(28, sc, 24))
-        tog_due.setToolTip("Open deadline bar to set or clear deadline on selected task(s)")
+        tog_due.setToolTip("Set or clear deadline on selected task(s)")
         tog_due.clicked.connect(self._open_due_for_selected)
         foot.addWidget(tog_due)
 
-        tog_prio = self._btn("PRIORITY", variant="gold", icon="bolt", display=True, px=9)
+        self._set_stat_btn = self._btn("STAT ▾", variant="gold", display=True, px=9)
+        self._set_stat_btn.setFixedHeight(_sc(28, sc, 24))
+        self._set_stat_btn.setToolTip("Change Social Stat type for selected task(s)")
+        self._set_stat_btn.clicked.connect(self._open_stat_menu_for_selected)
+        foot.addWidget(self._set_stat_btn)
+
+        tog_prio = self._btn("PRIO", variant="soft", icon="bolt", display=True, px=9)
         tog_prio.setFixedHeight(_sc(28, sc, 24))
         tog_prio.setToolTip("Toggle High priority on selected task(s)")
         tog_prio.clicked.connect(self._toggle_selected_priority)
         foot.addWidget(tog_prio)
 
-        del_btn = self._btn("DELETE", variant="danger", display=True, px=9)
+        del_btn = self._btn("DEL", variant="danger", display=True, px=9)
         del_btn.setFixedHeight(_sc(28, sc, 24))
+        del_btn.setToolTip("Delete selected task(s) (Del)")
         del_btn.clicked.connect(self._delete_selected)
         foot.addWidget(del_btn)
 
@@ -1257,6 +1313,57 @@ class TasksDialog(P5FluidPanel):
 
     def on_shown(self) -> None:
         QTimer.singleShot(20, self.input.setFocus)
+
+    def _set_new_stat(self, stat_key: str) -> None:
+        if stat_key not in SOCIAL_STATS:
+            return
+        self._new_stat = stat_key
+        for k, btn in self._stat_chips.items():
+            btn.set_active(k == stat_key, active_variant="gold")
+        self._stat_hint_lbl.setText(SOCIAL_STATS[stat_key]["label"])
+
+    def _apply_stat_to_selected(self, stat_key: str) -> None:
+        changed = False
+        for item in self.list.selectedItems():
+            tid = item.data(ROLE_ID)
+            if tid and self.store.set_stat(tid, stat_key):
+                changed = True
+        if changed:
+            self.refresh()
+            self.tasks_changed.emit()
+
+    def _open_stat_menu_for_selected(self) -> None:
+        sel = [i for i in self.list.selectedItems() if i.data(ROLE_ID)]
+        m = QMenu(self)
+        m.setStyleSheet(menu_qss(self._ui_scale))
+        for sk in ("knowledge", "guts", "proficiency", "charm", "kindness"):
+            meta = SOCIAL_STATS[sk]
+            if sel:
+                m.addAction(f"{meta['short']} · {meta['label']}", lambda k=sk: self._apply_stat_to_selected(k))
+            else:
+                m.addAction(f"{meta['short']} · {meta['label']} (new task)", lambda k=sk: self._set_new_stat(k))
+        pos = self._set_stat_btn.mapToGlobal(QPoint(0, -m.sizeHint().height() - 4))
+        m.exec(pos)
+
+    def _open_task_context_menu(self, pos: QPoint) -> None:
+        item = self.list.itemAt(pos)
+        if item is None or item.data(ROLE_ID) is None:
+            return
+        if not item.isSelected():
+            self.list.clearSelection()
+            item.setSelected(True)
+        m = QMenu(self)
+        m.setStyleSheet(menu_qss(self._ui_scale))
+        stat_sub = m.addMenu("SOCIAL STAT")
+        stat_sub.setStyleSheet(menu_qss(self._ui_scale))
+        for sk in ("knowledge", "guts", "proficiency", "charm", "kindness"):
+            meta = SOCIAL_STATS[sk]
+            stat_sub.addAction(f"{meta['short']} · {meta['label']}", lambda k=sk: self._apply_stat_to_selected(k))
+        m.addAction("TOGGLE PRIORITY", self._toggle_selected_priority)
+        m.addAction("SET DEADLINE...", self._open_due_for_selected)
+        m.addSeparator()
+        m.addAction("DELETE", self._delete_selected)
+        m.exec(self.list.viewport().mapToGlobal(pos))
 
     def _toggle_new_priority(self) -> None:
         self._new_high = not self._new_high
@@ -1393,12 +1500,14 @@ class TasksDialog(P5FluidPanel):
             self.list.addItem(_hint_item(msg))
         for t in shown:
             badge_txt, is_overdue = self._due_badge(t, now)
+            stat_k = self.store.stat_of(t)
             item = QListWidgetItem(t.get("title", ""))
             item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
                           | Qt.ItemFlag.ItemIsEditable)
             item.setData(ROLE_ID, t["id"])
             item.setData(ROLE_DONE, bool(t.get("done")))
             item.setData(ROLE_FLAG, t.get("priority") == "high")
+            item.setData(ROLE_CAT, SOCIAL_STATS[stat_k]["short"])
             item.setData(ROLE_BADGE, badge_txt)
             item.setData(ROLE_OVERDUE, is_overdue)
             item.setData(ROLE_DATE, _fmt_time_12h(t.get("created")))
@@ -1412,6 +1521,7 @@ class TasksDialog(P5FluidPanel):
             self.input.text(),
             priority="high" if self._new_high else "normal",
             deadline=dl,
+            stat=self._new_stat,
         )
         if task is None:
             return
@@ -1842,9 +1952,9 @@ class NotesDialog(P5FluidPanel):
         self.refresh()
 
     # -- public helper for Choice Prompts / Templates ----------------------------
-    def create_from_template(self, template_key: str) -> None:
-        """Open a fresh note pre-filled from `NOTE_TEMPLATES[template_key]`."""
-        self._new(template_key=template_key)
+    def create_from_template(self, template_key: str, title: str = "") -> None:
+        """Open a fresh note pre-filled from `NOTE_TEMPLATES[template_key]` with optional custom title."""
+        self._new(template_key=template_key, custom_title=title)
 
     def _open_template_menu(self) -> None:
         m = QMenu(self)
@@ -2210,7 +2320,7 @@ class NotesDialog(P5FluidPanel):
         upd = _fmt_short_date(note.get("updated") or note.get("created"))
         self.status.setText(f"Updated {upd}" if upd else "Auto-saves as you type")
 
-    def _new(self, template_key: str = "blank") -> None:
+    def _new(self, template_key: str = "blank", custom_title: str = "") -> None:
         self._autosave_timer.stop()
         if self._dirty:
             self._save(silent=True)
@@ -2221,7 +2331,8 @@ class NotesDialog(P5FluidPanel):
         date_str = datetime.now().strftime("%d %b %Y")
         self._category = tmpl_cat if tmpl_cat in NOTE_CATEGORIES else "Personal"
         self._sync_category_ui()
-        self.title_edit.setText(tmpl_title.format(date=date_str) if tmpl_title else "")
+        final_title = (custom_title or "").strip() or (tmpl_title.format(date=date_str) if tmpl_title else "")
+        self.title_edit.setText(final_title)
         self.content_edit.setPlainText(tmpl_body)
         self._update_word_and_tag_meta()
         self._legacy_dl_note_id = None
@@ -2230,14 +2341,14 @@ class NotesDialog(P5FluidPanel):
             btn.setEnabled(False)
         self._sync_flags_ui(False, False)
         self._loading = False
-        self._dirty = bool(tmpl_title or tmpl_body)
+        self._dirty = bool(final_title or tmpl_body)
         self.list.clearSelection()
         if self._filter == "archived":
             self._set_filter("all")
         else:
             self.refresh()
         self.status.setText("New note — auto-saves as you type")
-        if tmpl_body:
+        if tmpl_body or final_title:
             self._save(silent=True)
             self.refresh()
             self.content_edit.setFocus()
