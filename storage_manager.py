@@ -719,15 +719,51 @@ class SocialStatsStore(JsonListStore):
         new_lv = stat_level(self.total_for(stat))
         return entry, old_lv, new_lv
 
+    def update(self, entry_id: str, stat: str | None = None,
+               activity: str | None = None, points: int | None = None,
+               block: str | None = None) -> tuple[dict | None, dict | None]:
+        """Edit an existing stat log entry in place; returns (updated, previous_snapshot)."""
+        entry = self.get(entry_id)
+        if entry is None:
+            return None, None
+        prev = dict(entry)
+        new_stat = entry.get("stat", "knowledge")
+        if stat is not None:
+            if stat not in SOCIAL_STATS:
+                return None, None
+            new_stat = stat
+        new_pts = max(1, min(500, int(entry.get("points", DEFAULT_STAT_POINTS))))
+        if points is not None:
+            try:
+                new_pts = max(1, min(500, int(points)))
+            except (TypeError, ValueError):
+                return None, None
+        new_act = entry.get("activity", "")
+        if activity is not None:
+            new_act = (activity or "").strip() or (SOCIAL_STATS[new_stat]["label"] + " block")
+        new_blk = entry.get("block", default_time_block())
+        if block is not None and block in TIME_BLOCKS:
+            new_blk = block
+        entry["stat"] = new_stat
+        entry["points"] = new_pts
+        entry["activity"] = new_act
+        entry["block"] = new_blk
+        self.save()
+        return entry, prev
+
     def restore(self, entry: dict) -> dict | None:
         if not isinstance(entry, dict) or not entry.get("id"):
             return None
-        if self.get(entry["id"]) is None:
+        existing = self.get(entry["id"])
+        if existing is None:
             copy = dict(entry)
             self._items.append(copy)
             self.save()
             return copy
-        return None
+        existing.clear()
+        existing.update(dict(entry))
+        self.save()
+        return existing
 
     def total_for(self, stat: str) -> int:
         return sum(max(0, int(i.get("points", 0))) for i in self._items if i.get("stat") == stat)
@@ -954,6 +990,7 @@ QUICK_HOTKEY_PRESETS: tuple[str, ...] = (
     "Off",
 )
 AI_PROVIDER_PRESETS: tuple[str, ...] = ("gemini", "openai")
+FOCUS_STAT_OPTIONS: tuple[str, ...] = SOCIAL_STAT_KEYS + ("none",)
 
 SETTINGS_DEFAULTS = {
     "bedtime": "23:30",                 # bedtime reminder start
@@ -964,6 +1001,7 @@ SETTINGS_DEFAULTS = {
     "event_interval_min": 10,           # repeat interval for event reminders (min)
     "focus_min": 25,                    # Pomodoro focus duration (min)
     "rest_min": 5,                      # Pomodoro break duration (min)
+    "focus_stat": "knowledge",          # Social Stat rewarded when Focus finishes (or "none")
     "ui_scale": 100,                    # UI size percentage (75-150)
     "sound_enabled": True,              # Master audio toggle
     "sound_volume": 80,                 # Legacy master audio volume (kept for migration)
@@ -1130,6 +1168,9 @@ class SettingsStore:
                     self.data[key] = value.strip()
             elif key == "ai_provider":
                 if isinstance(value, str) and value.strip().lower() in AI_PROVIDER_PRESETS:
+                    self.data[key] = value.strip().lower()
+            elif key == "focus_stat":
+                if isinstance(value, str) and value.strip().lower() in FOCUS_STAT_OPTIONS:
                     self.data[key] = value.strip().lower()
             elif key in _STR_KEYS:
                 if isinstance(value, str):

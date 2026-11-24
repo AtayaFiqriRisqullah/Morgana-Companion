@@ -223,8 +223,18 @@ _EVENT_PREFIX_RE = re.compile(
     r"^(?:/?event|/?schedule|add\s+event|meeting|jadwal|acara)\s+(.+)$",
     re.IGNORECASE,
 )
+_FOCUS_STAT_ALIASES: dict[str, str] = {
+    "kno": "knowledge", "knowledge": "knowledge", "study": "knowledge", "belajar": "knowledge",
+    "gut": "guts", "guts": "guts",
+    "pro": "proficiency", "proficiency": "proficiency", "code": "proficiency", "coding": "proficiency", "work": "proficiency", "kerja": "proficiency",
+    "cha": "charm", "charm": "charm", "design": "charm",
+    "kin": "kindness", "kindness": "kindness",
+    "none": "none", "off": "none", "no": "none",
+}
 _FOCUS_RE = re.compile(
-    r"^(?:start\s+)?(?:/?focus|/?pomodoro|/?pomo|fokus)(?:\s+(\d{1,3})\s*(?:m|min|mins|menit)?)?$",
+    r"^(?:start\s+)?(?:/?focus|/?pomodoro|/?pomo|fokus)"
+    r"(?:\s+(\d{1,3})\s*(?:m|min|mins|menit)?)?"
+    r"(?:\s+([a-zA-Z]+))?$",
     re.IGNORECASE,
 )
 _BREAK_RE = re.compile(
@@ -612,19 +622,28 @@ def parse_and_plan(raw_text: str, ctx: dict | None = None,
 
     m_foc = _FOCUS_RE.match(text)
     if m_foc:
+        stat_tok = (m_foc.group(2) or "").strip().lower()
+        chosen_stat = _FOCUS_STAT_ALIASES.get(stat_tok, "")
+        if stat_tok and not chosen_stat:
+            m_foc = None
+    if m_foc:
         mins = int(m_foc.group(1)) if m_foc.group(1) else 0
         mins = max(1, min(180, mins)) if mins else 0
         lbl = f"{mins}-minute" if mins else "your default"
+        stat_note = (
+            " (no stat reward)" if chosen_stat == "none"
+            else (f" → +{chosen_stat.title()}" if chosen_stat else "")
+        )
         return CommandResult(
             kind="start_focus",
-            reply=f"Locking in! Starting {lbl} Focus sprint right now!",
+            reply=f"Locking in! Starting {lbl} Focus sprint{stat_note} right now!",
             emotion="excited",
             voice="uwooh",
             particle="sparkle",
             badge="FOCUS STARTED",
             action_label="OPEN TIMER",
             action_target="timer",
-            payload={"minutes": mins},
+            payload={"minutes": mins, "stat": chosen_stat},
         )
 
     m_brk = _BREAK_RE.match(text)

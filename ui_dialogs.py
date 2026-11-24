@@ -5371,6 +5371,7 @@ class SocialStatsDialog(P5FluidPanel):
     """Persona 5 Royal Social Stats tracker with progressive ranks, custom Daily Habits, and activity log."""
 
     stat_logged = pyqtSignal(str, str, int, int, int)             # stat, activity, pts, old_lv, new_lv
+    stats_changed = pyqtSignal()                                  # emitted on log edit, delete, or undo
     habit_toggled = pyqtSignal(str, bool, object, int, int)       # habit_id, now_done, stat_entry, old_lv, new_lv
     open_briefing = pyqtSignal()
     open_settings = pyqtSignal()
@@ -5389,6 +5390,7 @@ class SocialStatsDialog(P5FluidPanel):
         self._right_tab = "habits" if habits is not None else "log"
         self._undo_kind = ""
         self._undo_payload: dict | None = None
+        self._editing_log_id: str | None = None
 
         # Header bar
         self._blocks_hdr = QLabel("")
@@ -5602,15 +5604,15 @@ class SocialStatsDialog(P5FluidPanel):
         lpl.setContentsMargins(0, 0, 0, 0)
         lpl.setSpacing(_sc(8, sc, 6))
 
-        log_card = _make_card()
-        fl = QVBoxLayout(log_card)
+        self._log_card = _make_card()
+        fl = QVBoxLayout(self._log_card)
         fl.setContentsMargins(_sc(12, sc, 9), _sc(9, sc, 7), _sc(12, sc, 9), _sc(9, sc, 7))
         fl.setSpacing(_sc(6, sc, 5))
 
         f_hdr = QHBoxLayout()
-        h_lbl = QLabel("LOG TIME BLOCK (~2H)")
-        h_lbl.setObjectName("section")
-        f_hdr.addWidget(h_lbl)
+        self._log_hdr_lbl = QLabel("LOG TIME BLOCK (~2H)")
+        self._log_hdr_lbl.setObjectName("section")
+        f_hdr.addWidget(self._log_hdr_lbl)
         f_hdr.addStretch(1)
         self._pips_lbl = QLabel("")
         self._pips_lbl.setStyleSheet(
@@ -5658,6 +5660,13 @@ class SocialStatsDialog(P5FluidPanel):
         self._log_btn.setFixedHeight(_sc(30, sc, 25))
         self._log_btn.clicked.connect(self._log_activity)
         act_row.addWidget(self._log_btn)
+
+        self._cancel_edit_btn = self._btn("CANCEL", variant="soft", display=True, px=10)
+        self._cancel_edit_btn.setFixedHeight(_sc(30, sc, 25))
+        self._cancel_edit_btn.setToolTip("Cancel editing log entry (Esc)")
+        self._cancel_edit_btn.clicked.connect(self._cancel_edit)
+        self._cancel_edit_btn.setVisible(False)
+        act_row.addWidget(self._cancel_edit_btn)
         fl.addLayout(act_row)
 
         blk_row = QHBoxLayout()
@@ -5692,11 +5701,11 @@ class SocialStatsDialog(P5FluidPanel):
         self._pts_spin.setValue(DEFAULT_STAT_POINTS)
         self._pts_spin.setSuffix(" pts")
         self._pts_spin.setMinimumWidth(_sc(84, sc, 68))
-        self._pts_spin.setFixedHeight(_sc(25, sc, 21))
+        self._pts_spin.setFixedHeight(_sc(26, sc, 24))
         self._pts_spin.valueChanged.connect(self._on_points_changed)
         pts_row.addWidget(self._pts_spin)
         fl.addLayout(pts_row)
-        lpl.addWidget(log_card)
+        lpl.addWidget(self._log_card)
 
         hist_card = _make_card()
         hl = QVBoxLayout(hist_card)
@@ -5731,14 +5740,21 @@ class SocialStatsDialog(P5FluidPanel):
         self._log_list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self._log_list.setItemDelegate(StatLogDelegate(self._log_list, scale=sc))
         self._log_list.delete_pressed.connect(self._delete_selected)
+        self._log_list.itemDoubleClicked.connect(lambda _it: self._start_edit_selected())
         hl.addWidget(self._log_list, 1)
 
         h_foot = QHBoxLayout()
         h_foot.setSpacing(6)
         req_str = "/".join(str(x) for x in STAT_RANK_THRESHOLDS[1:])
-        tip = QLabel(f"Ranks: {req_str} pts · +{STAT_MASTERY_STEP} Mastery")
+        tip = QLabel(f"Double-click to edit · Ranks: {req_str} pts")
         tip.setObjectName("tip")
         h_foot.addWidget(tip, 1)
+
+        edit_btn = self._btn("EDIT", variant="gold", display=True, px=10)
+        edit_btn.setFixedHeight(_sc(26, sc, 22))
+        edit_btn.setToolTip("Edit selected log entry (stat, activity, block, points)")
+        edit_btn.clicked.connect(self._start_edit_selected)
+        h_foot.addWidget(edit_btn)
 
         del_btn = self._btn("DELETE", variant="danger", display=True, px=10)
         del_btn.setFixedHeight(_sc(26, sc, 22))
@@ -5814,13 +5830,24 @@ class SocialStatsDialog(P5FluidPanel):
     def _on_points_changed(self, value: int) -> None:
         for v, b in self._quick_pts_btns.items():
             b.set_active(v == value, active_variant="gold")
-        self._log_btn.setText(f"LOG +{value}")
+        if self._editing_log_id is None:
+            self._log_btn.setText(f"LOG +{value}")
 
     def _set_log_filter(self, key: str) -> None:
         self._log_filter = key
         for k, b in self._filter_btns.items():
             b.set_active(k == key)
         self._refresh_log()
+
+    def keyPressEvent(self, e) -> None:
+        if e.key() == Qt.Key.Key_Escape and self._editing_log_id is not None:
+            self._cancel_edit()
+            return
+        super().keyPressEvent(e)
+
+    def on_closing(self) -> None:
+        if self._editing_log_id is not None:
+            self._cancel_edit()
 
     # -- Custom Daily Habits actions -----------------------------------------
     def _add_habit(self) -> None:
@@ -5912,9 +5939,72 @@ class SocialStatsDialog(P5FluidPanel):
         self._habit_list.blockSignals(False)
 
     # -- Manual Time Block & History actions ---------------------------------
+    def _start_edit_selected(self) -> None:
+        item = self._log_list.currentItem()
+        if item is None:
+            return
+        entry_id = item.data(ROLE_ID)
+        if not entry_id:
+            return
+        entry = self.store.get(entry_id)
+        if entry is None:
+            return
+        self._editing_log_id = entry_id
+        self._set_right_tab("log")
+        self._select_stat(entry.get("stat", "knowledge"))
+        blk = entry.get("block", default_time_block())
+        if blk in TIME_BLOCKS:
+            self._select_block(blk)
+        self._pts_spin.setValue(max(1, min(500, int(entry.get("points", DEFAULT_STAT_POINTS)))))
+        self._act_input.setText(str(entry.get("activity") or ""))
+        self._log_hdr_lbl.setText("EDIT LOG ENTRY")
+        self._log_hdr_lbl.setStyleSheet("color: #FAD02C;")
+        self._log_card.setStyleSheet(
+            "QFrame#card { background-color: #1A1610; border: 1.5px solid #F5C400; border-radius: 10px; }"
+        )
+        self._log_btn.setText("SAVE EDIT")
+        self._log_btn._icon = ""
+        self._log_btn.set_variant("gold")
+        self._cancel_edit_btn.setVisible(True)
+        self._act_input.setFocus()
+        self._act_input.selectAll()
+
+    def _cancel_edit(self) -> None:
+        self._editing_log_id = None
+        self._log_hdr_lbl.setText("LOG TIME BLOCK (~2H)")
+        self._log_hdr_lbl.setStyleSheet("")
+        self._log_card.setStyleSheet("")
+        self._log_btn.setText(f"LOG +{self._pts_spin.value()}")
+        self._log_btn._icon = "plus"
+        self._log_btn.set_variant("primary")
+        self._cancel_edit_btn.setVisible(False)
+        self._act_input.clear()
+
     def _log_activity(self) -> None:
         self._pts_spin.interpretText()
         pts = self._pts_spin.value()
+        if self._editing_log_id is not None:
+            eid = self._editing_log_id
+            updated, prev = self.store.update(
+                eid,
+                stat=self._selected_stat,
+                activity=self._act_input.text(),
+                points=pts,
+                block=self._selected_block,
+            )
+            self._cancel_edit()
+            if updated is None or prev is None:
+                return
+            play_ui("select")
+            self._undo_kind = "log_edit"
+            self._undo_payload = dict(prev)
+            self._refresh_visuals(animate=True)
+            self._refresh_log()
+            self.stats_changed.emit()
+            lbl = SOCIAL_STATS.get(updated["stat"], {}).get("label", updated["stat"].title())
+            self._undo.trigger(f"Updated '{updated['activity'][:24]}' → {lbl} +{updated['points']}.")
+            return
+
         entry, old_lv, new_lv = self.store.add(
             self._selected_stat,
             self._act_input.text(),
@@ -5970,22 +6060,30 @@ class SocialStatsDialog(P5FluidPanel):
         entry = self.store.get(entry_id)
         if entry is None:
             return
+        if self._editing_log_id == entry_id:
+            self._cancel_edit()
         self._undo_kind = "log"
         self._undo_payload = dict(entry)
         self.store.delete(entry_id)
         self.refresh()
+        self.stats_changed.emit()
         self._undo.trigger(f"Removed '{entry.get('activity', '')[:28]}' (+{entry.get('points', 0)} pts).")
 
     def _undo_delete(self) -> None:
         if self._undo_payload is None:
             return
+        if self._editing_log_id is not None:
+            self._cancel_edit()
         if self._undo_kind == "habit" and self.habits is not None:
             self.habits.restore(self._undo_payload)
-        elif self._undo_kind == "log":
+        elif self._undo_kind in ("log", "log_edit"):
             self.store.restore(self._undo_payload)
         self._undo_kind = ""
         self._undo_payload = None
-        self.refresh()
+        self._refresh_visuals(animate=True)
+        self._refresh_habits()
+        self._refresh_log()
+        self.stats_changed.emit()
 
     def refresh(self) -> None:
         self._refresh_visuals(animate=False)
@@ -6501,6 +6599,7 @@ class TimerDialog(P5FluidPanel):
 
     focus_start_requested = pyqtSignal(int, int)      # focus_min, rest_min
     focus_stop_requested = pyqtSignal()
+    focus_stat_changed = pyqtSignal(str)              # knowledge | guts | proficiency | charm | kindness | none
     manual_add_requested = pyqtSignal(int, str)       # total_seconds, label
     manual_cancel_requested = pyqtSignal(str)         # timer_id
     break_requested = pyqtSignal(int)                 # break_minutes
@@ -6509,7 +6608,7 @@ class TimerDialog(P5FluidPanel):
     PRESETS = ((5, "5M"), (10, "10M"), (15, "15M"), (30, "30M"), (60, "1H"))
 
     def __init__(self, settings: SettingsStore, on_top: bool = True, ui_scale: float = 1.0) -> None:
-        super().__init__("TIMER", QSize(565, 690), on_top=on_top, ui_scale=ui_scale)
+        super().__init__("TIMER", QSize(565, 725), on_top=on_top, ui_scale=ui_scale)
         sc = self._ui_scale
         self.settings = settings
         self._focus_running = False
@@ -6517,6 +6616,7 @@ class TimerDialog(P5FluidPanel):
         self._focus_left = 0
         self._focus_total = 1
         self._focus_completed = 0
+        self._focus_stat = str(self.settings["focus_stat"] or "knowledge")
         self._manual_items: list[dict] = []
         self._timer_rows: dict[str, tuple[QFrame, QLabel, QProgressBar]] = {}
 
@@ -6583,6 +6683,38 @@ class TimerDialog(P5FluidPanel):
         self._focus_btn.clicked.connect(self._toggle_focus)
         ctrl.addWidget(self._focus_btn)
         fl.addLayout(ctrl)
+
+        # Social Stat reward selector for Focus Mode (KNO / GUT / PRO / CHA / KIN / OFF)
+        fstat_row = QHBoxLayout()
+        fstat_row.setSpacing(_sc(4, sc, 3))
+        fs_lbl = QLabel("STAT")
+        fs_lbl.setStyleSheet(
+            f'color: #FAD02C; font-family: "Barlow Condensed", "Anton", sans-serif; '
+            f'font-size: {_sc(11, sc, 9)}px; font-weight: 800; letter-spacing: 0.6px;'
+        )
+        fstat_row.addWidget(fs_lbl)
+        self._focus_stat_chips: dict[str, P5FluidButton] = {}
+        fstat_tips = {
+            "knowledge": "Knowledge — study, reading, research",
+            "guts": "Guts — tough chores, workouts, pushing through",
+            "proficiency": "Proficiency — coding, craft, deep work",
+            "charm": "Charm — design, writing, presentations",
+            "kindness": "Kindness — helping others, self-care, organizing",
+            "none": "Off — run Focus timer without auto-logging a Social Stat",
+        }
+        for sk in ("knowledge", "guts", "proficiency", "charm", "kindness", "none"):
+            chip_txt = "OFF" if sk == "none" else SOCIAL_STATS[sk]["short"]
+            sb = self._btn(chip_txt, variant="soft", display=True, px=9)
+            sb.setFixedHeight(_sc(24, sc, 20))
+            sb.setToolTip(fstat_tips[sk])
+            sb.clicked.connect(lambda _c=False, k=sk: self._select_focus_stat(k, emit=True))
+            self._focus_stat_chips[sk] = sb
+            fstat_row.addWidget(sb)
+        fstat_row.addStretch(1)
+        self._focus_stat_hint = QLabel("")
+        self._focus_stat_hint.setObjectName("tip")
+        fstat_row.addWidget(self._focus_stat_hint)
+        fl.addLayout(fstat_row)
         self.body.addWidget(fc)
 
         # -- SCREEN TIME LIVE STRIP ---------------------------------------------
@@ -6706,7 +6838,17 @@ class TimerDialog(P5FluidPanel):
         self._sync_spinners_from_settings()
         self._rebuild_manual_list()
 
+    def _select_focus_stat(self, stat: str, emit: bool = False) -> None:
+        key = stat if stat in self._focus_stat_chips else "knowledge"
+        self._focus_stat = key
+        for k, btn in self._focus_stat_chips.items():
+            btn.set_active(k == key, active_variant="gold" if k != "none" else "primary")
+        self._focus_stat_hint.setText("No reward" if key == "none" else SOCIAL_STATS[key]["label"])
+        if emit:
+            self.focus_stat_changed.emit(key)
+
     def _sync_spinners_from_settings(self) -> None:
+        self._select_focus_stat(str(self.settings["focus_stat"] or "knowledge"), emit=False)
         if self._focus_running:
             return
         self._focus_spin.blockSignals(True)

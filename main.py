@@ -3744,6 +3744,9 @@ class PetController(QObject):
             self._sync_events_view()
             self._sync_briefing_view()
         elif res.kind == "start_focus":
+            stat_arg = str(res.payload.get("stat") or "")
+            if stat_arg:
+                self._set_focus_stat(stat_arg)
             mins = int(res.payload.get("minutes") or 0)
             f_m = mins if mins > 0 else int(self.settings["focus_min"])
             r_m = int(self.settings["rest_min"])
@@ -3928,6 +3931,7 @@ class PetController(QObject):
                 self.social_stats, habits=self.habits, on_top=self.on_top, ui_scale=self.ui_scale
             )
             self.stats_dialog.stat_logged.connect(self._on_stat_logged)
+            self.stats_dialog.stats_changed.connect(self._on_stats_modified)
             self.stats_dialog.habit_toggled.connect(self._on_habit_toggled)
             self.stats_dialog.open_briefing.connect(lambda: self._open_briefing(announce=False))
             self.stats_dialog.open_settings.connect(self._open_settings_deferred)
@@ -4261,12 +4265,17 @@ class PetController(QObject):
         if announce and not was_open and not self._rebuilding_ui:
             self._say_tuple(self.dialogue.window_open("stats", self._ctx()), ms=4800)
 
+    def _on_stats_modified(self) -> None:
+        self._sync_briefing_view()
+        self._sync_wrapup_view()
+
     def _open_timer(self) -> None:
         was_open = self.timer_dialog is not None and self.timer_dialog.isVisible()
         if self.timer_dialog is None:
             self.timer_dialog = TimerDialog(self.settings, on_top=self.on_top, ui_scale=self.ui_scale)
             self.timer_dialog.focus_start_requested.connect(self._start_focus_from_dialog)
             self.timer_dialog.focus_stop_requested.connect(self._stop_pomodoro)
+            self.timer_dialog.focus_stat_changed.connect(self._set_focus_stat)
             self.timer_dialog.manual_add_requested.connect(self._add_manual_timer)
             self.timer_dialog.manual_cancel_requested.connect(self._cancel_manual_timer)
             self.timer_dialog.break_requested.connect(self._start_break_timer)
@@ -4687,6 +4696,12 @@ class PetController(QObject):
             )
             self.timer_dialog.update_manual_timers(manual)
 
+    def _set_focus_stat(self, stat: str) -> None:
+        if stat != self.settings["focus_stat"]:
+            self.settings.set(focus_stat=stat)
+        if self.timer_dialog is not None:
+            self.timer_dialog._select_focus_stat(str(self.settings["focus_stat"] or "knowledge"), emit=False)
+
     def _start_focus_from_dialog(self, focus_min: int, rest_min: int, silent_say: bool = False) -> None:
         if focus_min != self.settings["focus_min"] or rest_min != self.settings["rest_min"]:
             self.settings.set(focus_min=focus_min, rest_min=rest_min)
@@ -4752,18 +4767,21 @@ class PetController(QObject):
             play_beep()
             focus_mins = max(1, int(round(self.pomodoro.focus_s / 60.0)))
             pts = 3 if focus_mins >= 45 else 2
-            awarded, old_lv, new_lv = self._award_auto_stat(
-                stat="knowledge",
-                activity=f"Focus session ({focus_mins} min)",
-                points=pts,
-                source="focus",
-                announce=False,
-            )
+            fstat = str(self.settings["focus_stat"] or "knowledge")
+            awarded, old_lv, new_lv = 0, 1, 1
+            if fstat in SOCIAL_STATS:
+                awarded, old_lv, new_lv = self._award_auto_stat(
+                    stat=fstat,
+                    activity=f"Focus session ({focus_mins} min)",
+                    points=pts,
+                    source="focus",
+                    announce=False,
+                )
             if new_lv > old_lv:
                 return
             msg = random.choice(_FOCUS_REST).format(t=t)
-            if awarded > 0:
-                msg += f" (+{awarded} Knowledge!)"
+            if awarded > 0 and fstat in SOCIAL_STATS:
+                msg += f" (+{awarded} {SOCIAL_STATS[fstat]['label']}!)"
             if self.pet.isVisible():
                 self.say(msg, particle="music")
             else:
