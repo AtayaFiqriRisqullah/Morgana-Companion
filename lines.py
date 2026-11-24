@@ -308,19 +308,16 @@ class ContextualDialogue:
 
         if kind == "notes":
             cnt = int(ctx.get("notes_count", 0))
-            due = int(ctx.get("due_notes", 0))
             if cnt == 0:
                 return self._pick("open_notes_empty", [
-                    ("No notes yet! Jot down anything you don't want to forget.", "neutral", "naa"),
-                    ("Fresh notebook! Start typing whenever an idea hits you.", "wink", "hmm"),
+                    ("Fresh notebook! Catch any thought, add #tags, and preview in Markdown.", "wink", "naa"),
+                    ("Blank canvas! Jot down ideas or study notes—everything auto-saves as you type.", "neutral", "hmm"),
                 ])
             opts = [
-                (f"Opening your notes! {cnt} saved—need to add or review something?", "neutral", "oh_asking"),
-                ("Let's see what you've jotted down! Everything auto-saves too.", "wink", "hmm"),
+                (f"Opening your notebook! {cnt} notes saved—ready to capture a new idea?", "neutral", "oh_asking"),
+                ("Notebook's open! Use #tags to group thoughts or hit '→ TASK' on anything actionable.", "wink", "hmm"),
+                (f"Let's review your {cnt} notes! Everything auto-saves right as you write.", "smug", "naa"),
             ]
-            if due > 0:
-                word = "note" if due == 1 else "notes"
-                opts.append((f"Heads up—you've got {due} {word} with deadlines set!", "worried", "naa"))
             return self._pick("open_notes", opts)
 
         if kind == "events":
@@ -349,17 +346,17 @@ class ContextualDialogue:
             blocks = int(ctx.get("today_blocks", 0))
             if blocks >= 3:
                 return self._pick("open_stats_full", [
-                    (f"Whoa, {blocks} blocks logged today already! Your stats are soaring!", "excited", "oh_excited"),
-                    (f"All {blocks} blocks in today! Let's check how close you are to the next rank!", "smug", "hmm"),
+                    (f"Whoa, {blocks} activities logged today already! Your gold star is shining!", "excited", "oh_excited"),
+                    (f"All {blocks} entries in today! Let's check how close you are to the next rank!", "smug", "hmm"),
                 ])
             if blocks == 0:
                 return self._pick("open_stats_zero", [
-                    ("Zero time blocks logged today so far! Which stat are we leveling up?", "neutral", "dousuru"),
-                    ("Social Stats board is open! What did you spend your last 2-hour block on?", "neutral", "oh_asking"),
+                    ("Social Stats board is open! Check a Daily Habit or log an activity to grow your star!", "neutral", "dousuru"),
+                    ("Let's see your Confidant star! Which stat are we leveling up today?", "neutral", "oh_asking"),
                 ])
             return self._pick("open_stats", [
-                (f"Social Stats time! {blocks}/3 blocks done today—what did you train?", "smug", "oh_asking"),
-                (f"Nice momentum with {blocks}/3 blocks today! Ready to log another?", "wink", "hmm"),
+                (f"Social Stats time! {blocks} activities logged today—let's keep that star expanding!", "smug", "oh_asking"),
+                (f"Nice momentum with {blocks} logs today! Ready to push for a Rank Up?", "wink", "hmm"),
             ])
 
         if kind == "timer":
@@ -381,12 +378,12 @@ class ContextualDialogue:
             return self._pick("open_settings", [
                 ("Tuning the controls? Let's get everything set just how you like it!", "wink", "hmm"),
                 ("Oh, tweaking Settings? Don't forget to hit Save when you're done!", "neutral", "oh_asking"),
-                ("Customizing your setup? You can toggle tabs, audio, and bedtime right here!", "neutral", "naa"),
+                ("Customizing your setup? Toggle awareness, screen-time nudges, particles, and tabs here!", "neutral", "naa"),
             ])
 
         if kind == "system":
             return self._pick("open_system", [
-                ("System menu's up! Need CPU status, Sleep Mode, or Settings?", "neutral", "oh_asking"),
+                ("System menu's up! Need a chat, Briefing, CPU status, or Sleep Mode?", "neutral", "oh_asking"),
                 ("Looking under the hood? Pick whatever you need!", "smug", "dousuru"),
             ])
 
@@ -413,8 +410,8 @@ class ContextualDialogue:
 
         if kind == "notes":
             return self._pick("close_notes", [
-                ("Notes safely saved! Everything's locked in.", "wink", "hmm"),
-                ("Got your notes sorted? I'll keep watch on any deadlines for you!", "neutral", "naa"),
+                ("Notebook safely tucked away! Every idea is auto-saved.", "wink", "hmm"),
+                ("All thoughts captured! Tap NOTES anytime inspiration strikes.", "smug", "naa"),
             ])
 
         if kind == "events":
@@ -425,8 +422,8 @@ class ContextualDialogue:
 
         if kind == "stats":
             return self._pick("close_stats", [
-                ("Keep stacking those daily blocks—you'll rank up in no time!", "smug", "hmm"),
-                ("Nice work tracking your growth! Every block counts.", "wink", "hmm"),
+                ("Keep stacking those habits and wins—that gold star will be maxed in no time!", "smug", "hmm"),
+                ("Nice work tracking your growth! Every point counts.", "wink", "hmm"),
             ])
 
         if kind == "timer":
@@ -469,6 +466,13 @@ class ContextualDialogue:
             (f"One down! '{t}' is off the board{suffix}—keep that momentum rolling!", "smug", "hmm"),
         ])
 
+    def note_sent_to_task(self, title: str) -> tuple[str, str, str]:
+        t = _clip(title, 34)
+        return self._pick("note_to_task", [
+            (f"Nice! Turned '{t}' into a real Task—now it's on the mission board!", "smug", "hmm"),
+            (f"Idea -> Action! '{t}' is now queued up in Tasks!", "excited", "oh_excited"),
+        ])
+
     def habit_completed(self, title: str, stat_label: str, pts: int, streak: int,
                         done_today: int, total_habits: int) -> tuple[str, str, str]:
         t = _clip(title, 30)
@@ -483,6 +487,71 @@ class ContextualDialogue:
             (f"Consistency pays off! +{pts} {stat_label} for '{t}'{s_txt}!", "wink", "hmm"),
             (f"Ooh, '{t}' checked off—+{pts} {stat_label}{s_txt}! Keep the streak alive!", "excited", "oh_excited"),
         ])
+
+    def app_awareness(self, category: str, app_name: str, ctx: dict) -> tuple[str, str, str, str]:
+        """Context-aware remark when the user settles into an active app category.
+
+        Returns `(text, emotion, voice, particle)`.
+        """
+        app = _clip(app_name or "that app", 22)
+        overdue = int(ctx.get("overdue_count", 0))
+        pending = int(ctx.get("pending_tasks", 0))
+        hour = int(ctx.get("hour", 12))
+
+        if category == "coding":
+            return self._pick("app_coding", [
+                (f"Back in {app}! Let's sharpen your Proficiency—holler if you want a Focus block!", "smug", "hmm", "sparkle"),
+                (f"Ooh, coding time in {app}! Keep those commits clean and remember to stretch!", "excited", "oh_excited", "music"),
+                (f"Spotted {app}! If you hit a sneaky bug, double-click me for rubber-duck duty!", "wink", "naa", "sparkle"),
+            ])
+        if category == "study":
+            return self._pick("app_study", [
+                (f"Hitting the books in {app}? That's pure Knowledge points in the making!", "smug", "hmm", "music"),
+                (f"Study mode in {app}! Try summarizing key points in NOTES so they really stick!", "wink", "naa", "sparkle"),
+            ])
+        if category == "writing":
+            return self._pick("app_writing", [
+                (f"Drafting in {app}! Let the ideas flow first—you can polish later!", "wink", "hmm", "music"),
+                (f"Writing session in {app}! Need a quiet Pomodoro timer while you draft?", "neutral", "oh_asking", "sparkle"),
+            ])
+        if category == "creative":
+            return self._pick("app_creative", [
+                (f"Ooh, creative craft in {app}! Looking sharp and stylish today!", "excited", "oh_excited", "sparkle"),
+                (f"Designing in {app}! Don't forget to save often and rest your eyes!", "wink", "hmm", "music"),
+            ])
+        if category == "gaming":
+            if overdue > 0:
+                return self._pick("app_gaming_overdue", [
+                    (f"Whoa—playing {app} while you've got {overdue} overdue deadline(s)? Bold Guts, partner!", "worried", "hoi", "alert"),
+                    (f"Psst! {app} looks fun, just don't forget your overdue items waiting on the board!", "uneasy", "oh_asking", "question"),
+                ])
+            if hour >= 22 or hour < 4:
+                return self._pick("app_gaming_late", [
+                    (f"Late-night {app} run? Just one more round—don't let it eat your sleep!", "sad", "yareyare", "zzz"),
+                ])
+            return self._pick("app_gaming", [
+                (f"Ooh, {app}! Everyone deserves a victory break—have fun!", "excited", "oh_excited", "music"),
+                (f"Gaming break in {app}! Enjoy it guilt-free—just tap me if you want a break cap timer!", "wink", "hmm", "sparkle"),
+            ])
+        if category == "media":
+            if overdue > 0 or pending >= 4:
+                return self._pick("app_media_busy", [
+                    (f"Taking a quick breather on {app}? Remember you still have {pending} tasks on deck!", "smug", "oh_asking", "question"),
+                ])
+            return self._pick("app_media", [
+                (f"Chilling with {app}! Good background vibes—or taking a well-earned break?", "wink", "hmm", "music"),
+                (f"Ooh, {app} time! Relax those eyes and recharge for the next round!", "neutral", "naa", "music"),
+            ])
+        if category == "social":
+            return self._pick("app_social", [
+                (f"Catching up on {app}! Building up that Charm and Kindness, huh?", "wink", "hmm", "heart"),
+                (f"Checking {app}? Don't let chat pings ambush your focus if you're in the middle of work!", "smug", "naa", "question"),
+            ])
+        if category == "meeting":
+            return self._pick("app_meeting", [
+                (f"On a call in {app}? I'll stay out of your way—open NOTES if you need quick meeting jots!", "neutral", "hmm", "sparkle"),
+            ])
+        return (f"Working in {app}—I'm right here if you need anything!", "neutral", "hmm", "")
 
     def wall_bump(self) -> tuple[str, str, str]:
         return self._pick("wall_bump", [
