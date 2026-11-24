@@ -228,6 +228,37 @@ class TaskStore(JsonListStore):
     def pending(self) -> list[dict]:
         return [t for t in self._items if not t.get("done")]
 
+    def completed_today(self, now: datetime | None = None) -> list[dict]:
+        """Return tasks marked done on today's local date."""
+        today = (now or datetime.now()).date()
+        res: list[dict] = []
+        for t in self._items:
+            if not t.get("done"):
+                continue
+            dt = parse_dt(t.get("done_at"))
+            if dt is not None and dt.date() == today:
+                res.append(t)
+        return res
+
+    def rollover_to_tomorrow(self, task_ids: list[str], now: datetime | None = None) -> int:
+        """Move selected pending tasks' deadlines to tomorrow (preserving time or defaulting to 09:00)."""
+        cur = now or datetime.now()
+        tmrw = cur.date() + timedelta(days=1)
+        wanted = set(task_ids)
+        moved = 0
+        for t in self._items:
+            if t.get("id") not in wanted or t.get("done"):
+                continue
+            old_dl = parse_dt(t.get("deadline"))
+            target_t = old_dl.time() if old_dl is not None else dtime(9, 0)
+            new_dt = datetime.combine(tmrw, target_t)
+            t["deadline"] = new_dt.isoformat(timespec="minutes")
+            t["notified"] = False
+            moved += 1
+        if moved:
+            self.save()
+        return moved
+
     def clear_done(self) -> int:
         before = len(self._items)
         self._items = [t for t in self._items if not t.get("done")]
@@ -375,6 +406,40 @@ class NoteStore(JsonListStore):
             note["archived"] = False
         self.save()
         return True
+
+    def append_journal_reflection(self, text: str, mood: str = "",
+                                  now: datetime | None = None) -> dict | None:
+        """Append a 1-line reflection into today's Journal note (creating it if needed)."""
+        clean = (text or "").strip()
+        if not clean:
+            return None
+        cur = now or datetime.now()
+        title = f"Daily Reflection — {cur:%d %b %Y}"
+        mood_s = f" [{mood.strip().upper()}]" if (mood or "").strip() else ""
+        entry = f"- [{cur:%H:%M}]{mood_s} {clean}"
+
+        existing = next(
+            (n for n in self._items if not n.get("archived") and (n.get("title") or "").strip() == title),
+            None,
+        )
+        if existing is not None:
+            body = (existing.get("content") or "").rstrip()
+            if "#wrapup" in body:
+                lines = body.splitlines()
+                if lines and lines[-1].strip().startswith("#"):
+                    lines.insert(-1, entry)
+                    new_body = "\n".join(lines)
+                else:
+                    new_body = f"{body}\n{entry}"
+            else:
+                new_body = (
+                    f"{body}\n{entry}\n\n#journal #wrapup"
+                    if body else f"## Evening Reflection\n{entry}\n\n#journal #wrapup"
+                )
+            return self.update(existing["id"], title, new_body, category="Journal", preserve_deadline=True)
+
+        body = f"## Evening Reflection\n{entry}\n\n#journal #wrapup"
+        return self.add(title, body, deadline=None, category="Journal", tags=["journal", "wrapup"])
 
     def restore(self, note: dict) -> dict | None:
         if not isinstance(note, dict) or not note.get("id"):
@@ -881,6 +946,14 @@ RADIAL_TABS: tuple[tuple[str, str], ...] = (
 RADIAL_TAB_KEYS: tuple[str, ...] = tuple(k for k, _ in RADIAL_TABS)
 _LEGACY_6_TABS = frozenset({"events", "tasks", "timer", "notes", "stats", "system"})
 
+QUICK_HOTKEY_PRESETS: tuple[str, ...] = (
+    "Ctrl+Shift+M",
+    "Ctrl+Alt+M",
+    "Ctrl+Shift+Space",
+    "Alt+Space",
+    "Off",
+)
+
 SETTINGS_DEFAULTS = {
     "bedtime": "23:30",                 # bedtime reminder start
     "wake": "05:00",                    # bedtime reminder stop
@@ -896,6 +969,8 @@ SETTINGS_DEFAULTS = {
     "voice_volume": 85,                 # Morgana voiceline volume percentage (0-100)
     "sfx_volume": 75,                   # UI & Social Stats SFX volume percentage (0-100)
     "morning_briefing": True,           # Show Daily Briefing & Confidant Summary once daily
+    "evening_wrapup": True,             # Show Evening Wrap-up once per evening
+    "wrapup_time": "21:00",             # Target evening wrap-up trigger time (HH:MM)
     "auto_stat_rewards": True,          # Auto-award Social Stats from tasks, notes & focus
     "auto_open_stats_on_reward": True,  # Auto-open Social Stats star animation on activity rewards
     "app_awareness_enabled": True,      # Local-only active app/window awareness remarks
@@ -903,7 +978,16 @@ SETTINGS_DEFAULTS = {
     "break_nudge_min": 60,              # Continuous active minutes before Morgana nudges a break
     "particles_enabled": True,          # Persona 5 micro-particles around Morgana
     "spontaneous_choices_enabled": True,  # Occasional interactive choice prompts while idle
+    "auto_dnd_meetings": True,          # Auto-DND during video calls & meetings
+    "auto_dnd_fullscreen": True,        # Auto-DND during fullscreen apps, games & presentations
+    "manual_dnd": False,                # Manual Do Not Disturb mode
+    "quick_hotkey": "Ctrl+Shift+M",     # Global shortcut for Quick Command & Capture
+    "ai_enabled": False,                # Opt-in OpenAI-compatible AI fallback for free-form chat
+    "ai_endpoint": "http://localhost:11434/v1/chat/completions",
+    "ai_model": "llama3.2",
+    "ai_api_key": "",
     "last_briefing_date": "",           # YYYY-MM-DD of last auto-delivered Daily Briefing
+    "last_wrapup_date": "",             # YYYY-MM-DD of last auto-delivered Evening Wrap-up
     "enabled_tabs": list(RADIAL_TAB_KEYS),  # Active tabs shown in Morgana's radial menu
 }
 _INT_RANGES = {
@@ -922,13 +1006,19 @@ _BOOL_KEYS = (
     "curfew_enabled",
     "sound_enabled",
     "morning_briefing",
+    "evening_wrapup",
     "auto_stat_rewards",
     "auto_open_stats_on_reward",
     "app_awareness_enabled",
     "screen_time_enabled",
     "particles_enabled",
     "spontaneous_choices_enabled",
+    "auto_dnd_meetings",
+    "auto_dnd_fullscreen",
+    "manual_dnd",
+    "ai_enabled",
 )
+_STR_KEYS = ("ai_endpoint", "ai_model", "ai_api_key")
 
 
 def _valid_hhmm(value) -> bool:
@@ -1011,15 +1101,21 @@ class SettingsStore:
         for key, value in values.items():
             if key not in SETTINGS_DEFAULTS:
                 continue
-            if key in ("bedtime", "wake"):
+            if key in ("bedtime", "wake", "wrapup_time"):
                 if _valid_hhmm(value):
                     self.data[key] = datetime.strptime(str(value), "%H:%M").strftime("%H:%M")
             elif key in _BOOL_KEYS:
                 if isinstance(value, bool):
                     self.data[key] = value
-            elif key == "last_briefing_date":
+            elif key in ("last_briefing_date", "last_wrapup_date"):
                 if isinstance(value, str) and _valid_iso_date(value):
                     self.data[key] = value
+            elif key == "quick_hotkey":
+                if isinstance(value, str) and value.strip() in QUICK_HOTKEY_PRESETS:
+                    self.data[key] = value.strip()
+            elif key in _STR_KEYS:
+                if isinstance(value, str):
+                    self.data[key] = value.strip()[:512]
             elif key == "enabled_tabs":
                 cleaned = normalize_enabled_tabs(value)
                 if cleaned is not None:
@@ -1046,3 +1142,7 @@ class SettingsStore:
     @property
     def wake(self) -> dtime:
         return datetime.strptime(self.data["wake"], "%H:%M").time()
+
+    @property
+    def wrapup_time(self) -> dtime:
+        return datetime.strptime(self.data["wrapup_time"], "%H:%M").time()
