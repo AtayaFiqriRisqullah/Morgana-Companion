@@ -537,10 +537,12 @@ class AudioManager(QObject):
         """
         self._cancel_sequences()
         if not (self._enabled and self._ready and self._sfx_volume > 0.001):
+            # Keep a crisp visual cadence even when muted so the auto-opened Social Stats
+            # window finishes popping in before the gold star expands and bursts on Rank Up.
             if on_point_anim:
-                on_point_anim()
+                self._schedule(240, on_point_anim)
             if leveled_up and on_level_up:
-                on_level_up()
+                self._schedule(1050, on_level_up)
             return
 
         big = int(points) >= 3
