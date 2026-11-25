@@ -107,10 +107,43 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG=$([ "${{ github.ref_type }}" = "tag" ] && echo "${{ github.ref_name }}" || echo "${{ inputs.tag }}")
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" release-assets/* --clobber
-          else
-            gh release create "$TAG" release-assets/* \
-              --title "Morgana Companion $TAG" \
-              --generate-notes
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            for attempt in 1 2 3; do
+              if gh release create "$TAG" \
+                --title "Morgana Companion $TAG" \
+                --generate-notes; then
+                break
+              fi
+              echo "Create release failed (attempt $attempt/3); retrying in $((attempt * 5))s..."
+              sleep $((attempt * 5))
+            done
           fi
+
+          FAILED=0
+          for asset in release-assets/*; do
+            name=$(basename "$asset")
+            uploaded=0
+            for attempt in 1 2 3 4 5; do
+              echo "Uploading $name (attempt $attempt/5)..."
+              starter_ids=$(gh api "repos/${{ github.repository }}/releases/tags/$TAG" 2>/dev/null \
+                | jq -r --arg name "$name" '.assets[]? | select(.name == $name and .state == "starter") | .id' || true)
+              for sid in $starter_ids; do
+                echo "Deleting zombie starter asset $sid for $name..."
+                gh api -X DELETE "repos/${{ github.repository }}/releases/assets/$sid" || true
+              done
+
+              if gh release upload "$TAG" "$asset" --clobber; then
+                uploaded=1
+                break
+              fi
+              echo "Upload of $name failed on attempt $attempt; retrying in $((attempt * 5))s..."
+              sleep $((attempt * 5))
+            done
+
+            if [ "$uploaded" -ne 1 ]; then
+              echo "::error::Failed to upload $name after 5 attempts"
+              FAILED=1
+            fi
+          done
+
+          exit "$FAILED"
