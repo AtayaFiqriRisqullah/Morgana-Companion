@@ -76,8 +76,8 @@ from storage_manager import (RADIAL_TAB_KEYS, SOCIAL_STAT_KEYS, SOCIAL_STATS, Ha
                              LocalEventStore, NoteStore, SettingsStore, SocialStatsStore,
                              TaskStore, overall_confidant_level, parse_dt, stat_level,
                              stat_rank_title)
-from theme import (BLACK, BLACK_BURST_SHARDS, BLUE, GOLD, LIGHT_RED, MENU_QSS, P5_MINT_FG,
-                   P5_SURFACE, RED, RED_BURST_SHARDS, UI_SCALE_PRESETS, WHITE, lerp_color,
+from theme import (BLACK, BLUE, GOLD, LIGHT_RED, MENU_QSS, P5_MINT_FG,
+                   P5_SURFACE, RED, UI_SCALE_PRESETS, WHITE, lerp_color,
                    load_fonts, menu_qss, p5_dialogue_font, p5_font, pen, scale_polygon,
                    star_polygon, tapered_wedge)
 from ui_dialogs import (BriefingDialog, EventsDialog, NotesDialog, QuickCommandDialog,
@@ -1775,6 +1775,440 @@ class MenuButton:
     press: Spring = field(default_factory=lambda: Spring(0.0, 700.0, 36.0))   # mengempis saat ditekan
 
 
+# Non-overlapping base fan slots per side count: (oy_base, rot_up_deg)
+# Positive rot_up_deg tilts the outer tip upward (-Y) on both left and right sides.
+_RADIAL_BASE_SLOTS: dict[int, tuple[tuple[float, float], ...]] = {
+    1: ((   0.0,  +2.0),),
+    2: (( -28.0, +10.0), ( +28.0,  -8.0)),
+    3: (( -52.0, +18.0), (  -2.0,  +1.0), ( +50.0, -14.0)),
+    4: (( -74.0, +24.0), ( -24.0,  +8.0), ( +24.0,  -7.0), ( +72.0, -21.0)),
+    5: (( -96.0, +22.0), ( -48.0, +11.0), (   0.0,   0.0), ( +48.0, -11.0), ( +96.0, -22.0)),
+    6: ((-112.5, +20.0), ( -67.5, +12.0), ( -22.5,  +4.0), ( +22.5,  -4.0), ( +67.5, -12.0), (+112.5, -20.0)),
+    7: ((-126.0, +22.5), ( -84.0, +15.0), ( -42.0,  +7.5), (   0.0,   0.0), ( +42.0,  -7.5), ( +84.0, -15.0), (+126.0, -22.5)),
+}
+
+
+def _radial_side_ax(oy_base: float) -> float:
+    """Curved horizontal clearance from Morgana's center (tighter above head, HUD-safe below)."""
+    if oy_base < 0.0:
+        a = abs(oy_base)
+        if a <= 115.0:
+            return 92.0 - 20.0 * (a / 115.0) ** 2
+        return max(46.0, 72.0 - 0.22 * (a - 115.0))
+    if oy_base <= 115.0:
+        return 92.0 - 8.0 * (oy_base / 115.0) ** 2
+    return max(56.0, 84.0 - 0.22 * (oy_base - 115.0))
+
+
+def _radial_button_extents(
+    side: int, ox_px: float, oy_px: float, rot_deg: float, u_btn: float,
+    length: float = 176.0, h_in: float = 25.0, h_out: float = 48.0,
+) -> tuple[float, float, float, float]:
+    """Conservative pixel extents (min_x, max_x, min_y, max_y) of one wedge incl. hover/shadow/subtitle."""
+    L = length * u_btn
+    hi = h_in * u_btn
+    ho = h_out * u_btn
+    s = 1.08
+    slide = 10.0 * u_btn
+    if side > 0:
+        x_in = -14.0 * u_btn
+        x_out = slide + (L + 6.0 * u_btn) * s + 9.0 * u_btn
+    else:
+        x_in = +14.0 * u_btn
+        x_out = -(slide + (L + 6.0 * u_btn) * s + 9.0 * u_btn)
+    corners = (
+        (x_in,  -hi * 0.56 * s - 4.0 * u_btn),
+        (x_in,  +hi * 0.52 * s + 7.0 * u_btn),
+        (x_out, -ho * 0.58 * s - 4.0 * u_btn),
+        (x_out, +ho * 0.50 * s + 10.0 * u_btn),
+    )
+    ang = math.radians(rot_deg)
+    ca, sa = math.cos(ang), math.sin(ang)
+    xs = [ox_px + lx * ca - ly * sa for lx, ly in corners]
+    ys = [oy_px + lx * sa + ly * ca for lx, ly in corners]
+    return min(xs), max(xs), min(ys), max(ys)
+
+
+def _ray_clip_polygon(
+    pts: tuple[tuple[float, float], ...],
+    x_lo: float, x_hi: float, y_lo: float, y_hi: float,
+    min_scale: float = 0.28,
+) -> tuple[tuple[float, float], ...] | None:
+    """Scale a spike polygon radially from (0, 0) so every tip stays sharp and inside screen bounds."""
+    s = 1.0
+    for vx, vy in pts:
+        if vx < x_lo and vx < -1e-6:
+            s = min(s, x_lo / vx)
+        elif vx > x_hi and vx > 1e-6:
+            s = min(s, x_hi / vx)
+        if vy < y_lo and vy < -1e-6:
+            s = min(s, y_lo / vy)
+        elif vy > y_hi and vy > 1e-6:
+            s = min(s, y_hi / vy)
+    if s < min_scale:
+        return None
+    if s >= 0.999:
+        return pts
+    return tuple((vx * s, vy * s) for vx, vy in pts)
+
+
+def _spike_poly(
+    side: int, phi: float, r_in: float, r_out: float,
+    half_w_in: float, half_w_out: float = 0.0, skew: float = 0.0,
+) -> tuple[tuple[float, float], ...]:
+    """Build a sharp Persona 5 crimson/obsidian spike along local side angle `phi`."""
+    ux = side * math.cos(phi)
+    uy = math.sin(phi)
+    px, py = -uy, ux
+    bx, by = ux * r_in, uy * r_in
+    tx, ty = ux * r_out, uy * r_out
+    if half_w_out <= 0.5:
+        return (
+            (bx + px * half_w_in, by + py * half_w_in),
+            (tx + px * skew,      ty + py * skew),
+            (bx - px * half_w_in, by - py * half_w_in),
+        )
+    t2x, t2y = ux * (r_out * 0.91), uy * (r_out * 0.91)
+    return (
+        (bx + px * half_w_in,              by + py * half_w_in),
+        (tx + px * (half_w_out + skew),    ty + py * (half_w_out + skew)),
+        (t2x - px * (half_w_out - skew),   t2y - py * (half_w_out - skew)),
+        (bx - px * half_w_in,              by - py * half_w_in),
+    )
+
+
+def build_radial_burst_shards(
+    placed: list[tuple[int, float, float, float, float]],
+    u_sprite: float,
+    u_btn: float,
+    x_lo: float,
+    x_hi: float,
+    y_lo: float,
+    y_hi: float,
+) -> tuple[list[tuple[tuple[float, float], ...]], list[tuple[tuple[float, float], ...]]]:
+    """Generate Persona 5 crimson & obsidian backdrop shards adapted to active tabs & screen bounds."""
+    red: list[tuple[tuple[float, float], ...]] = []
+    black: list[tuple[tuple[float, float], ...]] = []
+
+    def _add(target: list[tuple[tuple[float, float], ...]],
+             pts: tuple[tuple[float, float], ...], min_s: float = 0.28) -> None:
+        clipped = _ray_clip_polygon(pts, x_lo, x_hi, y_lo, y_hi, min_scale=min_s)
+        if clipped is not None:
+            target.append(clipped)
+
+    by_side: dict[int, list[tuple[float, float]]] = {-1: [], +1: []}
+    for side, ox_px, oy_px, rot_deg, length_px in placed:
+        ang = math.radians(rot_deg)
+        tx = ox_px + side * math.cos(ang) * (0.78 * length_px)
+        ty = oy_px + math.sin(ang) * (0.78 * length_px)
+        phi = math.atan2(ty, max(1.0, side * tx))
+        dist = math.hypot(tx, ty)
+        by_side[side].append((phi, dist))
+
+    active_sides = [s for s in (-1, +1) if by_side[s]]
+    r_base = 14.0 * u_sprite
+    max_r = 390.0 * u_btn
+
+    for side in active_sides:
+        rays = sorted(by_side[side], key=lambda item: item[0])
+        n = len(rays)
+        phi_min, r_top = rays[0]
+        phi_max, r_bot = rays[-1]
+
+        # 1) Multi-point sawtooth crimson burst core hugging the active side's angular span
+        pad_core = 0.17 if n == 1 else 0.13
+        a0 = max(-1.38, phi_min - pad_core)
+        a1 = min(+1.38, phi_max + pad_core)
+        n_peaks = max(3, min(7, n + 2))
+        core_pts: list[tuple[float, float]] = [
+            (side * r_base * math.cos(a0) - math.sin(a0) * 6.0 * u_sprite,
+             r_base * math.sin(a0) + side * math.cos(a0) * 6.0 * u_sprite),
+        ]
+        for k in range(n_peaks):
+            t_pk = k / max(1, n_peaks - 1)
+            a_pk = a0 + (a1 - a0) * t_pk
+            idx_near = min(n - 1, int(round(t_pk * (n - 1))))
+            r_near = min(rays[idx_near][1], max_r)
+            r_pk = r_near * (0.96 if k % 2 == 0 else 0.86)
+            core_pts.append((side * r_pk * math.cos(a_pk), r_pk * math.sin(a_pk)))
+            if k < n_peaks - 1:
+                a_val = a0 + (a1 - a0) * ((k + 0.5) / max(1, n_peaks - 1))
+                r_val = r_near * (0.58 if k % 2 == 0 else 0.64)
+                core_pts.append((side * r_val * math.cos(a_val), r_val * math.sin(a_val)))
+        core_pts.append((
+            side * r_base * math.cos(a1) + math.sin(a1) * 6.0 * u_sprite,
+            r_base * math.sin(a1) - side * math.cos(a1) * 6.0 * u_sprite,
+        ))
+        _add(red, tuple(core_pts), min_s=0.35)
+
+        # 2) Dramatic crimson flank & gap spikes peeking past the command wedges
+        if n == 1:
+            phi0, r0 = rays[0]
+            r0 = min(r0, max_r)
+            _add(red, _spike_poly(side, max(-1.38, phi0 - 0.22), r_base, r0 * 1.00, 12.0 * u_btn, 7.0 * u_btn, -4.0 * u_btn))
+            _add(red, _spike_poly(side, phi0 + 0.04,             r_base, r0 * 1.11, 10.0 * u_btn, 0.0,           +3.0 * u_btn))
+            _add(red, _spike_poly(side, min(+1.38, phi0 + 0.21), r_base, r0 * 0.96, 11.0 * u_btn, 6.0 * u_btn,  +4.0 * u_btn))
+            _add(black, _spike_poly(side, max(-1.36, phi0 - 0.13), r_base, r0 * 0.90, 8.0 * u_btn))
+            _add(black, _spike_poly(side, min(+1.36, phi0 + 0.14), r_base, r0 * 0.86, 7.5 * u_btn))
+        else:
+            r_top_c = min(r_top, max_r)
+            r_bot_c = min(r_bot, max_r)
+            # Top & bottom outer crimson crown spikes
+            _add(red, _spike_poly(side, max(-1.40, phi_min - 0.17), r_base, r_top_c * 1.11, 13.0 * u_btn, 7.0 * u_btn, -4.0 * u_btn))
+            _add(red, _spike_poly(side, min(+1.40, phi_max + 0.16), r_base, r_bot_c * 1.08, 12.0 * u_btn, 6.0 * u_btn, +4.0 * u_btn))
+            # Outer black flanking daggers
+            _add(black, _spike_poly(side, max(-1.38, phi_min - 0.09), r_base, r_top_c * 0.92, 8.5 * u_btn))
+            _add(black, _spike_poly(side, min(+1.38, phi_max + 0.09), r_base, r_bot_c * 0.89, 8.0 * u_btn))
+
+            # Interleaved crimson blades & obsidian daggers between adjacent buttons
+            for i in range(n - 1):
+                phi_mid = 0.5 * (rays[i][0] + rays[i + 1][0])
+                r_mid = min(0.5 * (rays[i][1] + rays[i + 1][1]), max_r)
+                skew = (-4.0 if i % 2 == 0 else +4.0) * u_btn
+                r_red_len = r_mid * (1.09 if i % 2 == 0 else 1.00)
+                w_out = (8.0 if i % 2 == 0 else 0.0) * u_btn
+                _add(red, _spike_poly(side, phi_mid + (0.025 if i % 2 == 0 else -0.025),
+                                      r_base, r_red_len, 12.0 * u_btn, w_out, skew))
+                if n <= 4 or i % 2 == 0 or i == n - 2:
+                    r_blk_len = r_mid * (0.94 if i % 2 == 0 else 0.84)
+                    _add(black, _spike_poly(side, phi_mid - (0.03 if i % 2 == 0 else -0.03),
+                                            r_base, r_blk_len, 8.0 * u_btn))
+
+    # Subtle compact back-spurs right behind Morgana's torso when single-sided so the burst stays anchored
+    if len(active_sides) == 1:
+        back_side = -active_sides[0]
+        rays = sorted(by_side[active_sides[0]], key=lambda item: item[0])
+        phi_mid = 0.5 * (rays[0][0] + rays[-1][0])
+        spur_r = 66.0 * u_sprite
+        _add(red,   _spike_poly(back_side, clamp(-phi_mid * 0.45 - 0.32, -1.1, 1.1), 8.0 * u_sprite, spur_r,        10.0 * u_sprite, 0.0), min_s=0.45)
+        _add(red,   _spike_poly(back_side, clamp(-phi_mid * 0.45 + 0.34, -1.1, 1.1), 8.0 * u_sprite, spur_r * 0.92,  9.0 * u_sprite, 0.0), min_s=0.45)
+        _add(black, _spike_poly(back_side, clamp(-phi_mid * 0.45,        -1.0, 1.0), 8.0 * u_sprite, spur_r * 0.80,  7.0 * u_sprite, 0.0), min_s=0.45)
+
+    return red, black
+
+
+def compute_radial_layout(
+    active_defs: list[tuple[str, str, str, int, int]],
+    space_left: float,
+    space_right: float,
+    space_top: float,
+    space_bottom: float,
+    u_sprite: float,
+    u_pos: float,
+    u_btn: float,
+    u_y: float,
+    preferred_mode: str | None = None,
+    hysteresis: float = 0.0,
+) -> dict:
+    """Compute screen-adaptive, balanced Persona 5 radial menu geometry (pure Qt-free math)."""
+    if not active_defs:
+        return {
+            "mode": "both", "buttons": [], "u_pos": u_pos, "u_btn": u_btn, "u_y": u_y,
+            "dy_px": 0.0, "fit_scale": 1.0, "red_shards": [], "black_shards": [],
+            "w": 80, "h": 80, "cx": 40.0, "cy": 40.0, "btn_bounds": (0.0, 0.0, 0.0, 0.0),
+        }
+    margin = 10.0
+    need_x = 92.0 * u_pos + 204.0 * u_btn + margin
+
+    # 1) Select horizontal distribution mode: both sides, right-only, or left-only
+    if len(active_defs) == 1:
+        pref = "left" if active_defs[0][3] < 0 else "right"
+        if preferred_mode == "left" and space_left >= need_x - hysteresis:
+            mode = "left"
+        elif preferred_mode == "right" and space_right >= need_x - hysteresis:
+            mode = "right"
+        elif pref == "left":
+            mode = "left" if space_left >= need_x else ("right" if space_right >= space_left else "left")
+        else:
+            mode = "right" if space_right >= need_x else ("left" if space_left >= space_right else "right")
+    else:
+        l_need = need_x - hysteresis if preferred_mode in ("both", "left") else need_x + hysteresis
+        r_need = need_x - hysteresis if preferred_mode in ("both", "right") else need_x + hysteresis
+        fits_l = space_left >= l_need
+        fits_r = space_right >= r_need
+        if fits_l and fits_r:
+            mode = "both"
+        elif fits_r and not fits_l:
+            mode = "right"
+        elif fits_l and not fits_r:
+            mode = "left"
+        else:
+            mode = "right" if space_right >= space_left else "left"
+
+    # 2) Partition & balance active tabs across sides (keeps |L - R| <= 1 in two-sided mode)
+    if mode == "right":
+        left_defs: list[tuple[str, str, str, int, int]] = []
+        right_defs: list[tuple[str, str, str, int, int]] = list(active_defs)
+    elif mode == "left":
+        left_defs = list(active_defs)
+        right_defs = []
+    else:
+        left_defs = [d for d in active_defs if d[3] < 0]
+        right_defs = [d for d in active_defs if d[3] > 0]
+        order = {d[0]: i for i, d in enumerate(active_defs)}
+        if len(left_defs) - len(right_defs) > 1:
+            move = (len(left_defs) - len(right_defs)) // 2
+            right_defs = sorted(right_defs + left_defs[-move:], key=lambda d: order[d[0]])
+            left_defs = left_defs[:-move]
+        elif len(right_defs) - len(left_defs) > 1:
+            move = (len(right_defs) - len(left_defs)) // 2
+            left_defs = sorted(left_defs + right_defs[-move:], key=lambda d: order[d[0]])
+            right_defs = right_defs[:-move]
+
+    def _build_placed(up: float, ub: float, uy: float, rot_bias: float, dy_px: float):
+        dy_b = dy_px / max(0.01, uy)
+        sides_data = ((-1, left_defs), (+1, right_defs))
+        per_side: dict[int, list[dict]] = {-1: [], +1: []}
+        min_x = min_y = float("inf")
+        max_x = max_y = float("-inf")
+        for side, defs in sides_data:
+            if not defs:
+                continue
+            slots = _RADIAL_BASE_SLOTS[min(7, len(defs))]
+            for (key, label, sub, _pref_side, hi), (oy_b, rot_up) in zip(defs, slots):
+                oy_final = oy_b + dy_b
+                ax = _radial_side_ax(oy_final)
+                ox_b = -ax if side < 0 else (ax - 2.0)
+                rot_eff = clamp(rot_up + rot_bias, -30.0, 30.0)
+                rot_deg = rot_eff if side < 0 else -rot_eff
+                bmin_x, bmax_x, bmin_y, bmax_y = _radial_button_extents(
+                    side, ox_b * up, oy_final * uy, rot_deg, ub,
+                )
+                min_x = min(min_x, bmin_x)
+                max_x = max(max_x, bmax_x)
+                min_y = min(min_y, bmin_y)
+                max_y = max(max_y, bmax_y)
+                per_side[side].append({
+                    "key": key, "label": label, "sub": sub, "side": side,
+                    "ox": ox_b, "oy": oy_final, "rot": rot_deg, "hi": hi,
+                })
+        return per_side, (min_x, max_x, min_y, max_y)
+
+    # 3) Fit scale gracefully if screen is exceptionally small for the current UI scale
+    up, ub, uy = u_pos, u_btn, u_y
+    fit_scale = 1.0
+    _, (min_x, max_x, min_y, max_y) = _build_placed(up, ub, uy, 0.0, 0.0)
+    avail_h = max(160.0, (space_top + space_bottom) - 2.0 * margin)
+    fan_h = max(1.0, max_y - min_y)
+    v_fit = avail_h / fan_h if fan_h > avail_h else 1.0
+    h_fit = 1.0
+    if mode == "right" and max_x > max(120.0, space_right - margin):
+        h_fit = max(120.0, space_right - margin) / max(1.0, max_x)
+    elif mode == "left" and -min_x > max(120.0, space_left - margin):
+        h_fit = max(120.0, space_left - margin) / max(1.0, -min_x)
+    fit = clamp(min(v_fit, h_fit), 0.62, 1.0)
+    if fit < 0.995:
+        fit_scale = fit
+        up *= fit
+        ub *= fit
+        uy *= fit
+        _, (min_x, max_x, min_y, max_y) = _build_placed(up, ub, uy, 0.0, 0.0)
+
+    # 4) Quadrant angle bias (keeps corners tightly hugged & radiating organically away from edges)
+    max_base_rot = max(
+        (abs(r) for n in (len(left_defs), len(right_defs)) if n > 0
+         for _, r in _RADIAL_BASE_SLOTS[min(7, n)]),
+        default=0.0,
+    )
+    max_bias = max(0.0, min(8.0, 30.0 - max_base_rot))
+    over_bot = max(0.0, max_y - (space_bottom - margin))
+    over_top = max(0.0, -min_y - (space_top - margin))
+    if over_bot > 0.0 and over_top == 0.0:
+        rot_bias = clamp(over_bot / max(1.0, 16.0 * ub), 0.0, max_bias)
+    elif over_top > 0.0 and over_bot == 0.0:
+        rot_bias = -clamp(over_top / max(1.0, 16.0 * ub), 0.0, max_bias)
+    else:
+        rot_bias = 0.0
+
+    if abs(rot_bias) > 0.01:
+        _, (min_x, max_x, min_y, max_y) = _build_placed(up, ub, uy, rot_bias, 0.0)
+
+    # 5) Vertical shift so every wedge stays cleanly inside [area.top + margin, area.bottom - margin]
+    y_lo_lim = -(space_top - margin)
+    y_hi_lim = +(space_bottom - margin)
+    dy_px = 0.0
+    if max_y > y_hi_lim:
+        dy_px = y_hi_lim - max_y
+        if min_y + dy_px < y_lo_lim:
+            dy_px = 0.5 * (y_lo_lim + y_hi_lim) - 0.5 * (min_y + max_y)
+    elif min_y < y_lo_lim:
+        dy_px = y_lo_lim - min_y
+        if max_y + dy_px > y_hi_lim:
+            dy_px = 0.5 * (y_lo_lim + y_hi_lim) - 0.5 * (min_y + max_y)
+
+    per_side, btn_bounds = _build_placed(up, ub, uy, rot_bias, dy_px)
+    # Interleave left/right so stagger opens symmetrically top-to-bottom
+    ordered: list[dict] = []
+    l_list, r_list = per_side[-1], per_side[+1]
+    for idx in range(max(len(l_list), len(r_list))):
+        if idx < len(l_list):
+            ordered.append(l_list[idx])
+        if idx < len(r_list):
+            ordered.append(r_list[idx])
+
+    # 6) Adaptive Persona 5 crimson & obsidian shards matched to placed buttons & screen edges
+    shard_margin = 10.0
+    sx_lo = -max(14.0, space_left - shard_margin)
+    sx_hi = +max(14.0, space_right - shard_margin)
+    sy_lo = -max(14.0, space_top - shard_margin)
+    sy_hi = +max(14.0, space_bottom - shard_margin)
+    placed_for_shards = [
+        (b["side"], b["ox"] * up, b["oy"] * uy, b["rot"], 176.0 * ub)
+        for b in ordered
+    ]
+    red_shards, black_shards = build_radial_burst_shards(
+        placed_for_shards, u_sprite * fit_scale, ub, sx_lo, sx_hi, sy_lo, sy_hi,
+    )
+
+    # 7) Snug widget bounds & Morgana-center pivot (cx, cy) staying cleanly inside the screen
+    win_min_x, win_max_x, win_min_y, win_max_y = btn_bounds
+    core_pad = 32.0 * u_sprite
+    win_min_x = min(win_min_x, -core_pad)
+    win_max_x = max(win_max_x, +core_pad)
+    win_min_y = min(win_min_y, -core_pad)
+    win_max_y = max(win_max_y, +core_pad)
+    # Include shard vertices with slight burst spring-overshoot headroom (1.07x)
+    for poly in (*red_shards, *black_shards):
+        for vx, vy in poly:
+            win_min_x = min(win_min_x, vx * 1.07)
+            win_max_x = max(win_max_x, vx * 1.07)
+            win_min_y = min(win_min_y, vy * 1.07)
+            win_max_y = max(win_max_y, vy * 1.07)
+
+    pad = 8.0 * ub
+    win_min_x -= pad
+    win_max_x += pad
+    win_min_y -= pad
+    win_max_y += pad
+    # Keep widget edges flush within the screen without clipping any button extent
+    win_min_x = max(win_min_x, min(btn_bounds[0] - 2.0, -max(14.0, space_left)))
+    win_max_x = min(win_max_x, max(btn_bounds[1] + 2.0, +max(14.0, space_right)))
+    win_min_y = max(win_min_y, min(btn_bounds[2] - 2.0, -max(14.0, space_top)))
+    win_max_y = min(win_max_y, max(btn_bounds[3] + 2.0, +max(14.0, space_bottom)))
+
+    cx = float(math.ceil(-win_min_x))
+    cy = float(math.ceil(-win_min_y))
+    w = max(80, int(math.ceil(cx + win_max_x)))
+    h = max(80, int(math.ceil(cy + win_max_y)))
+
+    return {
+        "mode": mode,
+        "buttons": ordered,
+        "u_pos": up,
+        "u_btn": ub,
+        "u_y": uy,
+        "dy_px": dy_px,
+        "fit_scale": fit_scale,
+        "red_shards": red_shards,
+        "black_shards": black_shards,
+        "w": w,
+        "h": h,
+        "cx": cx,
+        "cy": cy,
+        "btn_bounds": btn_bounds,
+    }
+
+
 class MenuBackdrop(QWidget):
     """Lapisan serpihan spike merah-hitam yang memancar dari BELAKANG karakter.
     Tembus klik (WindowTransparentForInput) dan selalu berada di bawah PetWindow."""
@@ -1783,18 +2217,27 @@ class MenuBackdrop(QWidget):
         super().__init__()
         setup_overlay(self)
         self.setWindowFlag(Qt.WindowType.WindowTransparentForInput, True)
-        self._u = 1.0
+        self._cx = 0.0
+        self._cy = 0.0
+        self._spin_dir = -1.0
         self._burst = 0.0
         self._t = 0.0
         self._red: list[QPolygonF] = []
         self._black: list[QPolygonF] = []
 
-    def configure(self, w: int, h: int, u: float) -> None:
-        self.setFixedSize(w, h)
-        self._u = u
-        cx, cy = w / 2.0, h / 2.0
-        self._red = [scale_polygon(pts, cx, cy, u) for pts in RED_BURST_SHARDS]
-        self._black = [scale_polygon(pts, cx, cy, u) for pts in BLACK_BURST_SHARDS]
+    def configure(
+        self, w: int, h: int, cx: float, cy: float,
+        red_shards: list[tuple[tuple[float, float], ...]],
+        black_shards: list[tuple[tuple[float, float], ...]],
+        spin_dir: float = -1.0,
+    ) -> None:
+        if self.width() != w or self.height() != h:
+            self.setFixedSize(w, h)
+        self._cx = cx
+        self._cy = cy
+        self._spin_dir = spin_dir
+        self._red = [scale_polygon(pts, cx, cy, 1.0) for pts in red_shards]
+        self._black = [scale_polygon(pts, cx, cy, 1.0) for pts in black_shards]
 
     def set_anim(self, burst: float, t: float) -> None:
         self._burst = burst
@@ -1808,13 +2251,13 @@ class MenuBackdrop(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setOpacity(opacity)
-        cx = self.width() / 2.0
-        cy = self.height() / 2.0
+        cx = self._cx
+        cy = self._cy
         live = clamp(self._burst)
         pulse = 1.0 + 0.016 * math.sin(self._t * 2.4) * live
         sc = (0.18 + 0.82 * max(self._burst, 0.0)) * pulse
         p.translate(cx, cy)
-        p.rotate((1.0 - live) * -14.0)
+        p.rotate((1.0 - live) * (14.0 * self._spin_dir))
         p.scale(sc, sc)
         p.translate(-cx, -cy)
         p.setPen(Qt.PenStyle.NoPen)
@@ -1828,9 +2271,9 @@ class MenuBackdrop(QWidget):
 
 class RadialMenu(QWidget):
     """Menu radial bergaya menu battle Persona 5:
-      * Lapisan belakang (MenuBackdrop): ledakan serpihan spike merah-hitam di belakang karakter.
-      * Lapisan depan (jendela ini): 6 tombol trapesium (3 kiri + 3 kanan) yang mengipas dari
-        karakter, huruf besar bergaya cutout dengan subjudul bergaris hitam di tepi bawah.
+      * Lapisan belakang (MenuBackdrop): ledakan serpihan spike merah-hitam adaptif di belakang karakter.
+      * Lapisan depan (jendela ini): tombol trapesium adaptif yang menyeimbangkan tab aktif
+        dan berpindah otomatis menjauhi tepi/pojok layar agar selalu terjangkau.
       * Hover: bilah bergeser keluar, sapuan merah diagonal + bayangan putih + bintang berputar.
       * Tutup dengan redaman kritis (tanpa pantulan)."""
 
@@ -1842,7 +2285,7 @@ class RadialMenu(QWidget):
     OPEN_STIFFNESS, OPEN_DAMPING = 230.0, 15.0
     CLOSE_STIFFNESS = 340.0
 
-    # Master tab definitions: (key, label, subtitle, side, hi_idx)
+    # Master tab definitions: (key, label, subtitle, preferred_side, hi_idx)
     _TAB_DEFS: tuple[tuple[str, str, str, int, int], ...] = (
         ("events", "EVENTS", "This Week",       -1, 2),
         ("tasks",  "TASKS",  "To-Do List",      +1, 2),
@@ -1852,13 +2295,6 @@ class RadialMenu(QWidget):
         ("stats",  "STATS",  "Social Stats",    +1, 2),
         ("system", "SYSTEM", "Options & Sleep", -1, 2),
     )
-    # Non-overlapping fan slots per side count: list of (abs_ox_left, oy, rot_left_deg)
-    _SIDE_SLOTS: dict[int, tuple[tuple[float, float, float], ...]] = {
-        1: ((92.0,  -2.0,  +2.0),),
-        2: ((86.0, -34.0, +12.0), (86.0, +30.0, -10.0)),
-        3: ((80.0, -56.0, +20.0), (94.0,  -4.0,  +2.0), (88.0, +48.0, -11.0)),
-        4: ((76.0, -78.0, +26.0), (96.0, -26.0,  +9.0), (96.0, +26.0,  -7.0), (78.0, +76.0, -22.0)),
-    }
 
     def __init__(self, pet: PetWindow) -> None:
         super().__init__()
@@ -1866,13 +2302,22 @@ class RadialMenu(QWidget):
         self.setMouseTracking(True)
         self._pet = pet
         self._backdrop = MenuBackdrop()
+        self._enabled_keys: tuple[str, ...] = tuple(RADIAL_TAB_KEYS)
         self._buttons: list[MenuButton] = []
         self._u = 1.0                                    # button & font scale
         self._u_pos = 1.0                                # horizontal clearance from Morgana & HUD
         self._u_y = 1.0                                  # vertical separation scale
         self._ui_scale = 1.0
+        self._cx = 420.0
+        self._cy = 270.0
+        self._layout_mode = "both"
+        self._dy_px = 0.0
+        self._fit_scale = 1.0
+        self._btn_bounds = (-300.0, 300.0, -180.0, 180.0)
+        self._anchor_center: QPoint | None = None
         self._burst = Spring(0.0, 260.0, 17.0)           # animasi ledakan spike di belakang
         self._geom: dict[str, tuple] = {}                # cache poligon, huruf, dan path subjudul
+        self._geom_meta: dict[str, tuple[int, float]] = {}
         self._t = 0.0
         self._open = False
         self._mask_on = False
@@ -1886,35 +2331,28 @@ class RadialMenu(QWidget):
         self._auto_close.setInterval(15000)
         self._auto_close.timeout.connect(lambda: self.close_menu(silent=False, emit_user_close=False))
 
+    def _active_tab_defs(self) -> list[tuple[str, str, str, int, int]]:
+        wanted = set(self._enabled_keys)
+        defs = [d for d in self._TAB_DEFS if d[0] in wanted]
+        return defs if defs else list(self._TAB_DEFS)
+
     def set_enabled_tabs(self, enabled_keys: list[str] | tuple[str, ...]) -> None:
-        """Rebuild the radial fan for the active subset of tabs with balanced non-overlapping spacing."""
+        """Store active radial tabs and rebuild default balanced buttons."""
         wanted = set(enabled_keys or RADIAL_TAB_KEYS)
-        left_defs = [d for d in self._TAB_DEFS if d[3] < 0 and d[0] in wanted]
-        right_defs = [d for d in self._TAB_DEFS if d[3] > 0 and d[0] in wanted]
-        if not left_defs and not right_defs:
-            left_defs = [d for d in self._TAB_DEFS if d[3] < 0]
-            right_defs = [d for d in self._TAB_DEFS if d[3] > 0]
-
-        built_left: list[MenuButton] = []
-        slots_l = self._SIDE_SLOTS.get(len(left_defs), self._SIDE_SLOTS[4])
-        for (key, label, sub, side, hi), (ax, oy, rot_l) in zip(left_defs, slots_l):
-            built_left.append(MenuButton(key, label, sub, side, -ax, oy, rot_l, 176, 25, 48, hi, 0.0))
-
-        built_right: list[MenuButton] = []
-        slots_r = self._SIDE_SLOTS.get(len(right_defs), self._SIDE_SLOTS[3])
-        for (key, label, sub, side, hi), (ax, oy, rot_l) in zip(right_defs, slots_r):
-            built_right.append(MenuButton(key, label, sub, side, ax - 2.0, oy, -rot_l, 176, 25, 48, hi, 0.0))
-
-        # Interleave left/right so stagger opens symmetrically top-to-bottom
-        ordered: list[MenuButton] = []
-        for idx in range(max(len(built_left), len(built_right))):
-            if idx < len(built_left):
-                ordered.append(built_left[idx])
-            if idx < len(built_right):
-                ordered.append(built_right[idx])
-        for i, b in enumerate(ordered):
-            b.phase = float(i)
-        self._buttons = ordered
+        ordered_keys = tuple(d[0] for d in self._TAB_DEFS if d[0] in wanted)
+        self._enabled_keys = ordered_keys if ordered_keys else tuple(d[0] for d in self._TAB_DEFS)
+        # Build balanced default buttons immediately so state is valid even before first open
+        default_plan = compute_radial_layout(
+            self._active_tab_defs(), 800.0, 800.0, 500.0, 500.0,
+            1.0, 1.0, 1.0, 1.0,
+        )
+        self._buttons = [
+            MenuButton(
+                b["key"], b["label"], b["sub"], b["side"],
+                b["ox"], b["oy"], b["rot"], 176, 25, 48, b["hi"], float(i),
+            )
+            for i, b in enumerate(default_plan["buttons"])
+        ]
         self._hovered_idx = -1
         self._pressed = -1
         if self.isVisible():
@@ -1986,21 +2424,89 @@ class RadialMenu(QWidget):
         sub_path.addText(QPointF(tx, ty), sub_f, b.sub)
         return L, h_in, h_out, poly, shape, glyphs, sub_path
 
-    def _layout(self) -> None:
+    def _screen_spaces(self, c: QPoint) -> tuple[float, float, float, float]:
+        screen = QGuiApplication.screenAt(c) or QGuiApplication.primaryScreen()
+        if screen is None:
+            return 800.0, 800.0, 500.0, 500.0
+        area = screen.availableGeometry()
+        return (
+            float(c.x() - area.left()),
+            float(area.right() - c.x()),
+            float(c.y() - area.top()),
+            float(area.bottom() - c.y()),
+        )
+
+    def _layout(self, preserve_springs: bool = False, hysteresis: float = 0.0) -> None:
+        c = self._pet.sprite_center()
+        space_l, space_r, space_t, space_b = self._screen_spaces(c)
         u_sprite = max(0.72, self._pet.sprite_size / 180.0)
         u_btn = max(0.70, u_sprite * self._ui_scale)
         u_x = max(u_sprite, u_btn, self._ui_scale)
-        u_box = max(u_x, u_btn)
-        self._u_pos = u_x
-        self._u = u_btn
-        self._u_y = max(u_sprite, u_btn)
-        w, h = int(840 * u_box), int(540 * u_box)
-        self.setFixedSize(w, h)
-        self._backdrop.configure(w, h, u_box)
-        self._geom = {b.key: self._build_button_cache(b, u_btn) for b in self._buttons}
+        u_y = max(u_sprite, u_btn)
+
+        plan = compute_radial_layout(
+            self._active_tab_defs(),
+            space_l, space_r, space_t, space_b,
+            u_sprite, u_x, u_btn, u_y,
+            preferred_mode=self._layout_mode if preserve_springs else None,
+            hysteresis=hysteresis if preserve_springs else 0.0,
+        )
+
+        prev_by_key = {b.key: b for b in self._buttons} if preserve_springs else {}
+        rebuilt: list[MenuButton] = []
+        for i, spec in enumerate(plan["buttons"]):
+            key = spec["key"]
+            old = prev_by_key.get(key)
+            if old is not None:
+                old.side = spec["side"]
+                old.ox = spec["ox"]
+                old.oy = spec["oy"]
+                old.rot = spec["rot"]
+                old.phase = float(i)
+                rebuilt.append(old)
+            else:
+                rebuilt.append(MenuButton(
+                    key, spec["label"], spec["sub"], spec["side"],
+                    spec["ox"], spec["oy"], spec["rot"], 176, 25, 48, spec["hi"], float(i),
+                ))
+
+        self._buttons = rebuilt
+        self._hovered_idx = -1
+        self._pressed = -1
+        self._u_pos = plan["u_pos"]
+        self._u = plan["u_btn"]
+        self._u_y = plan["u_y"]
+        self._cx = plan["cx"]
+        self._cy = plan["cy"]
+        self._layout_mode = plan["mode"]
+        self._dy_px = plan["dy_px"]
+        self._fit_scale = plan["fit_scale"]
+        self._btn_bounds = plan["btn_bounds"]
+        self._anchor_center = QPoint(c)
+
+        w, h = plan["w"], plan["h"]
+        if self.width() != w or self.height() != h:
+            self.setFixedSize(w, h)
+        spin_dir = +1.0 if plan["mode"] == "left" else -1.0
+        self._backdrop.configure(
+            w, h, self._cx, self._cy, plan["red_shards"], plan["black_shards"], spin_dir=spin_dir,
+        )
+
+        # Rebuild button glyph cache only when (side, scale) changes; prune inactive keys
+        u_key = round(self._u, 4)
+        active_keys = {b.key for b in self._buttons}
+        for stale in list(self._geom.keys()):
+            if stale not in active_keys:
+                self._geom.pop(stale, None)
+                self._geom_meta.pop(stale, None)
+        for b in self._buttons:
+            meta = (b.side, u_key)
+            if self._geom_meta.get(b.key) != meta:
+                self._geom[b.key] = self._build_button_cache(b, self._u)
+                self._geom_meta[b.key] = meta
 
     def open_menu(self) -> None:
-        self._layout()
+        self._layout(preserve_springs=self.isVisible())
         self._hovered_idx = -1
         if self.isVisible():
             self._t = 10.0                      # sedang menutup lalu dibuka lagi: tanpa jeda stagger
@@ -2051,10 +2557,33 @@ class RadialMenu(QWidget):
         super().hideEvent(e)
         self._backdrop.hide()
 
+    def _needs_live_relayout(self, c: QPoint) -> bool:
+        """O(1) edge/corner check during live drag so open radial menu never clips off-screen."""
+        space_l, space_r, space_t, space_b = self._screen_spaces(c)
+        min_x, max_x, min_y, max_y = self._btn_bounds
+        if (min_x < -(space_l - 4.0) or max_x > (space_r - 4.0)
+                or min_y < -(space_t - 4.0) or max_y > (space_b - 4.0)):
+            return True
+        adapted = (
+            (self._layout_mode != "both" and len(self._buttons) >= 2)
+            or abs(self._dy_px) > 1.0
+            or self._fit_scale < 0.995
+        )
+        if adapted and self._anchor_center is not None:
+            if (c - self._anchor_center).manhattanLength() >= 28:
+                return True
+        return False
+
     def follow(self, force: bool = False) -> None:
         if self.isVisible() or force:
             c = self._pet.sprite_center()
-            pos = QPoint(c.x() - self.width() // 2, c.y() - self.height() // 2)
+            if self._open and not force and self._needs_live_relayout(c):
+                self._layout(preserve_springs=True, hysteresis=24.0)
+                if self._mask_on:
+                    self.setMask(self._build_mask())
+                self.update()
+                self._backdrop.update()
+            pos = QPoint(c.x() - int(round(self._cx)), c.y() - int(round(self._cy)))
             self.move(pos)
             self._backdrop.move(pos)
 
@@ -2063,7 +2592,7 @@ class RadialMenu(QWidget):
         if not self._geom:
             return self._pet.visual_bottom()
         u = self._u
-        max_y = float(self.height() / 2.0)
+        max_y = self._cy
         for b in self._buttons:
             if b.key not in self._geom:
                 continue
@@ -2078,7 +2607,7 @@ class RadialMenu(QWidget):
         if not self._geom:
             return self._pet.visual_top()
         u = self._u
-        min_y = float(self.height() / 2.0)
+        min_y = self._cy
         for b in self._buttons:
             if b.key not in self._geom:
                 continue
@@ -2131,8 +2660,8 @@ class RadialMenu(QWidget):
         fx = math.sin(self._t * 1.6 + b.phase) * 2.0 * u * live if wobble else 0.0
         fy = math.cos(self._t * 1.25 + b.phase * 1.3) * 2.4 * u * live if wobble else 0.0
         sway = math.sin(self._t * 1.1 + b.phase) * 0.7 * live if wobble else 0.0
-        cx = self.width() / 2.0
-        cy = self.height() / 2.0
+        cx = self._cx
+        cy = self._cy
         t = QTransform()
         t.translate(cx + b.ox * self._u_pos * pop + fx, cy + b.oy * self._u_y * pop + fy)
         t.rotate(b.rot + (1.0 - live) * 20.0 * -b.side + sway)      # mengipas masuk saat muncul
@@ -4167,10 +4696,10 @@ class PetController(QObject):
         self._say_tuple(self.dialogue.window_close(kind, self._ctx()), ms=3600)
 
     def _on_pet_moved(self) -> None:
+        self.menu.follow()
         self.bubble.follow()
         self.particles.follow()
         self.choices.follow()
-        self.menu.follow()
 
     def _sync_dialog_links(self) -> None:
         enabled = set(self.settings["enabled_tabs"])
