@@ -13,6 +13,7 @@ Design principles:
 """
 from __future__ import annotations
 
+import calendar
 import math
 import random
 import re
@@ -37,6 +38,7 @@ from calendar_service import CalendarResult, events_by_day, human_delta, morgana
 from lines import build_daily_briefing, build_evening_wrapup
 from motion import FrameTicker, Spring, clamp
 from particles import P5_NOTE_GOLD, P5_STAR_COLORS, Particle, draw_particle
+from sheets_sync import FinanceSheetMonthData, forbidden_bank_word, month_tab_name
 from storage_manager import (DAILY_BLOCK_TARGET, DEFAULT_STAT_POINTS, FINANCE_CATEGORIES,
                              FINANCE_CATEGORY_SHORT, FINANCE_WALLETS, FINANCE_WARN_RATIO,
                              QUICK_HOTKEY_PRESETS, QUICK_STAT_POINTS, RADIAL_TAB_KEYS,
@@ -3554,12 +3556,12 @@ class SettingsDialog(P5FluidPanel):
         lai.addLayout(test_row)
         cards_lay.addWidget(c_ai)
 
-        # Card 7: Google Sheets Sync (Write-Only Cloud Relay for WhatsApp Bot Reminders)
+        # Card 7: Google Sheets Sync (Tasks Relay + bot-wa Monthly Budget Finance)
         c_sh = _make_card()
         lsh = QVBoxLayout(c_sh)
         lsh.setContentsMargins(pad_x, pad_y, pad_x, pad_y)
         lsh.setSpacing(row_gap)
-        hsh = QLabel("GOOGLE SHEETS SYNC (WHATSAPP RELAY)")
+        hsh = QLabel("GOOGLE SHEETS SYNC (BOT-WA)")
         hsh.setObjectName("section")
         lsh.addWidget(hsh)
 
@@ -3567,13 +3569,19 @@ class SettingsDialog(P5FluidPanel):
         self.sheets_sync_enabled_check.toggled.connect(self._sync_sheets_fields)
         lsh.addWidget(self.sheets_sync_enabled_check)
 
+        self.finance_sheets_enabled_check = P5CheckBox(
+            "Connect Finance window to Monthly Budget tabs (bot-wa)", scale=sc,
+        )
+        self.finance_sheets_enabled_check.toggled.connect(self._sync_sheets_fields)
+        lsh.addWidget(self.finance_sheets_enabled_check)
+
         self.sheets_id_edit = QLineEdit()
         self.sheets_id_edit.setPlaceholderText("Spreadsheet ID or Google Sheets URL")
         self._row(lsh, "Sheet ID / URL", self.sheets_id_edit, wide=True)
 
         self.sheets_tab_edit = QLineEdit()
         self.sheets_tab_edit.setPlaceholderText("Morgana")
-        self._row(lsh, "Tab Name", self.sheets_tab_edit, wide=True)
+        self._row(lsh, "Tasks Tab", self.sheets_tab_edit, wide=True)
 
         key_wrap = QWidget()
         key_lay = QHBoxLayout(key_wrap)
@@ -3596,7 +3604,7 @@ class SettingsDialog(P5FluidPanel):
         self._sheets_test_btn.clicked.connect(self._on_test_sheets_clicked)
         sh_btn_row.addWidget(self._sheets_test_btn)
 
-        self._sheets_sync_btn = self._btn("SYNC NOW", variant="soft", display=True, px=10)
+        self._sheets_sync_btn = self._btn("SYNC TASKS", variant="soft", display=True, px=10)
         self._sheets_sync_btn.setFixedHeight(_sc(26, sc, 22))
         self._sheets_sync_btn.clicked.connect(self._on_sync_sheets_now_clicked)
         sh_btn_row.addWidget(self._sheets_sync_btn)
@@ -3604,7 +3612,8 @@ class SettingsDialog(P5FluidPanel):
         lsh.addLayout(sh_btn_row)
 
         self._sheets_status_lbl = QLabel(
-            "Off by default. Pushes active deadlines to a Sheet tab so your WhatsApp bot reminds you anywhere."
+            "Off by default. Shares the exact same Spreadsheet ID & kunci-google.json as bot-wa "
+            "(Januari–Desember budget tabs + optional task deadline relay)."
         )
         self._sheets_status_lbl.setObjectName("tip")
         self._sheets_status_lbl.setWordWrap(True)
@@ -3722,11 +3731,15 @@ class SettingsDialog(P5FluidPanel):
         self._ai_test_lbl.setStyleSheet(f"color: {color}; font-size: {_sc(12, self._ui_scale, 9)}px; font-weight: bold;")
         self._ai_test_lbl.setText(message)
 
-    def _sync_sheets_fields(self, enabled: bool) -> None:
-        on = bool(enabled)
-        for w in (self.sheets_id_edit, self.sheets_tab_edit, self.sheets_key_edit,
-                  self._sheets_browse_btn, self._sheets_test_btn, self._sheets_sync_btn):
-            w.setEnabled(on)
+    def _sync_sheets_fields(self, _checked: bool = False) -> None:
+        tasks_on = self.sheets_sync_enabled_check.isChecked()
+        fin_on = self.finance_sheets_enabled_check.isChecked()
+        any_on = tasks_on or fin_on
+        for w in (self.sheets_id_edit, self.sheets_key_edit,
+                  self._sheets_browse_btn, self._sheets_test_btn):
+            w.setEnabled(any_on)
+        self.sheets_tab_edit.setEnabled(tasks_on)
+        self._sheets_sync_btn.setEnabled(tasks_on)
 
     def _browse_sheets_key(self) -> None:
         cur = self.sheets_key_edit.text().strip()
@@ -3743,6 +3756,7 @@ class SettingsDialog(P5FluidPanel):
     def _sheets_form_payload(self) -> dict:
         return {
             "enabled": self.sheets_sync_enabled_check.isChecked(),
+            "finance_enabled": self.finance_sheets_enabled_check.isChecked(),
             "spreadsheet_id": self.sheets_id_edit.text().strip(),
             "tab_name": self.sheets_tab_edit.text().strip() or SETTINGS_DEFAULTS["sheets_sync_tab"],
             "key_path": self.sheets_key_edit.text().strip(),
@@ -3763,9 +3777,10 @@ class SettingsDialog(P5FluidPanel):
         self.sync_sheets_now_requested.emit(self._sheets_form_payload())
 
     def set_sheets_status(self, ok: bool, message: str) -> None:
-        on = self.sheets_sync_enabled_check.isChecked()
-        self._sheets_test_btn.setEnabled(on)
-        self._sheets_sync_btn.setEnabled(on)
+        tasks_on = self.sheets_sync_enabled_check.isChecked()
+        fin_on = self.finance_sheets_enabled_check.isChecked()
+        self._sheets_test_btn.setEnabled(tasks_on or fin_on)
+        self._sheets_sync_btn.setEnabled(tasks_on)
         color = "#5CE09A" if ok else "#FF6B78"
         self._sheets_status_lbl.setStyleSheet(f"color: {color}; font-size: {_sc(12, self._ui_scale, 9)}px; font-weight: bold;")
         self._sheets_status_lbl.setText(message)
@@ -3915,15 +3930,18 @@ class SettingsDialog(P5FluidPanel):
             self._ai_test_lbl.setText("Off by default. Free Gemini keys: aistudio.google.com/apikey")
             self._sync_ai_fields(ai_on)
             sh_on = bool(values.get("sheets_sync_enabled", SETTINGS_DEFAULTS["sheets_sync_enabled"]))
+            fin_sh_on = bool(values.get("finance_sheets_enabled", SETTINGS_DEFAULTS["finance_sheets_enabled"]))
             self.sheets_sync_enabled_check.setChecked(sh_on)
+            self.finance_sheets_enabled_check.setChecked(fin_sh_on)
             self.sheets_id_edit.setText(str(values.get("sheets_sync_id", SETTINGS_DEFAULTS["sheets_sync_id"])))
             self.sheets_tab_edit.setText(str(values.get("sheets_sync_tab", SETTINGS_DEFAULTS["sheets_sync_tab"])))
             self.sheets_key_edit.setText(str(values.get("sheets_sync_key_path", SETTINGS_DEFAULTS["sheets_sync_key_path"])))
             self._sheets_status_lbl.setStyleSheet("")
             self._sheets_status_lbl.setText(
-                "Off by default. Pushes active deadlines to a Sheet tab so your WhatsApp bot reminds you anywhere."
+                "Off by default. Shares the exact same Spreadsheet ID & kunci-google.json as bot-wa "
+                "(Januari–Desember budget tabs + optional task deadline relay)."
             )
-            self._sync_sheets_fields(sh_on)
+            self._sync_sheets_fields()
             enabled = set(values.get("enabled_tabs", RADIAL_TAB_KEYS))
             for key, cb in self.tab_checks.items():
                 cb.setChecked(key in enabled)
@@ -3997,6 +4015,7 @@ class SettingsDialog(P5FluidPanel):
                 ai_call_user=self.ai_call_user_edit.text().strip() or "Joker",
                 ai_dialogue_enabled=self.ai_dialogue_check.isChecked(),
                 sheets_sync_enabled=self.sheets_sync_enabled_check.isChecked(),
+                finance_sheets_enabled=self.finance_sheets_enabled_check.isChecked(),
                 sheets_sync_id=self.sheets_id_edit.text().strip(),
                 sheets_sync_tab=self.sheets_tab_edit.text().strip() or SETTINGS_DEFAULTS["sheets_sync_tab"],
                 sheets_sync_key_path=self.sheets_key_edit.text().strip(),
@@ -7871,15 +7890,26 @@ class FinanceTxDelegate(QStyledItemDelegate):
 
 
 class FinanceDialog(P5FluidPanel):
-    """Persona 5 personal finance ledger inspired by bot-wa (wallets, categories, budgets, bills & shortcuts)."""
+    """Persona 5 personal finance ledger inspired by bot-wa (local or live Google Sheets Monthly Budget)."""
 
-    finance_changed = pyqtSignal(str, dict)   # event_kind ("add"|"edit"|"delete"|"bill"), payload
+    finance_changed = pyqtSignal(str, dict)          # event_kind ("add"|"edit"|"delete"|"bill"), payload
     open_settings = pyqtSignal()
+    sheet_refresh_requested = pyqtSignal(int, int)   # year, month
+    sheet_write_requested = pyqtSignal(dict)         # tx payload (+ optional bill_id/bill_year/bill_month)
+    sheet_edit_requested = pyqtSignal(dict, dict)    # old_tx, new_payload
+    sheet_delete_requested = pyqtSignal(dict)        # tx
+    sheet_undo_requested = pyqtSignal(str, dict)     # undo_kind ("sheet_add"|"sheet_delete"), payload
 
     _MONTH_NAMES = ("JAN", "FEB", "MAR", "APR", "MAY", "JUN",
                     "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
 
-    def __init__(self, store: FinanceStore, on_top: bool = True, ui_scale: float = 1.0) -> None:
+    def __init__(
+        self,
+        store: FinanceStore,
+        on_top: bool = True,
+        ui_scale: float = 1.0,
+        sheet_mode: bool = False,
+    ) -> None:
         super().__init__("FINANCE", QSize(890, 680), on_top=on_top, ui_scale=ui_scale)
         sc = self._ui_scale
         self.store = store
@@ -7893,13 +7923,29 @@ class FinanceDialog(P5FluidPanel):
         self._selected_to_wallet = "BNI"
         self._tx_filter = "all"
         self._editing_tx_id: str | None = None
+        self._editing_sheet_tx: dict | None = None
         self._undo_kind = ""
         self._undo_payload: dict | None = None
+        self._sheet_mode = bool(sheet_mode)
+        self._sheet_busy = False
+        self._sheet_data: FinanceSheetMonthData | None = None
+        self._sheet_tx_by_id: dict[str, dict] = {}
+        self._sheet_error = ""
         self._budget_inputs: dict[str, QLineEdit] = {}
         self._budget_bars: dict[str, tuple[QLabel, QLabel, QProgressBar]] = {}
         self._wallet_rows: dict[str, tuple[QLabel, QProgressBar]] = {}
 
-        # -- Header bar: Month navigation + Settings + Close -----------------
+        # -- Header bar: Sheets status + Month navigation + Settings + Close -
+        self._sheet_badge = QLabel("LOCAL")
+        self._sheet_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._sheet_badge.setFixedHeight(_sc(24, sc, 20))
+        self.header_bar.addWidget(self._sheet_badge)
+
+        self._sheet_action_btn = self._btn("CONNECT", variant="soft", display=True, px=9)
+        self._sheet_action_btn.setFixedHeight(_sc(26, sc, 22))
+        self._sheet_action_btn.clicked.connect(self._on_sheet_action_clicked)
+        self.header_bar.addWidget(self._sheet_action_btn)
+
         prev_m = self._btn("◀", variant="soft", display=True, px=11)
         prev_m.setFixedSize(_sc(28, sc, 22), _sc(26, sc, 22))
         prev_m.setToolTip("Previous month")
@@ -7921,8 +7967,9 @@ class FinanceDialog(P5FluidPanel):
         next_m.clicked.connect(lambda _c=False: self._shift_month(+1))
         self.header_bar.addWidget(next_m)
 
-        today_m = self._btn("THIS MONTH", variant="gold", display=True, px=9)
+        today_m = self._btn("TODAY", variant="gold", display=True, px=9)
         today_m.setFixedHeight(_sc(26, sc, 22))
+        today_m.setToolTip("Jump to current month")
         today_m.clicked.connect(self._jump_this_month)
         self.header_bar.addWidget(today_m)
 
@@ -8452,11 +8499,173 @@ class FinanceDialog(P5FluidPanel):
         self._select_wallet("Tunai")
         self._select_to_wallet("BNI")
         self._set_tab("tx")
+        self._update_sheet_badge()
         self.refresh()
+
+    # -- Google Sheets Mode State & Callbacks --------------------------------
+    def is_sheet_mode(self) -> bool:
+        return self._sheet_mode
+
+    def view_period(self) -> tuple[int, int]:
+        return self._view_year, self._view_month
+
+    def set_sheet_mode(self, enabled: bool) -> None:
+        want = bool(enabled)
+        if want == self._sheet_mode:
+            self._update_sheet_badge()
+            return
+        if self._editing_tx_id is not None:
+            self._cancel_edit()
+        self._sheet_mode = want
+        self._sheet_busy = False
+        self._sheet_data = None
+        self._sheet_tx_by_id = {}
+        self._sheet_error = ""
+        self._undo_kind = ""
+        self._undo_payload = None
+        self._update_sheet_badge()
+        self.refresh()
+        if self._sheet_mode and self.isVisible():
+            self.request_sheet_refresh()
+
+    def set_sheet_busy(self, busy: bool, status_text: str = "") -> None:
+        self._sheet_busy = bool(busy)
+        self._submit_btn.setEnabled(not self._sheet_busy)
+        self._sheet_action_btn.setEnabled((not self._sheet_mode) or (not self._sheet_busy))
+        if status_text:
+            self._form_status.setText(status_text)
+        self._update_sheet_badge()
+
+    def request_sheet_refresh(self) -> None:
+        if not self._sheet_mode:
+            return
+        self._sheet_error = ""
+        self.set_sheet_busy(True)
+        self.sheet_refresh_requested.emit(self._view_year, self._view_month)
+
+    def apply_sheet_month(self, data: FinanceSheetMonthData) -> None:
+        if not self._sheet_mode:
+            return
+        if (data.year, data.month) != (self._view_year, self._view_month):
+            return
+        self._sheet_busy = False
+        self._submit_btn.setEnabled(True)
+        self._sheet_action_btn.setEnabled(True)
+        if data.ok:
+            self._sheet_data = data
+            self._sheet_error = ""
+            self._sheet_tx_by_id = {t["id"]: t for t in data.transactions}
+        else:
+            self._sheet_data = None
+            self._sheet_tx_by_id = {}
+            self._sheet_error = data.error or "Failed to load Google Sheets."
+            self._form_status.setText(self._sheet_error)
+        self._update_sheet_badge()
+        self.refresh()
+
+    def on_sheet_op_done(
+        self,
+        ok: bool,
+        action: str,
+        message: str,
+        undo_kind: str = "",
+        undo_payload: dict | None = None,
+    ) -> None:
+        self._sheet_busy = False
+        self._submit_btn.setEnabled(True)
+        self._sheet_action_btn.setEnabled(True)
+        self._update_sheet_badge()
+        if not ok:
+            if action == "bill":
+                self._plan_status.setText(message or "Google Sheets bill write failed.")
+            else:
+                self._form_status.setText(message or "Google Sheets write failed.")
+            return
+        if action in ("add", "edit", "bill", "undo"):
+            play_ui("select")
+        elif action == "delete":
+            play_ui("close")
+        if action == "edit":
+            self._cancel_edit()
+            self._form_status.setText(message)
+        elif action == "add":
+            self._amt_input.clear()
+            self._title_input.clear()
+            self._form_status.setText(message)
+        elif action == "bill":
+            self._plan_status.setText(message)
+        else:
+            self._form_status.setText(message)
+        if undo_kind and undo_payload:
+            self._undo_kind = undo_kind
+            self._undo_payload = undo_payload
+            self._undo.trigger(message[:38])
+
+    def _on_sheet_action_clicked(self) -> None:
+        if not self._sheet_mode:
+            self.open_settings.emit()
+            return
+        if not self._sheet_busy:
+            self.request_sheet_refresh()
+
+    def _update_sheet_badge(self) -> None:
+        sc = self._ui_scale
+        pad_x = _sc(8, sc, 6)
+        px = _sc(10, sc, 8)
+        base_css = (
+            f'border-radius: 4px; padding: 2px {pad_x}px; '
+            f'font-family: "Barlow Condensed", sans-serif; '
+            f'font-size: {px}px; font-weight: 800; letter-spacing: 0.6px;'
+        )
+        if not self._sheet_mode:
+            self._sheet_badge.setText("LOCAL")
+            self._sheet_badge.setToolTip("Local finance.json storage. Click CONNECT to sync with Google Sheets (bot-wa).")
+            self._sheet_badge.setStyleSheet(
+                f"background: #222634; color: #9FA6BA; border: 1px solid #353B4E; {base_css}"
+            )
+            self._sheet_action_btn.setText("CONNECT")
+            self._sheet_action_btn.set_variant("soft")
+            self._sheet_action_btn.setToolTip("Open Settings to connect Google Sheets (bot-wa)")
+            self._sheet_action_btn.setEnabled(True)
+            return
+
+        tab_name = month_tab_name(self._view_month)
+        if self._sheet_busy:
+            self._sheet_badge.setText("SYNCING...")
+            self._sheet_badge.setToolTip(f"Syncing tab '{tab_name}' with Google Sheets...")
+            self._sheet_badge.setStyleSheet(
+                f"background: #332910; color: #FAD02C; border: 1px solid #6E5818; {base_css}"
+            )
+            self._sheet_action_btn.setText("SYNC")
+            self._sheet_action_btn.set_variant("soft")
+            self._sheet_action_btn.setEnabled(False)
+        elif self._sheet_error:
+            self._sheet_badge.setText("SHEET ERR")
+            self._sheet_badge.setToolTip(self._sheet_error)
+            self._sheet_badge.setStyleSheet(
+                f"background: #3A1218; color: #FF6B78; border: 1px solid #7A2330; {base_css}"
+            )
+            self._sheet_action_btn.setText("RETRY")
+            self._sheet_action_btn.set_variant("gold")
+            self._sheet_action_btn.setToolTip("Retry Google Sheets sync")
+            self._sheet_action_btn.setEnabled(True)
+        else:
+            self._sheet_badge.setText(f"SHEET · {tab_name[:3].upper()}")
+            self._sheet_badge.setToolTip(f"Connected to Google Sheets tab '{tab_name}' (bot-wa format)")
+            self._sheet_badge.setStyleSheet(
+                f"background: #123322; color: #5CE09A; border: 1px solid #246845; {base_css}"
+            )
+            self._sheet_action_btn.setText("SYNC")
+            self._sheet_action_btn.set_variant("soft")
+            self._sheet_action_btn.setToolTip(f"Refresh '{tab_name}' from Google Sheets")
+            self._sheet_action_btn.setEnabled(True)
 
     # -- Navigation & Tab Switching ------------------------------------------
     def on_shown(self) -> None:
+        self._update_sheet_badge()
         self.refresh()
+        if self._sheet_mode:
+            self.request_sheet_refresh()
         if self._active_tab == "tx":
             QTimer.singleShot(20, self._amt_input.setFocus)
 
@@ -8488,12 +8697,26 @@ class FinanceDialog(P5FluidPanel):
             m = 1
             y += 1
         self._view_year, self._view_month = y, m
-        self.refresh()
+        if self._sheet_mode:
+            self._sheet_data = None
+            self._sheet_tx_by_id = {}
+            self._sheet_error = ""
+            self.refresh()
+            self.request_sheet_refresh()
+        else:
+            self.refresh()
 
     def _jump_this_month(self) -> None:
         today = date.today()
         self._view_year, self._view_month = today.year, today.month
-        self.refresh()
+        if self._sheet_mode:
+            self._sheet_data = None
+            self._sheet_tx_by_id = {}
+            self._sheet_error = ""
+            self.refresh()
+            self.request_sheet_refresh()
+        else:
+            self.refresh()
 
     # -- Form Controls -------------------------------------------------------
     def _select_tx_type(self, kind: str) -> None:
@@ -8580,6 +8803,8 @@ class FinanceDialog(P5FluidPanel):
 
     # -- Transaction CRUD + Inline Edit + Undo -------------------------------
     def _submit_transaction(self) -> None:
+        if self._sheet_mode and self._sheet_busy:
+            return
         amt = parse_rupiah(self._amt_input.text())
         if amt is None:
             self._form_status.setText("Enter a valid amount (e.g. 15rb, 1.5jt, or 25000).")
@@ -8591,6 +8816,47 @@ class FinanceDialog(P5FluidPanel):
         title = self._title_input.text().strip()
         qd = self._date_edit.date()
         day_s = f"{qd.year():04d}-{qd.month():02d}-{qd.day():02d}"
+
+        if self._sheet_mode:
+            # Immediate bot-wa formula guard before sending any network request
+            if self._tx_type == "income":
+                allowed = self._selected_wallet if self._selected_wallet in ("BNI", "Mandiri") else None
+                bad = forbidden_bank_word(title, allowed_bank=allowed)
+                if bad:
+                    if allowed:
+                        self._form_status.setText(
+                            f"Cannot include '{bad}' in a {allowed} deposit note (protects Sheet bank formulas)."
+                        )
+                    else:
+                        self._form_status.setText(
+                            f"Cash income note cannot include '{bad}' (Sheets would count it as bank income)."
+                        )
+                    return
+            elif self._tx_type == "transfer":
+                bad = forbidden_bank_word(title, allowed_bank=None)
+                if bad:
+                    self._form_status.setText(
+                        f"Transfer note cannot include '{bad}' (protects Sheet bank formulas)."
+                    )
+                    return
+
+            payload = {
+                "type": self._tx_type,
+                "amount": amt,
+                "title": title,
+                "category": self._selected_cat,
+                "wallet": self._selected_wallet,
+                "to_wallet": self._selected_to_wallet,
+                "date": day_s,
+            }
+            self._view_year, self._view_month = qd.year(), qd.month()
+            if self._editing_tx_id is not None and self._editing_sheet_tx is not None:
+                self.set_sheet_busy(True, "Updating row in Google Sheets...")
+                self.sheet_edit_requested.emit(dict(self._editing_sheet_tx), payload)
+            else:
+                self.set_sheet_busy(True, f"Writing to Google Sheets ({month_tab_name(qd.month())})...")
+                self.sheet_write_requested.emit(payload)
+            return
 
         if self._editing_tx_id is not None:
             tx_id = self._editing_tx_id
@@ -8631,24 +8897,30 @@ class FinanceDialog(P5FluidPanel):
         self.finance_changed.emit("add", tx)
 
     def _start_edit_selected_tx(self) -> None:
+        if self._sheet_mode and self._sheet_busy:
+            return
         item = self._tx_list.currentItem()
         if item is None:
             return
         tx_id = item.data(ROLE_ID)
         if not tx_id:
             return
-        tx = self.store.get_transaction(tx_id)
+        tx = self._sheet_tx_by_id.get(tx_id) if self._sheet_mode else self.store.get_transaction(tx_id)
         if tx is None:
             return
+        if self._sheet_mode and tx.get("sheet_kind") == "qris_pool":
+            self._form_status.setText("QRIS monthly pool rows are updated automatically by QRIS expenses.")
+            return
         self._editing_tx_id = tx_id
+        self._editing_sheet_tx = dict(tx) if self._sheet_mode else None
         self._select_tx_type(tx["type"])
         if tx["type"] == "expense" and tx.get("category"):
             self._select_category(tx["category"])
-        self._select_wallet(tx["wallet"])
-        if tx["type"] == "transfer" and tx.get("to_wallet"):
+        self._select_wallet(tx["wallet"] if tx.get("wallet") in FINANCE_WALLETS else "Tunai")
+        if tx["type"] == "transfer" and tx.get("to_wallet") in FINANCE_WALLETS:
             self._select_to_wallet(tx["to_wallet"])
         self._amt_input.setText(str(tx["amount"]))
-        self._title_input.setText(tx["title"])
+        self._title_input.setText(str(tx.get("edit_note", tx["title"])))
         try:
             d = date.fromisoformat(tx["date"])
             self._date_edit.setDate(QDate(d.year, d.month, d.day))
@@ -8668,6 +8940,7 @@ class FinanceDialog(P5FluidPanel):
 
     def _cancel_edit(self) -> None:
         self._editing_tx_id = None
+        self._editing_sheet_tx = None
         self._form_hdr_lbl.setText("RECORD TRANSACTION")
         self._form_hdr_lbl.setStyleSheet("")
         self._form_card.setStyleSheet("")
@@ -8680,6 +8953,8 @@ class FinanceDialog(P5FluidPanel):
         self._select_tx_type(self._tx_type)
 
     def _delete_selected_tx(self) -> None:
+        if self._sheet_mode and self._sheet_busy:
+            return
         item = self._tx_list.currentItem()
         if item is None:
             return
@@ -8688,6 +8963,16 @@ class FinanceDialog(P5FluidPanel):
             return
         if self._editing_tx_id == tx_id:
             self._cancel_edit()
+        if self._sheet_mode:
+            tx = self._sheet_tx_by_id.get(tx_id)
+            if tx is None:
+                return
+            if tx.get("sheet_kind") == "qris_pool":
+                self._form_status.setText("QRIS monthly pool rows are updated automatically — undo individual QRIS expenses instead.")
+                return
+            self.set_sheet_busy(True, "Clearing row in Google Sheets...")
+            self.sheet_delete_requested.emit(dict(tx))
+            return
         removed = self.store.delete_transaction(tx_id)
         if removed is None:
             return
@@ -8701,11 +8986,18 @@ class FinanceDialog(P5FluidPanel):
     def _undo_last(self) -> None:
         if not self._undo_payload:
             return
+        if self._sheet_mode and self._sheet_busy:
+            return
         if self._editing_tx_id is not None:
             self._cancel_edit()
+        kind = self._undo_kind
         payload = self._undo_payload
         self._undo_kind = ""
         self._undo_payload = None
+        if self._sheet_mode and kind.startswith("sheet_"):
+            self.set_sheet_busy(True, "Reverting last change in Google Sheets...")
+            self.sheet_undo_requested.emit(kind, payload)
+            return
         restored = self.store.restore_transaction(payload)
         if restored is not None:
             play_ui("select")
@@ -8750,6 +9042,33 @@ class FinanceDialog(P5FluidPanel):
             self.refresh()
 
     def _pay_bill(self, bill_id: str) -> None:
+        if self._sheet_mode:
+            if self._sheet_busy:
+                return
+            bill = self.store.get_bill(bill_id)
+            if bill is None:
+                return
+            today = date.today()
+            if today.year == self._view_year and today.month == self._view_month:
+                pay_day = today.isoformat()
+            else:
+                last_d = calendar.monthrange(self._view_year, self._view_month)[1]
+                pay_day = date(self._view_year, self._view_month, min(bill["day"], last_d)).isoformat()
+            self._plan_status.setText(f"Recording bill '{bill['name']}' to Google Sheets...")
+            self.set_sheet_busy(True)
+            self.sheet_write_requested.emit({
+                "type": "expense",
+                "amount": bill["amount"],
+                "title": bill["name"],
+                "category": bill["category"],
+                "wallet": bill["wallet"],
+                "to_wallet": "",
+                "date": pay_day,
+                "bill_id": bill_id,
+                "bill_year": self._view_year,
+                "bill_month": self._view_month,
+            })
+            return
         bill, tx = self.store.pay_bill(bill_id, self._view_year, self._view_month)
         if bill is not None and tx is not None:
             play_ui("select")
@@ -8785,25 +9104,59 @@ class FinanceDialog(P5FluidPanel):
             self.refresh()
 
     # -- Full UI Refresh -----------------------------------------------------
-    def refresh(self) -> None:
-        sc = self._ui_scale
-        self._month_lbl.setText(f"{self._MONTH_NAMES[self._view_month - 1]} {self._view_year}")
-
-        bal = self.store.wallet_balances()
-        summ = self.store.month_summary(self._view_year, self._view_month)
-
-        self._kpi_bal_val.setText(format_rupiah(bal["Total"]))
-        self._kpi_bal_sub.setText(
-            f"Tunai {format_rupiah(bal['Tunai'])} · BNI {format_rupiah(bal['BNI'])} · Mandiri {format_rupiah(bal['Mandiri'])}"
+    def _active_data(self) -> tuple[dict[str, int], dict, list[dict]]:
+        if self._sheet_mode:
+            if (self._sheet_data is not None and self._sheet_data.ok
+                    and (self._sheet_data.year, self._sheet_data.month) == (self._view_year, self._view_month)):
+                return self._sheet_data.balances, self._sheet_data.summary, self._sheet_data.transactions
+            empty_bal = {"Tunai": 0, "BNI": 0, "Mandiri": 0, "Total": 0}
+            empty_sum = {
+                "income": 0,
+                "expense": 0,
+                "net": 0,
+                "today_expense": 0,
+                "count": 0,
+                "by_category": {c: 0 for c in FINANCE_CATEGORIES},
+            }
+            return empty_bal, empty_sum, []
+        return (
+            self.store.wallet_balances(),
+            self.store.month_summary(self._view_year, self._view_month),
+            self.store.month_transactions(self._view_year, self._view_month),
         )
-        self._kpi_inc_val.setText("+" + format_rupiah(summ["income"]))
-        net = summ["net"]
-        net_prefix = "+" if net >= 0 else ""
-        self._kpi_inc_sub.setText(f"Net: {net_prefix}{format_rupiah(net)}")
-        self._kpi_exp_val.setText("-" + format_rupiah(summ["expense"]))
-        self._kpi_exp_sub.setText(f"{summ['count']} entries this month")
-        self._kpi_tod_val.setText(format_rupiah(summ["today_expense"]))
-        self._kpi_tod_sub.setText("Spent today")
+
+    def refresh(self) -> None:
+        self._month_lbl.setText(f"{self._MONTH_NAMES[self._view_month - 1]} {self._view_year}")
+        self._update_sheet_badge()
+
+        bal, summ, _items = self._active_data()
+        sheet_waiting = self._sheet_mode and self._sheet_data is None
+
+        if sheet_waiting:
+            self._kpi_bal_val.setText("..." if self._sheet_busy else "—")
+            self._kpi_bal_sub.setText(
+                f"Loading '{month_tab_name(self._view_month)}' from Google Sheets..."
+                if self._sheet_busy else (self._sheet_error or "Click SYNC to load Google Sheets")
+            )
+            self._kpi_inc_val.setText("..." if self._sheet_busy else "—")
+            self._kpi_inc_sub.setText("Google Sheets mode")
+            self._kpi_exp_val.setText("..." if self._sheet_busy else "—")
+            self._kpi_exp_sub.setText(f"Tab: {month_tab_name(self._view_month)}")
+            self._kpi_tod_val.setText("..." if self._sheet_busy else "—")
+            self._kpi_tod_sub.setText("Spent today")
+        else:
+            self._kpi_bal_val.setText(format_rupiah(bal["Total"]))
+            self._kpi_bal_sub.setText(
+                f"Tunai {format_rupiah(bal['Tunai'])} · BNI {format_rupiah(bal['BNI'])} · Mandiri {format_rupiah(bal['Mandiri'])}"
+            )
+            self._kpi_inc_val.setText("+" + format_rupiah(summ["income"]))
+            net = summ["net"]
+            net_prefix = "+" if net >= 0 else ""
+            self._kpi_inc_sub.setText(f"Net: {net_prefix}{format_rupiah(net)}")
+            self._kpi_exp_val.setText("-" + format_rupiah(summ["expense"]))
+            self._kpi_exp_sub.setText(f"{summ['count']} entries this month")
+            self._kpi_tod_val.setText(format_rupiah(summ["today_expense"]))
+            self._kpi_tod_sub.setText("Spent today")
 
         self._refresh_shortcut_chips()
         self._refresh_tx_list()
@@ -8827,7 +9180,7 @@ class FinanceDialog(P5FluidPanel):
             self._sc_grid.addWidget(btn, idx // 4, idx % 4)
 
     def _refresh_tx_list(self) -> None:
-        items = self.store.month_transactions(self._view_year, self._view_month)
+        _bal, _summ, items = self._active_data()
         q = self._search_input.text().strip().lower()
         flt = self._tx_filter
         filtered: list[dict] = []
@@ -8845,7 +9198,13 @@ class FinanceDialog(P5FluidPanel):
         self._tx_count_lbl.setText(f"{len(filtered)} {'entry' if len(filtered) == 1 else 'entries'}")
         self._tx_list.clear()
         if not filtered:
-            empty = QListWidgetItem("No transactions match this month or filter.\nRecord an expense, income, or transfer on the left!")
+            if self._sheet_mode and self._sheet_busy and self._sheet_data is None:
+                msg = f"Loading '{month_tab_name(self._view_month)}' from Google Sheets..."
+            elif self._sheet_mode and self._sheet_error:
+                msg = f"Google Sheets unavailable:\n{self._sheet_error}"
+            else:
+                msg = "No transactions match this month or filter.\nRecord an expense, income, or transfer on the left!"
+            empty = QListWidgetItem(msg)
             empty.setData(ROLE_ID, None)
             empty.setFlags(Qt.ItemFlag.NoItemFlags)
             self._tx_list.addItem(empty)
@@ -8867,7 +9226,8 @@ class FinanceDialog(P5FluidPanel):
                 meta = f"{t['wallet']} → {t.get('to_wallet', '')} · {d_str}"
             else:
                 amt_txt = "-" + format_rupiah(t["amount"])
-                meta = f"{t.get('category', 'Jajan')} · {t['wallet']} · {d_str}"
+                wal_part = f" · {t['wallet']}" if t.get("wallet") else ""
+                meta = f"{t.get('category', 'Jajan')}{wal_part} · {d_str}"
             it.setData(ROLE_BADGE, amt_txt)
             it.setData(ROLE_DATE, meta)
             self._tx_list.addItem(it)

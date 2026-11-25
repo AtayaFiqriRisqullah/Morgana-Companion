@@ -83,8 +83,12 @@ from theme import (BLACK, BLUE, GOLD, LIGHT_RED, MENU_QSS, P5_MINT_FG,
 from ui_dialogs import (BriefingDialog, EventsDialog, FinanceDialog, NotesDialog,
                         QuickCommandDialog, SettingsDialog, SocialStatsDialog, TasksDialog,
                         TimerDialog, WrapUpDialog)
-from sheets_sync import (SheetsPushResult, SheetsSyncConfig, push_tasks_to_sheets,
-                         serialize_tasks_to_rows, test_sheets_connection)
+from sheets_sync import (FinanceSheetMonthData, FinanceSheetWriteResult,
+                         SheetsPushResult, SheetsSyncConfig,
+                         clear_finance_cells_in_sheets, fetch_finance_month_from_sheets,
+                         forbidden_bank_word, push_tasks_to_sheets,
+                         serialize_tasks_to_rows, test_sheets_connection,
+                         update_finance_tx_in_sheets, write_finance_tx_to_sheets)
 
 try:
     import psutil
@@ -3249,14 +3253,21 @@ class SheetsSyncWorker(QObject):
         threading.Thread(target=_run, daemon=True, name="morgana-sheets-push").start()
         return True
 
-    def test_connection(self, cfg: SheetsSyncConfig) -> bool:
+    def test_connection(
+        self,
+        cfg: SheetsSyncConfig,
+        check_tasks: bool = True,
+        check_finance: bool = False,
+    ) -> bool:
         if self._test_busy:
             return False
         self._test_busy = True
 
         def _run() -> None:
             try:
-                ok, msg = test_sheets_connection(cfg, self._base_dir)
+                ok, msg = test_sheets_connection(
+                    cfg, self._base_dir, check_tasks=check_tasks, check_finance=check_finance,
+                )
             except Exception as exc:
                 ok, msg = False, f"Sheets connection test failed ({type(exc).__name__})."
             self._test_busy = False
@@ -3264,6 +3275,122 @@ class SheetsSyncWorker(QObject):
 
         threading.Thread(target=_run, daemon=True, name="morgana-sheets-test").start()
         return True
+
+
+class FinanceSheetsWorker(QObject):
+    """Non-blocking background worker for bot-wa Monthly Budget Google Sheets reads & writes."""
+
+    month_loaded = pyqtSignal(object)               # FinanceSheetMonthData
+    op_done = pyqtSignal(str, object, dict)         # (action, FinanceSheetWriteResult, context)
+
+    def __init__(self, base_dir: Path, parent=None) -> None:
+        super().__init__(parent)
+        self._base_dir = Path(base_dir)
+        self._lock = threading.Lock()
+        self._fetch_busy = False
+        self._pending_fetch: tuple[SheetsSyncConfig, int, int] | None = None
+        self._write_busy = False
+
+    def fetch_month(self, cfg: SheetsSyncConfig, year: int, month: int) -> None:
+        """Fetch `(year, month)` off the UI thread; rapid requests coalesce to the latest month."""
+        with self._lock:
+            if self._fetch_busy:
+                self._pending_fetch = (cfg, int(year), int(month))
+                return
+            self._fetch_busy = True
+            self._pending_fetch = None
+
+        def _run(cur_cfg: SheetsSyncConfig, cur_y: int, cur_m: int) -> None:
+            while True:
+                try:
+                    data = fetch_finance_month_from_sheets(cur_cfg, self._base_dir, cur_y, cur_m)
+                except Exception as exc:
+                    data = FinanceSheetMonthData(
+                        ok=False, year=cur_y, month=cur_m,
+                        error=f"Google Sheets read failed ({type(exc).__name__}).",
+                    )
+                self.month_loaded.emit(data)
+                with self._lock:
+                    nxt = self._pending_fetch
+                    self._pending_fetch = None
+                    if nxt is None:
+                        self._fetch_busy = False
+                        return
+                    cur_cfg, cur_y, cur_m = nxt
+
+        threading.Thread(
+            target=_run, args=(cfg, int(year), int(month)),
+            daemon=True, name="morgana-finance-fetch",
+        ).start()
+
+    def _run_write_op(self, action: str, fn, context: dict) -> bool:
+        with self._lock:
+            if self._write_busy:
+                return False
+            self._write_busy = True
+
+        def _run() -> None:
+            try:
+                res = fn()
+            except Exception as exc:
+                res = FinanceSheetWriteResult(
+                    ok=False, error=f"Google Sheets operation failed ({type(exc).__name__}).",
+                )
+            with self._lock:
+                self._write_busy = False
+            self.op_done.emit(action, res, context)
+
+        threading.Thread(target=_run, daemon=True, name=f"morgana-finance-{action}").start()
+        return True
+
+    def write_tx(self, cfg: SheetsSyncConfig, payload: dict, action: str = "add", context: dict | None = None) -> bool:
+        p = dict(payload)
+        ctx = dict(context or {})
+        ctx.setdefault("payload", p)
+        return self._run_write_op(
+            action,
+            lambda: write_finance_tx_to_sheets(
+                cfg,
+                self._base_dir,
+                tx_type=str(p.get("type") or "expense"),
+                amount=int(p["amount"]),
+                title=str(p.get("title") or ""),
+                category=str(p.get("category") or "Jajan"),
+                wallet=str(p.get("wallet") or "Tunai"),
+                to_wallet=str(p.get("to_wallet") or ""),
+                day=p.get("date"),
+            ),
+            ctx,
+        )
+
+    def edit_tx(self, cfg: SheetsSyncConfig, old_tx: dict, new_payload: dict) -> bool:
+        old_copy = dict(old_tx)
+        new_copy = dict(new_payload)
+        return self._run_write_op(
+            "edit",
+            lambda: update_finance_tx_in_sheets(
+                cfg,
+                self._base_dir,
+                old_tx=old_copy,
+                tx_type=str(new_copy.get("type") or "expense"),
+                amount=int(new_copy["amount"]),
+                title=str(new_copy.get("title") or ""),
+                category=str(new_copy.get("category") or "Jajan"),
+                wallet=str(new_copy.get("wallet") or "Tunai"),
+                to_wallet=str(new_copy.get("to_wallet") or ""),
+                day=new_copy.get("date"),
+            ),
+            {"old_tx": old_copy, "payload": new_copy},
+        )
+
+    def clear_cells(self, cfg: SheetsSyncConfig, cells: list[dict], action: str = "delete", context: dict | None = None) -> bool:
+        cells_copy = [dict(c) for c in (cells or ())]
+        ctx = dict(context or {})
+        return self._run_write_op(
+            action,
+            lambda: clear_finance_cells_in_sheets(cfg, self._base_dir, cells_copy),
+            ctx,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -3335,6 +3462,8 @@ class PetController(QObject):
         self._ai_talk_scene: AITalkScene | None = None
         self._ai_ambient_last_t = 0.0
         self.sheets_sync = SheetsSyncWorker(APP_DIR, self)
+        self.finance_sheets = FinanceSheetsWorker(APP_DIR, self)
+        self._pending_sheet_budget_check: dict | None = None
         self._sheets_dirty = False
         self._sheets_fail_streak = 0
         self._sheets_manual_sync = False
@@ -3429,6 +3558,8 @@ class PetController(QObject):
         self.ai_fetcher.test_done.connect(self._on_ai_test_done)
         self.sheets_sync.push_done.connect(self._on_sheets_push_done)
         self.sheets_sync.test_done.connect(self._on_sheets_test_done)
+        self.finance_sheets.month_loaded.connect(self._on_finance_sheet_month_loaded)
+        self.finance_sheets.op_done.connect(self._on_finance_sheet_op_done)
         self.hotkeys.activated.connect(lambda: self._open_quick_command(toggle=True))
 
         self._curfew_timer = QTimer(self)
@@ -4417,27 +4548,64 @@ class PetController(QObject):
             self._sync_briefing_view()
         elif res.kind == "add_finance":
             p = res.payload
-            tx = self.finance.add_transaction(
-                tx_type=p.get("type", "expense"),
-                amount=p["amount"],
-                title=p.get("title", ""),
-                category=p.get("category", "Jajan"),
-                wallet=p.get("wallet", "Tunai"),
-                source="quick_cmd",
-            )
-            if self.finance_dialog is not None:
-                self.finance_dialog.refresh()
-            if tx is not None and tx["type"] == "expense":
-                today = date.today()
-                warn = self.finance.budget_warning(tx["category"], today.year, today.month)
-                if warn is not None:
-                    kind_w, ratio, spent, limit = warn
-                    pct = int(round(ratio * 100))
-                    res.reply += (
-                        f" Watch out—{tx['category']} is at {pct}% ({format_rupiah(spent)} / {format_rupiah(limit)})!"
-                        if kind_w == "warn"
-                        else f" Heads up—{tx['category']} just crossed its budget ({format_rupiah(spent)} / {format_rupiah(limit)})!"
+            if bool(self.settings["finance_sheets_enabled"]):
+                cfg = self._finance_sheets_config()
+                if not cfg.is_ready(APP_DIR):
+                    res.reply = "Finance Google Sheets sync is on, but Sheet ID or kunci-google.json is missing. Check Settings!"
+                    res.emotion = "worried"
+                    res.action_label = "OPEN SETTINGS"
+                    res.action_target = "settings"
+                else:
+                    tx_t = str(p.get("type") or "expense")
+                    wal = str(p.get("wallet") or "Tunai")
+                    title = str(p.get("title") or "")
+                    if tx_t == "income" and title == f"Income ({wal})":
+                        title = ""
+                    bad = (
+                        forbidden_bank_word(title, allowed_bank=(wal if wal in ("BNI", "Mandiri") else None))
+                        if tx_t == "income" else None
                     )
+                    if bad:
+                        res.reply = f"Cannot include '{bad}' in that note — it would distort Google Sheets bank formulas."
+                        res.emotion = "worried"
+                    else:
+                        sheet_payload = {
+                            "type": tx_t,
+                            "amount": int(p["amount"]),
+                            "title": title,
+                            "category": str(p.get("category") or "Jajan"),
+                            "wallet": wal,
+                            "to_wallet": str(p.get("to_wallet") or ""),
+                            "date": date.today().isoformat(),
+                        }
+                        if not self.finance_sheets.write_tx(cfg, sheet_payload, action="quick_add"):
+                            res.reply = "Another Google Sheets write is still running—try again in a second!"
+                            res.emotion = "worried"
+                        else:
+                            res.badge = "FINANCE · SHEET"
+                            res.reply += " (Syncing to Google Sheets...)"
+            else:
+                tx = self.finance.add_transaction(
+                    tx_type=p.get("type", "expense"),
+                    amount=p["amount"],
+                    title=p.get("title", ""),
+                    category=p.get("category", "Jajan"),
+                    wallet=p.get("wallet", "Tunai"),
+                    source="quick_cmd",
+                )
+                if self.finance_dialog is not None:
+                    self.finance_dialog.refresh()
+                if tx is not None and tx["type"] == "expense":
+                    today = date.today()
+                    warn = self.finance.budget_warning(tx["category"], today.year, today.month)
+                    if warn is not None:
+                        kind_w, ratio, spent, limit = warn
+                        pct = int(round(ratio * 100))
+                        res.reply += (
+                            f" Watch out—{tx['category']} is at {pct}% ({format_rupiah(spent)} / {format_rupiah(limit)})!"
+                            if kind_w == "warn"
+                            else f" Heads up—{tx['category']} just crossed its budget ({format_rupiah(spent)} / {format_rupiah(limit)})!"
+                        )
         elif res.kind == "start_focus":
             stat_arg = str(res.payload.get("stat") or "")
             if stat_arg:
@@ -4546,6 +4714,21 @@ class PetController(QObject):
             key_path=str(self.settings["sheets_sync_key_path"] or ""),
         )
 
+    def _finance_sheets_config(self, override: dict | None = None) -> SheetsSyncConfig:
+        if override is not None:
+            return SheetsSyncConfig(
+                enabled=bool(override.get("finance_enabled", True)),
+                spreadsheet_id=str(override.get("spreadsheet_id") or ""),
+                tab_name=str(override.get("tab_name") or "Morgana"),
+                key_path=str(override.get("key_path") or ""),
+            )
+        return SheetsSyncConfig(
+            enabled=bool(self.settings["finance_sheets_enabled"]),
+            spreadsheet_id=str(self.settings["sheets_sync_id"] or ""),
+            tab_name=str(self.settings["sheets_sync_tab"] or "Morgana"),
+            key_path=str(self.settings["sheets_sync_key_path"] or ""),
+        )
+
     def _configure_sheets_sync(self, trigger_initial: bool = False) -> None:
         cfg = self._sheets_sync_config()
         if not cfg.is_ready(APP_DIR):
@@ -4596,7 +4779,11 @@ class PetController(QObject):
 
     def _on_test_sheets_sync_requested(self, data: dict) -> None:
         cfg = self._sheets_sync_config(override=data)
-        if not self.sheets_sync.test_connection(cfg) and self.settings_dialog is not None:
+        check_tasks = bool(data.get("enabled", False))
+        check_finance = bool(data.get("finance_enabled", False))
+        if not self.sheets_sync.test_connection(
+            cfg, check_tasks=check_tasks, check_finance=check_finance,
+        ) and self.settings_dialog is not None:
             self.settings_dialog.set_sheets_status(False, "Already testing — please wait a second.")
 
     def _on_sync_sheets_now_requested(self, data: dict) -> None:
@@ -5073,15 +5260,45 @@ class PetController(QObject):
 
     def _open_finance(self, announce: bool = True) -> None:
         was_open = self.finance_dialog is not None and self.finance_dialog.isVisible()
+        sheet_on = bool(self.settings["finance_sheets_enabled"])
         if self.finance_dialog is None:
-            self.finance_dialog = FinanceDialog(self.finance, on_top=self.on_top, ui_scale=self.ui_scale)
+            self.finance_dialog = FinanceDialog(
+                self.finance, on_top=self.on_top, ui_scale=self.ui_scale, sheet_mode=sheet_on,
+            )
             self.finance_dialog.finance_changed.connect(self._on_finance_changed)
             self.finance_dialog.open_settings.connect(self._open_settings_deferred)
+            self.finance_dialog.sheet_refresh_requested.connect(self._on_finance_sheet_refresh)
+            self.finance_dialog.sheet_write_requested.connect(self._on_finance_sheet_write)
+            self.finance_dialog.sheet_edit_requested.connect(self._on_finance_sheet_edit)
+            self.finance_dialog.sheet_delete_requested.connect(self._on_finance_sheet_delete)
+            self.finance_dialog.sheet_undo_requested.connect(self._on_finance_sheet_undo)
             self.finance_dialog.closed.connect(lambda: self._on_dialog_closed("finance"))
-        self.finance_dialog.refresh()
+        else:
+            self.finance_dialog.set_sheet_mode(sheet_on)
         self.finance_dialog.show_near(self.pet.geometry())
         if announce and not was_open and not self._rebuilding_ui:
             self._say_tuple(self.dialogue.window_open("finance", self._ctx()), ms=4800)
+
+    def _announce_budget_warning(
+        self, category: str, year: int, month: int, spent_override: int | None = None,
+    ) -> None:
+        if self._rebuilding_ui or not category:
+            return
+        warn = self.finance.budget_warning(category, year, month, spent_override=spent_override)
+        if warn is None:
+            return
+        level, ratio, spent, limit = warn
+        pct = int(round(ratio * 100))
+        if level == "over":
+            self._say_tuple((
+                f"Whoa! {category} just passed its monthly budget ({format_rupiah(spent)} / {format_rupiah(limit)})!",
+                "surprised", "uwooh",
+            ), ms=5600)
+        else:
+            self._say_tuple((
+                f"Careful! {category} is at {pct}% of this month's budget ({format_rupiah(spent)} / {format_rupiah(limit)}).",
+                "neutral", "naa",
+            ), ms=5000)
 
     def _on_finance_changed(self, kind: str, tx: dict) -> None:
         if self._rebuilding_ui or kind not in ("add", "bill"):
@@ -5091,20 +5308,135 @@ class PetController(QObject):
                 d = date.fromisoformat(str(tx.get("date") or ""))
             except ValueError:
                 d = date.today()
-            warn = self.finance.budget_warning(tx["category"], d.year, d.month)
-            if warn is not None:
-                level, ratio, spent, limit = warn
-                pct = int(round(ratio * 100))
-                if level == "over":
-                    self._say_tuple((
-                        f"Whoa! {tx['category']} just passed its monthly budget ({format_rupiah(spent)} / {format_rupiah(limit)})!",
-                        "surprised", "uwooh",
-                    ), ms=5600)
-                else:
-                    self._say_tuple((
-                        f"Careful! {tx['category']} is at {pct}% of this month's budget ({format_rupiah(spent)} / {format_rupiah(limit)}).",
-                        "neutral", "naa",
-                    ), ms=5000)
+            self._announce_budget_warning(tx["category"], d.year, d.month)
+
+    def _finance_sheets_missing_msg(self, cfg: SheetsSyncConfig) -> str:
+        if not cfg.normalized_sheet_id():
+            return "Spreadsheet ID not configured. Set Sheet ID & kunci-google.json in Settings."
+        return "Service Account JSON not found (place kunci-google.json beside app or pick in Settings)."
+
+    def _on_finance_sheet_refresh(self, year: int, month: int) -> None:
+        cfg = self._finance_sheets_config()
+        if not cfg.is_ready(APP_DIR):
+            if self.finance_dialog is not None:
+                self.finance_dialog.apply_sheet_month(FinanceSheetMonthData(
+                    ok=False, year=year, month=month, error=self._finance_sheets_missing_msg(cfg),
+                ))
+            return
+        self.finance_sheets.fetch_month(cfg, year, month)
+
+    def _on_finance_sheet_write(self, payload: dict) -> None:
+        cfg = self._finance_sheets_config()
+        action = "bill" if payload.get("bill_id") else "add"
+        if not cfg.is_ready(APP_DIR):
+            if self.finance_dialog is not None:
+                self.finance_dialog.on_sheet_op_done(False, action, self._finance_sheets_missing_msg(cfg))
+            return
+        if not self.finance_sheets.write_tx(cfg, payload, action=action, context={"payload": dict(payload)}):
+            if self.finance_dialog is not None:
+                self.finance_dialog.on_sheet_op_done(False, action, "Another Google Sheets write is in progress — wait a moment.")
+
+    def _on_finance_sheet_edit(self, old_tx: dict, new_payload: dict) -> None:
+        cfg = self._finance_sheets_config()
+        if not cfg.is_ready(APP_DIR):
+            if self.finance_dialog is not None:
+                self.finance_dialog.on_sheet_op_done(False, "edit", self._finance_sheets_missing_msg(cfg))
+            return
+        if not self.finance_sheets.edit_tx(cfg, old_tx, new_payload):
+            if self.finance_dialog is not None:
+                self.finance_dialog.on_sheet_op_done(False, "edit", "Another Google Sheets write is in progress — wait a moment.")
+
+    def _on_finance_sheet_delete(self, tx: dict) -> None:
+        cfg = self._finance_sheets_config()
+        if not cfg.is_ready(APP_DIR):
+            if self.finance_dialog is not None:
+                self.finance_dialog.on_sheet_op_done(False, "delete", self._finance_sheets_missing_msg(cfg))
+            return
+        cells = list(tx.get("sheet_cells") or [])
+        if not self.finance_sheets.clear_cells(cfg, cells, action="delete", context={"tx": dict(tx)}):
+            if self.finance_dialog is not None:
+                self.finance_dialog.on_sheet_op_done(False, "delete", "Another Google Sheets write is in progress — wait a moment.")
+
+    def _on_finance_sheet_undo(self, undo_kind: str, payload: dict) -> None:
+        cfg = self._finance_sheets_config()
+        if not cfg.is_ready(APP_DIR):
+            if self.finance_dialog is not None:
+                self.finance_dialog.on_sheet_op_done(False, "undo", self._finance_sheets_missing_msg(cfg))
+            return
+        if undo_kind == "sheet_add":
+            cells = list(payload.get("cells") or [])
+            ok = self.finance_sheets.clear_cells(cfg, cells, action="undo", context={"undo_kind": undo_kind})
+        elif undo_kind == "sheet_delete":
+            restore_payload = dict(payload)
+            if "edit_note" in restore_payload:
+                restore_payload["title"] = str(restore_payload["edit_note"])
+            ok = self.finance_sheets.write_tx(cfg, restore_payload, action="undo", context={"undo_kind": undo_kind})
+        else:
+            ok = False
+        if not ok and self.finance_dialog is not None:
+            self.finance_dialog.on_sheet_op_done(False, "undo", "Cannot undo right now — wait a moment and try again.")
+
+    def _on_finance_sheet_month_loaded(self, data: FinanceSheetMonthData) -> None:
+        if self.finance_dialog is not None and self.finance_dialog.is_sheet_mode():
+            self.finance_dialog.apply_sheet_month(data)
+        pending = self._pending_sheet_budget_check
+        if data.ok and pending is not None:
+            if (int(pending["year"]), int(pending["month"])) == (data.year, data.month):
+                self._pending_sheet_budget_check = None
+                cat = str(pending["category"])
+                spent = int((data.summary.get("by_category") or {}).get(cat, 0))
+                self._announce_budget_warning(cat, data.year, data.month, spent_override=spent)
+
+    def _on_finance_sheet_op_done(self, action: str, res: FinanceSheetWriteResult, ctx: dict) -> None:
+        payload = ctx.get("payload") or {}
+        if action == "quick_add":
+            if not res.ok:
+                self.say(f"Couldn't save to Google Sheets: {res.error}", "talking", ms=5500, emotion="worried")
+                return
+            if payload.get("type") == "expense" and payload.get("category"):
+                today = date.today()
+                self._pending_sheet_budget_check = {
+                    "category": payload["category"], "year": today.year, "month": today.month,
+                }
+            cfg = self._finance_sheets_config()
+            if self.finance_dialog is not None and self.finance_dialog.isVisible() and self.finance_dialog.is_sheet_mode():
+                self.finance_dialog.request_sheet_refresh()
+            elif self._pending_sheet_budget_check is not None and cfg.is_ready(APP_DIR):
+                self.finance_sheets.fetch_month(
+                    cfg, self._pending_sheet_budget_check["year"], self._pending_sheet_budget_check["month"],
+                )
+            return
+
+        if not res.ok:
+            if self.finance_dialog is not None:
+                self.finance_dialog.on_sheet_op_done(False, action, res.error or "Google Sheets operation failed.")
+            return
+
+        if action == "bill" and payload.get("bill_id"):
+            self.finance.mark_bill_paid(
+                str(payload["bill_id"]), int(payload["bill_year"]), int(payload["bill_month"]),
+            )
+
+        undo_kind = ""
+        undo_payload: dict | None = None
+        if action in ("add", "bill") and res.cells:
+            undo_kind = "sheet_add"
+            undo_payload = {"cells": list(res.cells)}
+        elif action == "delete" and ctx.get("tx"):
+            undo_kind = "sheet_delete"
+            undo_payload = dict(ctx["tx"])
+
+        if action in ("add", "bill") and payload.get("type") == "expense" and payload.get("category"):
+            try:
+                d = date.fromisoformat(str(payload.get("date") or ""))
+            except ValueError:
+                d = date.today()
+            self._pending_sheet_budget_check = {"category": payload["category"], "year": d.year, "month": d.month}
+
+        if self.finance_dialog is not None:
+            self.finance_dialog.on_sheet_op_done(True, action, res.message or "Synced with Google Sheets!", undo_kind, undo_payload)
+            if self.finance_dialog.is_sheet_mode():
+                self.finance_dialog.request_sheet_refresh()
 
     def _open_timer(self) -> None:
         was_open = self.timer_dialog is not None and self.timer_dialog.isVisible()
@@ -5470,6 +5802,12 @@ class PetController(QObject):
         self._configure_sheets_sync(trigger_initial=False)
         if self._sheets_sync_config().is_ready(APP_DIR):
             self._schedule_sheets_sync()
+        if self.finance_dialog is not None:
+            fin_sh_on = bool(self.settings["finance_sheets_enabled"])
+            was_sheet = self.finance_dialog.is_sheet_mode()
+            self.finance_dialog.set_sheet_mode(fin_sh_on)
+            if fin_sh_on and was_sheet and self.finance_dialog.isVisible():
+                self.finance_dialog.request_sheet_refresh()
         self._last_curfew_msg = None
         self._check_curfew()
 

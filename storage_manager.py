@@ -1447,13 +1447,15 @@ class FinanceStore:
         self.save()
         return True
 
-    def budget_warning(self, category: str, year: int, month: int) -> tuple[str, float, int, int] | None:
+    def budget_warning(
+        self, category: str, year: int, month: int, spent_override: int | None = None,
+    ) -> tuple[str, float, int, int] | None:
         """Return ('over'|'warn', ratio, spent, limit) when category spend >= 80% of budget."""
         cat = normalize_finance_category(category)
         limit = self._budgets.get(cat)
         if not limit or limit <= 0:
             return None
-        spent = self.month_summary(year, month)["by_category"].get(cat, 0)
+        spent = int(spent_override) if spent_override is not None else self.month_summary(year, month)["by_category"].get(cat, 0)
         ratio = spent / float(limit)
         if ratio >= 1.0:
             return ("over", ratio, spent, limit)
@@ -1536,6 +1538,26 @@ class FinanceStore:
             self.save()
             return True
         return False
+
+    def get_bill(self, bill_id: str) -> dict | None:
+        for bill in self._bills:
+            if bill["id"] == bill_id:
+                return dict(bill, paid_months=list(bill.get("paid_months", [])))
+        return None
+
+    def mark_bill_paid(self, bill_id: str, year: int, month: int) -> dict | None:
+        """Mark a recurring bill as paid for `(year, month)` (used when written directly to Google Sheets)."""
+        ym = f"{int(year):04d}-{int(month):02d}"
+        for bill in self._bills:
+            if bill["id"] != bill_id:
+                continue
+            paid = list(bill.get("paid_months", []))
+            if ym not in paid:
+                paid.append(ym)
+                bill["paid_months"] = sorted(paid)[-24:]
+                self.save()
+            return dict(bill, paid_months=list(bill.get("paid_months", [])))
+        return None
 
     def pay_bill(
         self, bill_id: str, year: int, month: int,
@@ -1640,6 +1662,7 @@ SETTINGS_DEFAULTS = {
     "ai_call_user": "Joker",            # How Morgana addresses you in AI conversations
     "ai_dialogue_enabled": True,        # Use AI for Talk / Choice Prompts & live app reactions
     "sheets_sync_enabled": False,       # Opt-in write-only Google Sheets task deadline sync (WhatsApp relay)
+    "finance_sheets_enabled": False,    # Opt-in Google Sheets Finance sync (bot-wa Monthly Budget tabs)
     "sheets_sync_id": "",               # Google Spreadsheet ID or URL shared with Service Account
     "sheets_sync_tab": "Morgana",       # Dedicated worksheet tab name for synced deadlines
     "sheets_sync_key_path": "",         # Path to Service Account JSON (optional if placed beside app)
@@ -1677,6 +1700,7 @@ _BOOL_KEYS = (
     "ai_enabled",
     "ai_dialogue_enabled",
     "sheets_sync_enabled",
+    "finance_sheets_enabled",
     "finance_tab_migrated",
 )
 _STR_KEYS = (

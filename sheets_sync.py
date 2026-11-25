@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Opt-in Google Sheets cloud relay (write-only output) for WhatsApp Bot reminders.
+"""Opt-in Google Sheets integration for Morgana Companion (bot-wa compatible).
 
 Zero Qt dependency and zero extra pip dependencies beyond `requirements.txt`
 (`google-api-python-client`, `google-auth-httplib2`).
@@ -7,19 +7,20 @@ Zero Qt dependency and zero extra pip dependencies beyond `requirements.txt`
 Design:
   * Strictly opt-in: NEVER sends network requests unless enabled in Settings
     with a valid Spreadsheet ID and Service Account JSON key file.
-  * Write-only output during sync: Morgana pushes its authoritative active
-    deadline tasks to a dedicated tab (default: `Morgana`) whenever tasks
-    change, without reading cells back from Sheets.
-  * The Termux WhatsApp Bot periodically pulls that tab using its existing
-    Google Sheets connection and sends staged WhatsApp reminders even when
-    this PC is turned off.
+  * Task Deadline Relay (write-only): pushes active deadline tasks to a
+    dedicated tab (default: `Morgana`) for WhatsApp Bot reminders.
+  * Finance Monthly Budget Sync (read/write): connects directly to the same
+    `bot-wa` Monthly Budget spreadsheet (`Januari`..`Desember` tabs, summary
+    ranges `G9:H12` & `K9:L12`, 4 expense tables, Pemasukan `B10:D31`, and
+    Pemasukan Bank `T10:V31`) using identical formula-safe write & undo rules.
 """
 from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
-from datetime import datetime
+import threading
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -27,6 +28,31 @@ DEFAULT_SHEETS_TAB = "Morgana"
 SHEET_HEADERS: tuple[str, ...] = ("id", "title", "deadline", "priority", "stat", "updated_at")
 MAX_SYNC_TASKS = 500
 PIP_HINT = "pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib"
+
+# Exact bot-wa Monthly Budget spreadsheet schema
+FINANCE_MONTH_TABS: tuple[str, ...] = (
+    "Januari", "Februari", "Maret", "April", "Mei", "Juni",
+    "Juli", "Agustus", "September", "Oktober", "November", "Desember",
+)
+FINANCE_SHEET_CAT_COLS: dict[str, tuple[str, str]] = {
+    "Jajan": ("B", "D"),
+    "Alat": ("G", "I"),
+    "Mingguan&Bulanan": ("K", "M"),
+    "Hiburan": ("P", "R"),
+}
+FINANCE_EXPENSE_TOTAL_ROW = 35
+FINANCE_EXPENSE_ROW_START = 36
+FINANCE_EXPENSE_ROW_END = 1000
+FINANCE_INCOME_ROW_START = 10
+FINANCE_INCOME_ROW_END = 31
+FINANCE_BANK_ROW_START = 10
+FINANCE_BANK_ROW_END = 31
+FINANCE_SUMMARY_RANGE = "G9:H12"
+FINANCE_BANK_BAL_RANGE = "K9:L12"
+QRIS_SOURCE_BY_BANK: dict[str, str] = {"BNI": "QRIS BNI", "Mandiri": "QRIS Mandiri"}
+FINANCE_BANK_WORDS: tuple[str, ...] = ("BNI", "Mandiri")
+
+_FINANCE_WRITE_LOCK = threading.RLock()
 
 _SHEET_URL_RE = re.compile(r"/spreadsheets/d/([A-Za-z0-9_-]{10,128})")
 _SHEET_ID_RE = re.compile(r"^[A-Za-z0-9_-]{10,128}$")
@@ -209,8 +235,14 @@ def _create_tab(service, sheet_id: str, tab_name: str, HttpError) -> None:
             raise
 
 
-def test_sheets_connection(cfg: SheetsSyncConfig, base_dir: Path, timeout: float = 10.0) -> tuple[bool, str]:
-    """Verify Service Account access, check Spreadsheet, and auto-create the target tab if needed."""
+def test_sheets_connection(
+    cfg: SheetsSyncConfig,
+    base_dir: Path,
+    timeout: float = 10.0,
+    check_tasks: bool = True,
+    check_finance: bool = False,
+) -> tuple[bool, str]:
+    """Verify Service Account access, check Spreadsheet, and verify Tasks / Finance tabs."""
     sheet_id = cfg.normalized_sheet_id()
     if not sheet_id:
         return False, "Enter a valid Google Spreadsheet ID or URL."
@@ -232,17 +264,26 @@ def test_sheets_connection(cfg: SheetsSyncConfig, base_dir: Path, timeout: float
             str((s.get("properties") or {}).get("title") or "")
             for s in (meta.get("sheets") or ())
         }
-        created_note = ""
-        if tab not in existing_tabs:
-            _create_tab(service, sheet_id, tab, HttpError)
-            service.spreadsheets().values().update(
-                spreadsheetId=sheet_id,
-                range=_a1_range(tab, "A1"),
-                valueInputOption="RAW",
-                body={"values": [list(SHEET_HEADERS)]},
-            ).execute()
-            created_note = " (tab created)"
-        return True, f"Connected · '{doc_title}' -> tab '{tab}' ready{created_note}"
+        notes: list[str] = []
+        if check_tasks or not check_finance:
+            created_note = ""
+            if tab not in existing_tabs:
+                _create_tab(service, sheet_id, tab, HttpError)
+                service.spreadsheets().values().update(
+                    spreadsheetId=sheet_id,
+                    range=_a1_range(tab, "A1"),
+                    valueInputOption="RAW",
+                    body={"values": [list(SHEET_HEADERS)]},
+                ).execute()
+                created_note = " (created)"
+            notes.append(f"Tasks tab '{tab}' ready{created_note}")
+        if check_finance:
+            fin_tab = month_tab_name(date.today().month)
+            if fin_tab in existing_tabs:
+                notes.append(f"Finance tab '{fin_tab}' ready")
+            else:
+                notes.append(f"Finance tab '{fin_tab}' not found yet")
+        return True, f"Connected · '{doc_title}' · " + " · ".join(notes)
     except HttpError as exc:
         return False, _friendly_http_error(exc, client_email)
     except TimeoutError:
@@ -307,3 +348,1035 @@ def push_tasks_to_sheets(
         return SheetsPushResult(ok=False, error=f"Google Sheets sync failed ({type(exc).__name__}).")
     finally:
         _close_service(service)
+
+
+# ---------------------------------------------------------------------------
+# Finance Monthly Budget Sync (100% compatible with AtayaFiqriRisqullah/bot-wa)
+# ---------------------------------------------------------------------------
+@dataclass
+class FinanceSheetMonthData:
+    ok: bool
+    tab: str = ""
+    year: int = 0
+    month: int = 0
+    balances: dict[str, int] = field(default_factory=dict)
+    summary: dict = field(default_factory=dict)
+    transactions: list[dict] = field(default_factory=list)
+    error: str = ""
+
+
+@dataclass
+class FinanceSheetWriteResult:
+    ok: bool
+    tab: str = ""
+    cells: list[dict] = field(default_factory=list)
+    message: str = ""
+    error: str = ""
+
+
+def month_tab_name(month: int) -> str:
+    """Return Indonesian Monthly Budget worksheet tab name ('Januari'..'Desember')."""
+    return FINANCE_MONTH_TABS[(int(month) - 1) % 12]
+
+
+def safe_sheet_text(text: str) -> str:
+    """Prefix leading formula characters (=, +, -, @) with apostrophe to prevent formula injection."""
+    s = str(text or "").strip()
+    if s and s[0] in "=+-@":
+        return "'" + s
+    return s
+
+
+def forbidden_bank_word(text: str, allowed_bank: str | None = None) -> str | None:
+    """Return forbidden bank name ('BNI'|'Mandiri') if `text` would corrupt Monthly Budget SUMIF formulas.
+
+    Matches `bot-wa`'s exact rule:
+      * Cash income (`allowed_bank=None`) and Transfer notes must NOT mention 'BNI' or 'Mandiri'.
+      * Bank income (`allowed_bank='BNI'` or `'Mandiri'`) must NOT mention the OTHER bank.
+    """
+    low = str(text or "").lower()
+    if not low:
+        return None
+    allow_low = str(allowed_bank or "").strip().lower()
+    for bank in FINANCE_BANK_WORDS:
+        if bank.lower() == allow_low:
+            continue
+        if bank.lower() in low:
+            return bank
+    return None
+
+
+def _is_number(val) -> bool:
+    return isinstance(val, (int, float)) and not isinstance(val, bool)
+
+
+def parse_sheet_date(cell) -> str:
+    """Convert Google Sheets UNFORMATTED_VALUE date (Excel serial number or string) -> 'YYYY-MM-DD' or ''."""
+    if isinstance(cell, bool) or cell is None:
+        return ""
+    if isinstance(cell, (int, float)):
+        if cell <= 0 or cell > 200000:
+            return ""
+        try:
+            return (date(1899, 12, 30) + timedelta(days=int(cell))).isoformat()
+        except (OverflowError, ValueError):
+            return ""
+    raw = str(cell).strip()
+    if not raw:
+        return ""
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(raw, fmt).date().isoformat()
+        except ValueError:
+            pass
+    return ""
+
+
+def _parse_tx_date(day: str | date | None) -> date:
+    if isinstance(day, date):
+        return day
+    if isinstance(day, str) and day.strip():
+        try:
+            return date.fromisoformat(day.strip()[:10])
+        except ValueError:
+            pass
+    return date.today()
+
+
+def _is_missing_tab_error(exc) -> bool:
+    status = int(getattr(getattr(exc, "resp", None), "status", 0) or 0)
+    txt = str(exc).lower()
+    return status == 400 and ("unable to parse range" in txt or "not found" in txt)
+
+
+def _friendly_finance_http_error(exc, client_email: str, tab: str) -> str:
+    if _is_missing_tab_error(exc):
+        return f"Tab '{tab}' not found in spreadsheet. Create the '{tab}' sheet tab first."
+    return _friendly_http_error(exc, client_email)
+
+
+def _find_empty_rows(col_values: list[list], row_start: int, row_end: int, count: int = 1) -> list[int]:
+    """Return the first `count` empty 1-based row numbers in [row_start, row_end]."""
+    found: list[int] = []
+    for row_num in range(row_start, row_end + 1):
+        idx = row_num - row_start
+        cell = col_values[idx][0] if (idx < len(col_values) and col_values[idx]) else ""
+        if str(cell).strip() == "":
+            found.append(row_num)
+            if len(found) == count:
+                return found
+    return []
+
+
+def _format_bank_income_label(bank: str, title: str) -> str:
+    clean = str(title or "").strip()
+    if not clean:
+        return bank
+    if clean.lower().startswith(bank.lower()):
+        return clean
+    return f"{bank} - {clean}"
+
+
+def _extract_bank_from_label(label: str) -> str:
+    low = str(label or "").lower()
+    if "mandiri" in low:
+        return "Mandiri"
+    return "BNI"
+
+
+def _strip_transfer_note(label: str) -> str:
+    """Extract optional user note after ' - ' from bot-wa transfer labels."""
+    txt = str(label or "").strip()
+    if txt.endswith(")") and " - " in txt:
+        inner = txt.rsplit(" - ", 1)[1].rstrip(")").strip()
+        return inner
+    if " - " in txt:
+        return txt.split(" - ", 1)[1].strip()
+    return ""
+
+
+def fetch_finance_month_from_sheets(
+    cfg: SheetsSyncConfig,
+    base_dir: Path,
+    year: int,
+    month: int,
+    timeout: float = 12.0,
+) -> FinanceSheetMonthData:
+    """Read live Monthly Budget balances, category totals, and transactions for `(year, month)`."""
+    tab = month_tab_name(month)
+    sheet_id = cfg.normalized_sheet_id()
+    if not sheet_id:
+        return FinanceSheetMonthData(ok=False, tab=tab, year=year, month=month,
+                                     error="Spreadsheet ID is not configured in Settings.")
+    key_file = cfg.resolve_key_file(base_dir)
+    if key_file is None:
+        return FinanceSheetMonthData(ok=False, tab=tab, year=year, month=month,
+                                     error="Service Account JSON key file not found (e.g. kunci-google.json).")
+    service, client_email, HttpError, err = _build_service(key_file, timeout=timeout)
+    if err or service is None:
+        return FinanceSheetMonthData(ok=False, tab=tab, year=year, month=month, error=err)
+
+    cat_names = list(FINANCE_SHEET_CAT_COLS.keys())
+    ranges = [
+        _a1_range(tab, FINANCE_SUMMARY_RANGE),
+        _a1_range(tab, FINANCE_BANK_BAL_RANGE),
+    ]
+    for cat in cat_names:
+        col_a, col_c = FINANCE_SHEET_CAT_COLS[cat]
+        ranges.append(_a1_range(tab, f"{col_a}{FINANCE_EXPENSE_TOTAL_ROW}:{col_c}{FINANCE_EXPENSE_ROW_END}"))
+    ranges.append(_a1_range(tab, f"B{FINANCE_INCOME_ROW_START}:D{FINANCE_INCOME_ROW_END}"))
+    ranges.append(_a1_range(tab, f"T{FINANCE_BANK_ROW_START}:V{FINANCE_BANK_ROW_END}"))
+
+    try:
+        resp = service.spreadsheets().values().batchGet(
+            spreadsheetId=sheet_id,
+            ranges=ranges,
+            valueRenderOption="UNFORMATTED_VALUE",
+        ).execute()
+        vrs = resp.get("valueRanges") or []
+        blocks = [(vrs[i].get("values") or []) if i < len(vrs) else [] for i in range(len(ranges))]
+
+        # 1. Summary & Bank balances (exact bot-wa G9:H12 & K9:L12 parsing)
+        hasil: dict[str, float] = {}
+        for row in blocks[0]:
+            if len(row) >= 2 and _is_number(row[1]):
+                hasil[str(row[0]).strip().lower()] = float(row[1])
+        bank_hasil: dict[str, float] = {}
+        for row in blocks[1]:
+            if len(row) >= 2 and _is_number(row[1]):
+                bank_hasil[str(row[0]).strip().lower()] = float(row[1])
+
+        tunai_bal = int(round(hasil.get("sisa uang", 0.0)))
+        bni_bal = int(round(bank_hasil.get("bni", 0.0)))
+        mandiri_bal = int(round(bank_hasil.get("mandiri", 0.0)))
+        balances = {
+            "Tunai": tunai_bal,
+            "BNI": bni_bal,
+            "Mandiri": mandiri_bal,
+            "Total": tunai_bal + bni_bal + mandiri_bal,
+        }
+
+        # 2. Expense tables (row 35 = TOTAL, rows 36..1000 = entries)
+        by_category: dict[str, int] = {}
+        transactions: list[dict] = []
+        default_date = f"{int(year):04d}-{int(month):02d}-01"
+        today_str = date.today().isoformat()
+        today_expense = 0
+
+        for c_idx, cat in enumerate(cat_names):
+            col_a, col_c = FINANCE_SHEET_CAT_COLS[cat]
+            rows = blocks[2 + c_idx]
+            total_row = rows[0] if rows else []
+            cat_sum = 0
+            for offset, r in enumerate(rows[1:]):
+                row_num = FINANCE_EXPENSE_ROW_START + offset
+                nama, tgl, nilai = (list(r) + ["", "", ""])[:3]
+                nama_str = str(nama).strip()
+                if not nama_str and not _is_number(nilai):
+                    continue
+                if not _is_number(nilai):
+                    continue
+                val_int = int(round(float(nilai)))
+                cat_sum += val_int
+                d_str = parse_sheet_date(tgl) or default_date
+                if d_str == today_str:
+                    today_expense += abs(val_int)
+                rng = f"{col_a}{row_num}:{col_c}{row_num}"
+                transactions.append({
+                    "id": f"sh:{tab}:{rng}",
+                    "type": "expense",
+                    "amount": abs(val_int),
+                    "title": nama_str or cat,
+                    "category": cat,
+                    "wallet": "",
+                    "to_wallet": "",
+                    "date": d_str,
+                    "source": "sheets",
+                    "sheet_row": row_num,
+                    "sheet_cells": [{"tab": tab, "range": rng, "name": nama_str, "amount": val_int}],
+                })
+            if len(total_row) >= 3 and _is_number(total_row[2]):
+                by_category[cat] = int(round(float(total_row[2])))
+            else:
+                by_category[cat] = cat_sum
+
+        # 3. Parse Pemasukan (B10:D31) & Pemasukan Bank (T10:V31) including paired transfers
+        cash_raw: list[dict] = []
+        for idx, r in enumerate(blocks[2 + len(cat_names)]):
+            row_num = FINANCE_INCOME_ROW_START + idx
+            nama, tgl, nilai = (list(r) + ["", "", ""])[:3]
+            nama_str = str(nama).strip()
+            if not nama_str and not _is_number(nilai):
+                continue
+            if not _is_number(nilai):
+                continue
+            val_int = int(round(float(nilai)))
+            rng = f"B{row_num}:D{row_num}"
+            cash_raw.append({
+                "row": row_num,
+                "name": nama_str,
+                "low": nama_str.lower(),
+                "date": parse_sheet_date(tgl) or default_date,
+                "amount": val_int,
+                "cell": {"tab": tab, "range": rng, "name": nama_str, "amount": val_int},
+            })
+
+        bank_raw: list[dict] = []
+        for idx, r in enumerate(blocks[3 + len(cat_names)]):
+            row_num = FINANCE_BANK_ROW_START + idx
+            nama, tgl, nilai = (list(r) + ["", "", ""])[:3]
+            nama_str = str(nama).strip()
+            if not nama_str and not _is_number(nilai):
+                continue
+            if not _is_number(nilai):
+                continue
+            val_int = int(round(float(nilai)))
+            rng = f"T{row_num}:V{row_num}"
+            bank_raw.append({
+                "row": row_num,
+                "name": nama_str,
+                "low": nama_str.lower(),
+                "date": parse_sheet_date(tgl) or default_date,
+                "amount": val_int,
+                "cell": {"tab": tab, "range": rng, "name": nama_str, "amount": val_int},
+            })
+
+        used_bank_rows: set[int] = set()
+        fallback_income = 0
+
+        # Process Pemasukan (B10:D31)
+        for item in cash_raw:
+            low = item["low"]
+            amt = item["amount"]
+            if low in ("qris bni", "qris mandiri"):
+                bank = "Mandiri" if "mandiri" in low else "BNI"
+                transactions.append({
+                    "id": f"sh:{tab}:{item['cell']['range']}",
+                    "type": "transfer",
+                    "amount": abs(amt),
+                    "title": f"{item['name']} (Monthly Pool)",
+                    "category": "",
+                    "wallet": bank,
+                    "to_wallet": "QRIS",
+                    "date": item["date"],
+                    "source": "sheets",
+                    "sheet_kind": "qris_pool",
+                    "sheet_row": item["row"],
+                    "sheet_cells": [item["cell"]],
+                })
+            elif low.startswith("tarik uang bni") or low.startswith("tarik uang mandiri"):
+                bank = "Mandiri" if "mandiri" in low else "BNI"
+                note = _strip_transfer_note(item["name"])
+                transactions.append({
+                    "id": f"sh:{tab}:{item['cell']['range']}",
+                    "type": "transfer",
+                    "amount": abs(amt),
+                    "title": item["name"],
+                    "edit_note": note,
+                    "category": "",
+                    "wallet": bank,
+                    "to_wallet": "Tunai",
+                    "date": item["date"],
+                    "source": "sheets",
+                    "sheet_row": item["row"],
+                    "sheet_cells": [item["cell"]],
+                })
+            elif low.startswith("setor tunai") and amt < 0:
+                partner = None
+                for b in bank_raw:
+                    if (b["row"] not in used_bank_rows and "(setor tunai" in b["low"]
+                            and b["amount"] == -amt and b["date"] == item["date"]):
+                        partner = b
+                        break
+                if partner is not None:
+                    used_bank_rows.add(partner["row"])
+                    to_bank = _extract_bank_from_label(partner["name"])
+                    note = _strip_transfer_note(item["name"])
+                    cells = [item["cell"], partner["cell"]]
+                    transactions.append({
+                        "id": f"sh:{tab}:{item['cell']['range']}+{partner['cell']['range']}",
+                        "type": "transfer",
+                        "amount": abs(amt),
+                        "title": note or f"Setor Tunai → {to_bank}",
+                        "edit_note": note,
+                        "category": "",
+                        "wallet": "Tunai",
+                        "to_wallet": to_bank,
+                        "date": item["date"],
+                        "source": "sheets",
+                        "sheet_row": item["row"],
+                        "sheet_cells": cells,
+                    })
+                else:
+                    note = _strip_transfer_note(item["name"])
+                    transactions.append({
+                        "id": f"sh:{tab}:{item['cell']['range']}",
+                        "type": "transfer",
+                        "amount": abs(amt),
+                        "title": item["name"],
+                        "edit_note": note,
+                        "category": "",
+                        "wallet": "Tunai",
+                        "to_wallet": "BNI",
+                        "date": item["date"],
+                        "source": "sheets",
+                        "sheet_row": item["row"],
+                        "sheet_cells": [item["cell"]],
+                    })
+            else:
+                if amt > 0:
+                    fallback_income += amt
+                transactions.append({
+                    "id": f"sh:{tab}:{item['cell']['range']}",
+                    "type": "income",
+                    "amount": abs(amt),
+                    "title": item["name"] or "Tunai",
+                    "category": "",
+                    "wallet": "Tunai",
+                    "to_wallet": "",
+                    "date": item["date"],
+                    "source": "sheets",
+                    "sheet_row": item["row"],
+                    "sheet_cells": [item["cell"]],
+                })
+
+        # Process Pemasukan Bank (T10:V31) — pair bank-to-bank transfers first
+        for b in bank_raw:
+            if b["row"] in used_bank_rows:
+                continue
+            if "(tf keluar" in b["low"] and b["amount"] < 0:
+                partner = None
+                for p in bank_raw:
+                    if (p["row"] not in used_bank_rows and p["row"] != b["row"]
+                            and "(tf masuk" in p["low"]
+                            and p["amount"] == -b["amount"]
+                            and p["date"] == b["date"]):
+                        partner = p
+                        break
+                if partner is not None:
+                    used_bank_rows.add(b["row"])
+                    used_bank_rows.add(partner["row"])
+                    from_bank = _extract_bank_from_label(b["name"])
+                    to_bank = _extract_bank_from_label(partner["name"])
+                    note = _strip_transfer_note(b["name"])
+                    transactions.append({
+                        "id": f"sh:{tab}:{b['cell']['range']}+{partner['cell']['range']}",
+                        "type": "transfer",
+                        "amount": abs(b["amount"]),
+                        "title": note or f"{from_bank} → {to_bank}",
+                        "edit_note": note,
+                        "category": "",
+                        "wallet": from_bank,
+                        "to_wallet": to_bank,
+                        "date": b["date"],
+                        "source": "sheets",
+                        "sheet_row": b["row"],
+                        "sheet_cells": [b["cell"], partner["cell"]],
+                    })
+                    continue
+            used_bank_rows.add(b["row"])
+            bank = _extract_bank_from_label(b["name"])
+            if b["amount"] > 0:
+                fallback_income += b["amount"]
+            transactions.append({
+                "id": f"sh:{tab}:{b['cell']['range']}",
+                "type": "income",
+                "amount": abs(b["amount"]),
+                "title": b["name"] or bank,
+                "category": "",
+                "wallet": bank,
+                "to_wallet": "",
+                "date": b["date"],
+                "source": "sheets",
+                "sheet_row": b["row"],
+                "sheet_cells": [b["cell"]],
+            })
+
+        transactions.sort(key=lambda t: (t.get("date", ""), int(t.get("sheet_row", 0))), reverse=True)
+
+        month_income = int(round(hasil["pemasukan"])) if "pemasukan" in hasil else fallback_income
+        month_expense = int(round(hasil["pengeluaran"])) if "pengeluaran" in hasil else sum(by_category.values())
+        summary = {
+            "income": month_income,
+            "expense": month_expense,
+            "net": month_income - month_expense,
+            "today_expense": today_expense,
+            "count": len(transactions),
+            "by_category": by_category,
+        }
+        return FinanceSheetMonthData(
+            ok=True,
+            tab=tab,
+            year=int(year),
+            month=int(month),
+            balances=balances,
+            summary=summary,
+            transactions=transactions,
+        )
+    except HttpError as exc:
+        return FinanceSheetMonthData(
+            ok=False, tab=tab, year=year, month=month,
+            error=_friendly_finance_http_error(exc, client_email, tab),
+        )
+    except TimeoutError:
+        return FinanceSheetMonthData(
+            ok=False, tab=tab, year=year, month=month,
+            error="Google Sheets request timed out.",
+        )
+    except Exception as exc:
+        return FinanceSheetMonthData(
+            ok=False, tab=tab, year=year, month=month,
+            error=f"Failed to read Google Sheets ({type(exc).__name__}).",
+        )
+    finally:
+        _close_service(service)
+
+
+def _write_finance_with_service(
+    service,
+    sheet_id: str,
+    tx_type: str,
+    amount: int,
+    title: str,
+    category: str,
+    wallet: str,
+    to_wallet: str,
+    dt: date,
+) -> FinanceSheetWriteResult:
+    """Core bot-wa Monthly Budget writer operating on an open Google Sheets service."""
+    tab = month_tab_name(dt.month)
+    date_str = dt.isoformat()
+    amt = int(amount)
+    if amt <= 0:
+        return FinanceSheetWriteResult(ok=False, tab=tab, error="Amount must be greater than zero.")
+
+    clean_title = str(title or "").strip()[:100]
+    tx_t = str(tx_type or "expense").strip().lower()
+    wal = str(wallet or "Tunai").strip()
+    to_wal = str(to_wallet or "").strip()
+    cat = category if category in FINANCE_SHEET_CAT_COLS else "Jajan"
+
+    # Bank keyword guard (protects Monthly_Budget SUMIF("*BNI*") / SUMIF("*Mandiri*") formulas)
+    if tx_t == "income":
+        allowed = wal if wal in FINANCE_BANK_WORDS else None
+        bad = forbidden_bank_word(clean_title, allowed_bank=allowed)
+        if bad:
+            if allowed:
+                return FinanceSheetWriteResult(
+                    ok=False, tab=tab,
+                    error=f"Note cannot contain '{bad}' for a {allowed} deposit (would distort bank formulas).",
+                )
+            return FinanceSheetWriteResult(
+                ok=False, tab=tab,
+                error=f"Cash income cannot contain '{bad}' (would be counted as bank income in Sheets).",
+            )
+    elif tx_t == "transfer":
+        bad = forbidden_bank_word(clean_title, allowed_bank=None)
+        if bad:
+            return FinanceSheetWriteResult(
+                ok=False, tab=tab,
+                error=f"Transfer note cannot contain '{bad}' (would distort bank formulas in Sheets).",
+            )
+
+    cells: list[dict] = []
+
+    if tx_t == "expense":
+        col_a, col_c = FINANCE_SHEET_CAT_COLS[cat]
+        name = clean_title or cat
+        exp_col_rng = _a1_range(tab, f"{col_a}{FINANCE_EXPENSE_ROW_START}:{col_a}{FINANCE_EXPENSE_ROW_END}")
+
+        if wal in QRIS_SOURCE_BY_BANK:
+            # Exact bot-wa /qris flow: pre-check BOTH Pemasukan (B10:D31) and Expense table before writing!
+            sumber_qris = QRIS_SOURCE_BY_BANK[wal]
+            inc_rng = _a1_range(tab, f"B{FINANCE_INCOME_ROW_START}:D{FINANCE_INCOME_ROW_END}")
+            resp = service.spreadsheets().values().batchGet(
+                spreadsheetId=sheet_id,
+                ranges=[inc_rng, exp_col_rng],
+                valueRenderOption="UNFORMATTED_VALUE",
+            ).execute()
+            vrs = resp.get("valueRanges") or []
+            inc_rows = (vrs[0].get("values") or []) if len(vrs) > 0 else []
+            exp_col = (vrs[1].get("values") or []) if len(vrs) > 1 else []
+
+            erows = _find_empty_rows(exp_col, FINANCE_EXPENSE_ROW_START, FINANCE_EXPENSE_ROW_END, count=1)
+            if not erows:
+                return FinanceSheetWriteResult(ok=False, tab=tab, error=f"Table '{cat}' in '{tab}' is full.")
+            erow = erows[0]
+
+            # Look for existing QRIS BNI / QRIS Mandiri row
+            existing_qris = None
+            inc_col_b: list[list] = []
+            for idx, r in enumerate(inc_rows):
+                col0 = r[0] if len(r) > 0 else ""
+                inc_col_b.append([col0])
+                if (existing_qris is None and len(r) >= 3
+                        and str(r[0]).strip().lower() == sumber_qris.lower()
+                        and _is_number(r[2])):
+                    old_val = int(round(float(r[2])))
+                    existing_qris = (FINANCE_INCOME_ROW_START + idx, str(r[0]).strip(), old_val)
+
+            if existing_qris is None:
+                qrows = _find_empty_rows(inc_col_b, FINANCE_INCOME_ROW_START, FINANCE_INCOME_ROW_END, count=1)
+                if not qrows:
+                    return FinanceSheetWriteResult(
+                        ok=False, tab=tab,
+                        error=f"Pemasukan table (B10:D31) in '{tab}' is full — cannot create '{sumber_qris}' row.",
+                    )
+                qrow = qrows[0]
+                qrange = f"B{qrow}:D{qrow}"
+                service.spreadsheets().values().update(
+                    spreadsheetId=sheet_id,
+                    range=_a1_range(tab, qrange),
+                    valueInputOption="USER_ENTERED",
+                    body={"values": [[safe_sheet_text(sumber_qris), date_str, amt]]},
+                ).execute()
+                cells.append({"tab": tab, "range": qrange, "name": sumber_qris, "amount": amt})
+            else:
+                qrow, qname, old_val = existing_qris
+                new_val = old_val + amt
+                service.spreadsheets().values().update(
+                    spreadsheetId=sheet_id,
+                    range=_a1_range(tab, f"D{qrow}"),
+                    valueInputOption="USER_ENTERED",
+                    body={"values": [[new_val]]},
+                ).execute()
+                cells.append({
+                    "tab": tab,
+                    "range": f"B{qrow}:D{qrow}",
+                    "name": qname,
+                    "amount": new_val,
+                    "prev_amount": old_val,
+                    "kind": "increment",
+                })
+
+            erange = f"{col_a}{erow}:{col_c}{erow}"
+            service.spreadsheets().values().update(
+                spreadsheetId=sheet_id,
+                range=_a1_range(tab, erange),
+                valueInputOption="USER_ENTERED",
+                body={"values": [[safe_sheet_text(name), date_str, amt]]},
+            ).execute()
+            cells.append({"tab": tab, "range": erange, "name": name, "amount": amt})
+            return FinanceSheetWriteResult(
+                ok=True, tab=tab, cells=cells,
+                message=f"Saved QRIS ({wal}) '{name}' to {tab} · {cat} row {erow}",
+            )
+
+        # Standard Tunai expense
+        resp = service.spreadsheets().values().get(
+            spreadsheetId=sheet_id,
+            range=exp_col_rng,
+            valueRenderOption="UNFORMATTED_VALUE",
+        ).execute()
+        erows = _find_empty_rows(resp.get("values") or [], FINANCE_EXPENSE_ROW_START, FINANCE_EXPENSE_ROW_END, count=1)
+        if not erows:
+            return FinanceSheetWriteResult(ok=False, tab=tab, error=f"Table '{cat}' in '{tab}' is full.")
+        erow = erows[0]
+        erange = f"{col_a}{erow}:{col_c}{erow}"
+        service.spreadsheets().values().update(
+            spreadsheetId=sheet_id,
+            range=_a1_range(tab, erange),
+            valueInputOption="USER_ENTERED",
+            body={"values": [[safe_sheet_text(name), date_str, amt]]},
+        ).execute()
+        cells.append({"tab": tab, "range": erange, "name": name, "amount": amt})
+        return FinanceSheetWriteResult(
+            ok=True, tab=tab, cells=cells,
+            message=f"Saved '{name}' to {tab} · {cat} row {erow}",
+        )
+
+    if tx_t == "income":
+        if wal in FINANCE_BANK_WORDS:
+            label = _format_bank_income_label(wal, clean_title)
+            col_rng = _a1_range(tab, f"T{FINANCE_BANK_ROW_START}:T{FINANCE_BANK_ROW_END}")
+            resp = service.spreadsheets().values().get(
+                spreadsheetId=sheet_id, range=col_rng, valueRenderOption="UNFORMATTED_VALUE",
+            ).execute()
+            rows = _find_empty_rows(resp.get("values") or [], FINANCE_BANK_ROW_START, FINANCE_BANK_ROW_END, count=1)
+            if not rows:
+                return FinanceSheetWriteResult(
+                    ok=False, tab=tab,
+                    error=f"Pemasukan Bank table (T10:V31) in '{tab}' is full.",
+                )
+            rnum = rows[0]
+            rng = f"T{rnum}:V{rnum}"
+            service.spreadsheets().values().update(
+                spreadsheetId=sheet_id,
+                range=_a1_range(tab, rng),
+                valueInputOption="USER_ENTERED",
+                body={"values": [[safe_sheet_text(label), date_str, amt]]},
+            ).execute()
+            cells.append({"tab": tab, "range": rng, "name": label, "amount": amt})
+            return FinanceSheetWriteResult(
+                ok=True, tab=tab, cells=cells,
+                message=f"Saved bank income '{label}' to {tab} row {rnum}",
+            )
+
+        label = clean_title or "Pemasukan"
+        col_rng = _a1_range(tab, f"B{FINANCE_INCOME_ROW_START}:B{FINANCE_INCOME_ROW_END}")
+        resp = service.spreadsheets().values().get(
+            spreadsheetId=sheet_id, range=col_rng, valueRenderOption="UNFORMATTED_VALUE",
+        ).execute()
+        rows = _find_empty_rows(resp.get("values") or [], FINANCE_INCOME_ROW_START, FINANCE_INCOME_ROW_END, count=1)
+        if not rows:
+            return FinanceSheetWriteResult(
+                ok=False, tab=tab,
+                error=f"Pemasukan table (B10:D31) in '{tab}' is full.",
+            )
+        rnum = rows[0]
+        rng = f"B{rnum}:D{rnum}"
+        service.spreadsheets().values().update(
+            spreadsheetId=sheet_id,
+            range=_a1_range(tab, rng),
+            valueInputOption="USER_ENTERED",
+            body={"values": [[safe_sheet_text(label), date_str, amt]]},
+        ).execute()
+        cells.append({"tab": tab, "range": rng, "name": label, "amount": amt})
+        return FinanceSheetWriteResult(
+            ok=True, tab=tab, cells=cells,
+            message=f"Saved cash income '{label}' to {tab} row {rnum}",
+        )
+
+    if tx_t == "transfer":
+        if wal == to_wal or wal not in ("Tunai", "BNI", "Mandiri") or to_wal not in ("Tunai", "BNI", "Mandiri"):
+            return FinanceSheetWriteResult(ok=False, tab=tab, error="Choose two different wallets for a transfer.")
+        extra = f" - {clean_title}" if clean_title else ""
+
+        if wal in FINANCE_BANK_WORDS and to_wal == "Tunai":
+            label = f"Tarik Uang {wal}{extra}"
+            col_rng = _a1_range(tab, f"B{FINANCE_INCOME_ROW_START}:B{FINANCE_INCOME_ROW_END}")
+            resp = service.spreadsheets().values().get(
+                spreadsheetId=sheet_id, range=col_rng, valueRenderOption="UNFORMATTED_VALUE",
+            ).execute()
+            rows = _find_empty_rows(resp.get("values") or [], FINANCE_INCOME_ROW_START, FINANCE_INCOME_ROW_END, count=1)
+            if not rows:
+                return FinanceSheetWriteResult(ok=False, tab=tab, error=f"Pemasukan table (B10:D31) in '{tab}' is full.")
+            rnum = rows[0]
+            rng = f"B{rnum}:D{rnum}"
+            service.spreadsheets().values().update(
+                spreadsheetId=sheet_id,
+                range=_a1_range(tab, rng),
+                valueInputOption="USER_ENTERED",
+                body={"values": [[safe_sheet_text(label), date_str, amt]]},
+            ).execute()
+            cells.append({"tab": tab, "range": rng, "name": label, "amount": amt})
+            return FinanceSheetWriteResult(ok=True, tab=tab, cells=cells, message=f"Saved transfer {wal} → Tunai to {tab}")
+
+        if wal == "Tunai" and to_wal in FINANCE_BANK_WORDS:
+            cash_rng = _a1_range(tab, f"B{FINANCE_INCOME_ROW_START}:B{FINANCE_INCOME_ROW_END}")
+            bank_rng = _a1_range(tab, f"T{FINANCE_BANK_ROW_START}:T{FINANCE_BANK_ROW_END}")
+            resp = service.spreadsheets().values().batchGet(
+                spreadsheetId=sheet_id, ranges=[cash_rng, bank_rng], valueRenderOption="UNFORMATTED_VALUE",
+            ).execute()
+            vrs = resp.get("valueRanges") or []
+            cash_rows = _find_empty_rows(
+                (vrs[0].get("values") or []) if len(vrs) > 0 else [],
+                FINANCE_INCOME_ROW_START, FINANCE_INCOME_ROW_END, count=1,
+            )
+            bank_rows = _find_empty_rows(
+                (vrs[1].get("values") or []) if len(vrs) > 1 else [],
+                FINANCE_BANK_ROW_START, FINANCE_BANK_ROW_END, count=1,
+            )
+            if not cash_rows:
+                return FinanceSheetWriteResult(ok=False, tab=tab, error=f"Pemasukan table (B10:D31) in '{tab}' is full.")
+            if not bank_rows:
+                return FinanceSheetWriteResult(ok=False, tab=tab, error=f"Pemasukan Bank table (T10:V31) in '{tab}' is full.")
+            lbl_cash = f"Setor Tunai{extra}"
+            lbl_bank = f"{to_wal} (setor tunai{extra})"
+            rng_c = f"B{cash_rows[0]}:D{cash_rows[0]}"
+            rng_b = f"T{bank_rows[0]}:V{bank_rows[0]}"
+            service.spreadsheets().values().batchUpdate(
+                spreadsheetId=sheet_id,
+                body={
+                    "valueInputOption": "USER_ENTERED",
+                    "data": [
+                        {"range": _a1_range(tab, rng_c), "values": [[safe_sheet_text(lbl_cash), date_str, -amt]]},
+                        {"range": _a1_range(tab, rng_b), "values": [[safe_sheet_text(lbl_bank), date_str, amt]]},
+                    ],
+                },
+            ).execute()
+            cells.append({"tab": tab, "range": rng_c, "name": lbl_cash, "amount": -amt})
+            cells.append({"tab": tab, "range": rng_b, "name": lbl_bank, "amount": amt})
+            return FinanceSheetWriteResult(ok=True, tab=tab, cells=cells, message=f"Saved transfer Tunai → {to_wal} to {tab}")
+
+        # Bank <-> Bank transfer (2 rows in T10:V31)
+        bank_rng = _a1_range(tab, f"T{FINANCE_BANK_ROW_START}:T{FINANCE_BANK_ROW_END}")
+        resp = service.spreadsheets().values().get(
+            spreadsheetId=sheet_id, range=bank_rng, valueRenderOption="UNFORMATTED_VALUE",
+        ).execute()
+        rows = _find_empty_rows(resp.get("values") or [], FINANCE_BANK_ROW_START, FINANCE_BANK_ROW_END, count=2)
+        if len(rows) < 2:
+            return FinanceSheetWriteResult(
+                ok=False, tab=tab,
+                error=f"Pemasukan Bank table (T10:V31) in '{tab}' needs 2 free rows for bank transfer.",
+            )
+        lbl_out = f"{wal} (tf keluar{extra})"
+        lbl_in = f"{to_wal} (tf masuk{extra})"
+        rng_out = f"T{rows[0]}:V{rows[0]}"
+        rng_in = f"T{rows[1]}:V{rows[1]}"
+        service.spreadsheets().values().batchUpdate(
+            spreadsheetId=sheet_id,
+            body={
+                "valueInputOption": "USER_ENTERED",
+                "data": [
+                    {"range": _a1_range(tab, rng_out), "values": [[safe_sheet_text(lbl_out), date_str, -amt]]},
+                    {"range": _a1_range(tab, rng_in), "values": [[safe_sheet_text(lbl_in), date_str, amt]]},
+                ],
+            },
+        ).execute()
+        cells.append({"tab": tab, "range": rng_out, "name": lbl_out, "amount": -amt})
+        cells.append({"tab": tab, "range": rng_in, "name": lbl_in, "amount": amt})
+        return FinanceSheetWriteResult(ok=True, tab=tab, cells=cells, message=f"Saved transfer {wal} → {to_wal} to {tab}")
+
+    return FinanceSheetWriteResult(ok=False, tab=tab, error=f"Unsupported transaction type: {tx_t}")
+
+
+def write_finance_tx_to_sheets(
+    cfg: SheetsSyncConfig,
+    base_dir: Path,
+    tx_type: str,
+    amount: int,
+    title: str,
+    category: str = "Jajan",
+    wallet: str = "Tunai",
+    to_wallet: str = "",
+    day: str | date | None = None,
+    timeout: float = 12.0,
+) -> FinanceSheetWriteResult:
+    """Write a finance transaction to Google Sheets using exact `bot-wa` Monthly Budget rules."""
+    dt = _parse_tx_date(day)
+    tab = month_tab_name(dt.month)
+    sheet_id = cfg.normalized_sheet_id()
+    if not sheet_id:
+        return FinanceSheetWriteResult(ok=False, tab=tab, error="Spreadsheet ID is not configured.")
+    key_file = cfg.resolve_key_file(base_dir)
+    if key_file is None:
+        return FinanceSheetWriteResult(ok=False, tab=tab, error="Service Account JSON key file not found.")
+    service, client_email, HttpError, err = _build_service(key_file, timeout=timeout)
+    if err or service is None:
+        return FinanceSheetWriteResult(ok=False, tab=tab, error=err)
+
+    with _FINANCE_WRITE_LOCK:
+        try:
+            return _write_finance_with_service(
+                service, sheet_id, tx_type, amount, title, category, wallet, to_wallet, dt,
+            )
+        except HttpError as exc:
+            return FinanceSheetWriteResult(ok=False, tab=tab, error=_friendly_finance_http_error(exc, client_email, tab))
+        except TimeoutError:
+            return FinanceSheetWriteResult(ok=False, tab=tab, error="Google Sheets write timed out.")
+        except Exception as exc:
+            return FinanceSheetWriteResult(ok=False, tab=tab, error=f"Google Sheets write failed ({type(exc).__name__}).")
+        finally:
+            _close_service(service)
+
+
+def _verify_cells_match(service, sheet_id: str, cells: list[dict]) -> tuple[bool, list[dict]]:
+    """Verify all target sheet cells are either empty or still match expected (name, amount).
+
+    Returns `(safe, non_empty_cells)` matching `bot-wa`'s `batalkan_terakhir` protection.
+    """
+    if not cells:
+        return False, []
+    ranges = [_a1_range(str(c["tab"]), str(c["range"])) for c in cells]
+    resp = service.spreadsheets().values().batchGet(
+        spreadsheetId=sheet_id,
+        ranges=ranges,
+        valueRenderOption="UNFORMATTED_VALUE",
+    ).execute()
+    vrs = resp.get("valueRanges") or []
+    active: list[dict] = []
+    for i, c in enumerate(cells):
+        vals = (vrs[i].get("values") or []) if i < len(vrs) else []
+        if not any(str(x).strip() for row in vals for x in row):
+            continue  # Already cleared manually
+        row = list(vals[0]) if vals else []
+        if len(row) < 3 or not _is_number(row[2]):
+            return False, []
+        cur_name = str(row[0]).strip().lstrip("'").lower()
+        exp_name = str(c.get("name") or "").strip().lstrip("'").lower()
+        if cur_name != exp_name or float(row[2]) != float(c["amount"]):
+            return False, []
+        active.append(c)
+    return True, active
+
+
+def _clear_cells_with_service(service, sheet_id: str, cells: list[dict]) -> FinanceSheetWriteResult:
+    tab = str(cells[0].get("tab") or "") if cells else ""
+    safe, active = _verify_cells_match(service, sheet_id, cells)
+    if not safe:
+        return FinanceSheetWriteResult(
+            ok=False, tab=tab,
+            error="Cell was modified in Google Sheets — skipped to protect your manual edits.",
+        )
+    to_clear: list[str] = []
+    to_restore: list[dict] = []
+    for c in active:
+        rng_full = _a1_range(str(c["tab"]), str(c["range"]))
+        if c.get("prev_amount") is not None:
+            amt_cell = str(c["range"]).split(":")[-1]
+            to_restore.append({"range": _a1_range(str(c["tab"]), amt_cell), "values": [[c["prev_amount"]]]})
+        else:
+            to_clear.append(rng_full)
+    if to_clear:
+        service.spreadsheets().values().batchClear(
+            spreadsheetId=sheet_id,
+            body={"ranges": to_clear},
+        ).execute()
+    if to_restore:
+        service.spreadsheets().values().batchUpdate(
+            spreadsheetId=sheet_id,
+            body={"valueInputOption": "USER_ENTERED", "data": to_restore},
+        ).execute()
+    return FinanceSheetWriteResult(ok=True, tab=tab, cells=cells, message="Reverted cells in Google Sheets.")
+
+
+def clear_finance_cells_in_sheets(
+    cfg: SheetsSyncConfig,
+    base_dir: Path,
+    cells: list[dict],
+    timeout: float = 12.0,
+) -> FinanceSheetWriteResult:
+    """Safely clear or revert recorded finance cells in Google Sheets (bot-wa /undo safety)."""
+    tab = str(cells[0].get("tab") or "") if cells else ""
+    if not cells:
+        return FinanceSheetWriteResult(ok=False, tab=tab, error="No Google Sheets cell trace to revert.")
+    sheet_id = cfg.normalized_sheet_id()
+    if not sheet_id:
+        return FinanceSheetWriteResult(ok=False, tab=tab, error="Spreadsheet ID is not configured.")
+    key_file = cfg.resolve_key_file(base_dir)
+    if key_file is None:
+        return FinanceSheetWriteResult(ok=False, tab=tab, error="Service Account JSON key file not found.")
+    service, client_email, HttpError, err = _build_service(key_file, timeout=timeout)
+    if err or service is None:
+        return FinanceSheetWriteResult(ok=False, tab=tab, error=err)
+
+    with _FINANCE_WRITE_LOCK:
+        try:
+            return _clear_cells_with_service(service, sheet_id, cells)
+        except HttpError as exc:
+            return FinanceSheetWriteResult(ok=False, tab=tab, error=_friendly_finance_http_error(exc, client_email, tab))
+        except TimeoutError:
+            return FinanceSheetWriteResult(ok=False, tab=tab, error="Google Sheets request timed out.")
+        except Exception as exc:
+            return FinanceSheetWriteResult(ok=False, tab=tab, error=f"Google Sheets delete failed ({type(exc).__name__}).")
+        finally:
+            _close_service(service)
+
+
+def update_finance_tx_in_sheets(
+    cfg: SheetsSyncConfig,
+    base_dir: Path,
+    old_tx: dict,
+    tx_type: str,
+    amount: int,
+    title: str,
+    category: str = "Jajan",
+    wallet: str = "Tunai",
+    to_wallet: str = "",
+    day: str | date | None = None,
+    timeout: float = 12.0,
+) -> FinanceSheetWriteResult:
+    """Safely edit a Sheet-backed transaction (in-place when same tab/table, else write-then-clear)."""
+    if str(old_tx.get("sheet_kind") or "") == "qris_pool":
+        return FinanceSheetWriteResult(
+            ok=False, error="QRIS monthly pool rows are updated automatically by QRIS expenses.",
+        )
+    old_cells = list(old_tx.get("sheet_cells") or [])
+    if not old_cells:
+        return FinanceSheetWriteResult(ok=False, error="Selected transaction is not linked to Google Sheets cells.")
+
+    dt = _parse_tx_date(day)
+    new_tab = month_tab_name(dt.month)
+    old_tab = str(old_cells[0].get("tab") or "")
+    sheet_id = cfg.normalized_sheet_id()
+    if not sheet_id:
+        return FinanceSheetWriteResult(ok=False, tab=new_tab, error="Spreadsheet ID is not configured.")
+    key_file = cfg.resolve_key_file(base_dir)
+    if key_file is None:
+        return FinanceSheetWriteResult(ok=False, tab=new_tab, error="Service Account JSON key file not found.")
+    service, client_email, HttpError, err = _build_service(key_file, timeout=timeout)
+    if err or service is None:
+        return FinanceSheetWriteResult(ok=False, tab=new_tab, error=err)
+
+    with _FINANCE_WRITE_LOCK:
+        try:
+            safe, active = _verify_cells_match(service, sheet_id, old_cells)
+            if not safe or not active:
+                return FinanceSheetWriteResult(
+                    ok=False, tab=old_tab,
+                    error="Row changed in Google Sheets — refresh before editing.",
+                )
+
+            amt = int(amount)
+            if amt <= 0:
+                return FinanceSheetWriteResult(ok=False, tab=new_tab, error="Amount must be greater than zero.")
+            clean_title = str(title or "").strip()[:100]
+            date_str = dt.isoformat()
+
+            # Fast in-place update for single-row Expense in same tab & category (without new QRIS charge)
+            if (len(old_cells) == 1 and old_tx.get("type") == "expense" and tx_type == "expense"
+                    and old_tab == new_tab and old_tx.get("category") == category
+                    and wallet not in QRIS_SOURCE_BY_BANK):
+                rng = str(old_cells[0]["range"])
+                name = clean_title or category
+                service.spreadsheets().values().update(
+                    spreadsheetId=sheet_id,
+                    range=_a1_range(new_tab, rng),
+                    valueInputOption="USER_ENTERED",
+                    body={"values": [[safe_sheet_text(name), date_str, amt]]},
+                ).execute()
+                return FinanceSheetWriteResult(
+                    ok=True, tab=new_tab,
+                    cells=[{"tab": new_tab, "range": rng, "name": name, "amount": amt}],
+                    message=f"Updated '{name}' in {new_tab} ({rng})",
+                )
+
+            # Fast in-place update for single-row Income in same tab & same table (Tunai vs Bank)
+            old_is_bank = old_tx.get("wallet") in FINANCE_BANK_WORDS
+            new_is_bank = wallet in FINANCE_BANK_WORDS
+            if (len(old_cells) == 1 and old_tx.get("type") == "income" and tx_type == "income"
+                    and old_tab == new_tab and old_is_bank == new_is_bank):
+                allowed = wallet if new_is_bank else None
+                bad = forbidden_bank_word(clean_title, allowed_bank=allowed)
+                if bad:
+                    return FinanceSheetWriteResult(
+                        ok=False, tab=new_tab,
+                        error=f"Label cannot contain '{bad}' for this wallet (protects Sheet bank formulas).",
+                    )
+                label = _format_bank_income_label(wallet, clean_title) if new_is_bank else (clean_title or "Pemasukan")
+                rng = str(old_cells[0]["range"])
+                service.spreadsheets().values().update(
+                    spreadsheetId=sheet_id,
+                    range=_a1_range(new_tab, rng),
+                    valueInputOption="USER_ENTERED",
+                    body={"values": [[safe_sheet_text(label), date_str, amt]]},
+                ).execute()
+                return FinanceSheetWriteResult(
+                    ok=True, tab=new_tab,
+                    cells=[{"tab": new_tab, "range": rng, "name": label, "amount": amt}],
+                    message=f"Updated '{label}' in {new_tab} ({rng})",
+                )
+
+            # Cross-table / cross-tab / type-change edit: write new FIRST, then clear old so data is never lost
+            written = _write_finance_with_service(
+                service, sheet_id, tx_type, amt, clean_title, category, wallet, to_wallet, dt,
+            )
+            if not written.ok:
+                return written
+            _clear_cells_with_service(service, sheet_id, old_cells)
+            return FinanceSheetWriteResult(
+                ok=True, tab=written.tab, cells=written.cells,
+                message=f"Moved & updated transaction in {written.tab}",
+            )
+        except HttpError as exc:
+            return FinanceSheetWriteResult(
+                ok=False, tab=new_tab, error=_friendly_finance_http_error(exc, client_email, new_tab),
+            )
+        except TimeoutError:
+            return FinanceSheetWriteResult(ok=False, tab=new_tab, error="Google Sheets update timed out.")
+        except Exception as exc:
+            return FinanceSheetWriteResult(ok=False, tab=new_tab, error=f"Google Sheets update failed ({type(exc).__name__}).")
+        finally:
+            _close_service(service)
+
