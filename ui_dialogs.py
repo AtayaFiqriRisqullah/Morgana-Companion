@@ -3329,6 +3329,8 @@ class SettingsDialog(P5FluidPanel):
     always_on_top_changed = pyqtSignal(bool)
     autostart_changed = pyqtSignal(bool)
     test_ai_requested = pyqtSignal(dict)
+    test_wa_sync_requested = pyqtSignal(dict)
+    sync_wa_now_requested = pyqtSignal(dict)
 
     def __init__(self, store: SettingsStore, get_on_top=None, get_autostart=None,
                  get_hotkey_status=None, on_top: bool = True, ui_scale: float = 1.0) -> None:
@@ -3550,7 +3552,49 @@ class SettingsDialog(P5FluidPanel):
         lai.addLayout(test_row)
         cards_lay.addWidget(c_ai)
 
-        # Card 7: Radial menu tabs (enable/disable individual tabs)
+        # Card 7: WhatsApp Bot Sync (Offline Task Deadline Reminders via Termux / Baileys API)
+        c_wa = _make_card()
+        lwa = QVBoxLayout(c_wa)
+        lwa.setContentsMargins(pad_x, pad_y, pad_x, pad_y)
+        lwa.setSpacing(row_gap)
+        hwa = QLabel("WHATSAPP BOT SYNC (OFFLINE REMINDERS)")
+        hwa.setObjectName("section")
+        lwa.addWidget(hwa)
+
+        self.wa_sync_enabled_check = P5CheckBox("Sync task deadlines to WhatsApp Bot (opt-in)", scale=sc)
+        self.wa_sync_enabled_check.toggled.connect(self._sync_wa_fields)
+        lwa.addWidget(self.wa_sync_enabled_check)
+
+        self.wa_sync_url_edit = QLineEdit()
+        self.wa_sync_url_edit.setPlaceholderText("http://100.x.y.z:8000 (Tailscale / LAN IP)")
+        self._row(lwa, "Bot API URL", self.wa_sync_url_edit, wide=True)
+
+        self.wa_sync_token_edit = QLineEdit()
+        self.wa_sync_token_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.wa_sync_token_edit.setPlaceholderText("Matches MORGANA_SYNC_TOKEN in bot-wa .env")
+        self._row(lwa, "Sync Token", self.wa_sync_token_edit, wide=True)
+
+        wa_btn_row = QHBoxLayout()
+        wa_btn_row.setSpacing(_sc(8, sc, 6))
+        self._wa_test_btn = self._btn("TEST", variant="gold", display=True, px=10)
+        self._wa_test_btn.setFixedHeight(_sc(26, sc, 22))
+        self._wa_test_btn.clicked.connect(self._on_test_wa_clicked)
+        wa_btn_row.addWidget(self._wa_test_btn)
+
+        self._wa_sync_btn = self._btn("SYNC NOW", variant="soft", display=True, px=10)
+        self._wa_sync_btn.setFixedHeight(_sc(26, sc, 22))
+        self._wa_sync_btn.clicked.connect(self._on_sync_wa_now_clicked)
+        wa_btn_row.addWidget(self._wa_sync_btn)
+        wa_btn_row.addStretch(1)
+        lwa.addLayout(wa_btn_row)
+
+        self._wa_status_lbl = QLabel("Off by default. Syncs active deadlines so your bot reminds you when this PC is off.")
+        self._wa_status_lbl.setObjectName("tip")
+        self._wa_status_lbl.setWordWrap(True)
+        lwa.addWidget(self._wa_status_lbl)
+        cards_lay.addWidget(c_wa)
+
+        # Card 8: Radial menu tabs (enable/disable individual tabs)
         c4 = _make_card()
         l4 = QVBoxLayout(c4)
         l4.setContentsMargins(pad_x, pad_y, pad_x, pad_y)
@@ -3659,6 +3703,40 @@ class SettingsDialog(P5FluidPanel):
         color = "#5CE09A" if ok else "#FF6B78"
         self._ai_test_lbl.setStyleSheet(f"color: {color}; font-size: {_sc(12, self._ui_scale, 9)}px; font-weight: bold;")
         self._ai_test_lbl.setText(message)
+
+    def _sync_wa_fields(self, enabled: bool) -> None:
+        on = bool(enabled)
+        for w in (self.wa_sync_url_edit, self.wa_sync_token_edit, self._wa_test_btn, self._wa_sync_btn):
+            w.setEnabled(on)
+
+    def _wa_form_payload(self) -> dict:
+        return {
+            "enabled": self.wa_sync_enabled_check.isChecked(),
+            "url": self.wa_sync_url_edit.text().strip(),
+            "token": self.wa_sync_token_edit.text().strip(),
+        }
+
+    def _on_test_wa_clicked(self) -> None:
+        self._wa_test_btn.setEnabled(False)
+        self._wa_sync_btn.setEnabled(False)
+        self._wa_status_lbl.setStyleSheet(f"color: #FAD02C; font-size: {_sc(12, self._ui_scale, 9)}px;")
+        self._wa_status_lbl.setText("Testing connection to WhatsApp Bot...")
+        self.test_wa_sync_requested.emit(self._wa_form_payload())
+
+    def _on_sync_wa_now_clicked(self) -> None:
+        self._wa_test_btn.setEnabled(False)
+        self._wa_sync_btn.setEnabled(False)
+        self._wa_status_lbl.setStyleSheet(f"color: #FAD02C; font-size: {_sc(12, self._ui_scale, 9)}px;")
+        self._wa_status_lbl.setText("Syncing task deadlines with WhatsApp Bot...")
+        self.sync_wa_now_requested.emit(self._wa_form_payload())
+
+    def set_wa_status(self, ok: bool, message: str) -> None:
+        on = self.wa_sync_enabled_check.isChecked()
+        self._wa_test_btn.setEnabled(on)
+        self._wa_sync_btn.setEnabled(on)
+        color = "#5CE09A" if ok else "#FF6B78"
+        self._wa_status_lbl.setStyleSheet(f"color: {color}; font-size: {_sc(12, self._ui_scale, 9)}px; font-weight: bold;")
+        self._wa_status_lbl.setText(message)
 
     def _row(self, layout: QVBoxLayout, text: str, widget: QWidget, wide: bool = False) -> None:
         sc = self._ui_scale
@@ -3804,6 +3882,13 @@ class SettingsDialog(P5FluidPanel):
             self._ai_test_lbl.setStyleSheet("")
             self._ai_test_lbl.setText("Off by default. Free Gemini keys: aistudio.google.com/apikey")
             self._sync_ai_fields(ai_on)
+            wa_on = bool(values.get("wa_sync_enabled", SETTINGS_DEFAULTS["wa_sync_enabled"]))
+            self.wa_sync_enabled_check.setChecked(wa_on)
+            self.wa_sync_url_edit.setText(str(values.get("wa_sync_url", SETTINGS_DEFAULTS["wa_sync_url"])))
+            self.wa_sync_token_edit.setText(str(values.get("wa_sync_token", SETTINGS_DEFAULTS["wa_sync_token"])))
+            self._wa_status_lbl.setStyleSheet("")
+            self._wa_status_lbl.setText("Off by default. Syncs active deadlines so your bot reminds you when this PC is off.")
+            self._sync_wa_fields(wa_on)
             enabled = set(values.get("enabled_tabs", RADIAL_TAB_KEYS))
             for key, cb in self.tab_checks.items():
                 cb.setChecked(key in enabled)
@@ -3876,6 +3961,9 @@ class SettingsDialog(P5FluidPanel):
                 ai_api_key=self.ai_key_edit.text().strip(),
                 ai_call_user=self.ai_call_user_edit.text().strip() or "Joker",
                 ai_dialogue_enabled=self.ai_dialogue_check.isChecked(),
+                wa_sync_enabled=self.wa_sync_enabled_check.isChecked(),
+                wa_sync_url=self.wa_sync_url_edit.text().strip(),
+                wa_sync_token=self.wa_sync_token_edit.text().strip(),
                 enabled_tabs=chosen_tabs,
             )
             self.saved.emit()

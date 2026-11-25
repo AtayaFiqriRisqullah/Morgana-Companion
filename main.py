@@ -82,6 +82,9 @@ from theme import (BLACK, BLUE, GOLD, LIGHT_RED, MENU_QSS, P5_MINT_FG,
                    star_polygon, tapered_wedge)
 from ui_dialogs import (BriefingDialog, EventsDialog, NotesDialog, QuickCommandDialog,
                         SettingsDialog, SocialStatsDialog, TasksDialog, TimerDialog, WrapUpDialog)
+from whatsapp_sync import (OutboxResult, SyncPushResult, WhatsAppSyncConfig, parse_remote_dt,
+                           pull_whatsapp_outbox, push_whatsapp_sync, serialize_tasks_for_sync,
+                           test_whatsapp_connection)
 
 try:
     import psutil
@@ -109,6 +112,10 @@ NOTE_COUNTDOWN_REMINDERS = True           # catatan ber-deadline ikut diingatkan
 EVENT_STARTED_GRACE_S = 90                # pesan "acara dimulai sekarang" dalam N detik setelah mulai
 REMINDER_CHECK_MS = 30_000    # cek deadline catatan & acara tiap 30 detik
 CALENDAR_REFRESH_MS = 10 * 60_000
+WA_SYNC_INTERVAL_MS = 60_000              # periodic background sync with Bot WA when enabled
+WA_SYNC_STARTUP_DELAY_MS = 6_000          # let Wi-Fi/Tailscale settle on boot before first pull
+WA_SYNC_DEBOUNCE_MS = 2_500               # batch rapid task edits into one HTTP push
+WA_SYNC_RETRY_DELAYS_MS = (10_000, 20_000, 35_000)  # backoff after timeout/unreachable error
 STARTUP_TASK_LIMIT = 4        # maksimal tugas yang disebut di ringkasan startup
 
 def clip(text: str, limit: int) -> str:
@@ -3144,6 +3151,71 @@ class AIFetcher(QObject):
         return True
 
 
+class WhatsAppSyncWorker(QObject):
+    """Non-blocking single-flight background worker for WhatsApp Bot deadline sync."""
+
+    outbox_done = pyqtSignal(object, object)      # (OutboxResult, WhatsAppSyncConfig)
+    push_done = pyqtSignal(object)                # SyncPushResult
+    test_done = pyqtSignal(bool, str)             # (ok, status_message)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._sync_busy = False
+        self._test_busy = False
+
+    @property
+    def busy(self) -> bool:
+        return self._sync_busy
+
+    def release_sync(self) -> None:
+        self._sync_busy = False
+
+    def begin_pull(self, cfg: WhatsAppSyncConfig) -> bool:
+        if self._sync_busy:
+            return False
+        self._sync_busy = True
+
+        def _run() -> None:
+            try:
+                res = pull_whatsapp_outbox(cfg)
+            except Exception as exc:
+                res = OutboxResult(ok=False, error=f"Sync error ({type(exc).__name__}).")
+            if not res.ok:
+                self._sync_busy = False
+            self.outbox_done.emit(res, cfg)
+
+        threading.Thread(target=_run, daemon=True, name="morgana-wa-pull").start()
+        return True
+
+    def continue_push(self, cfg: WhatsAppSyncConfig, tasks_payload: list[dict],
+                      ack_ids: list[str]) -> None:
+        def _run() -> None:
+            try:
+                res = push_whatsapp_sync(cfg, tasks_payload, ack_ids=ack_ids)
+            except Exception as exc:
+                res = SyncPushResult(ok=False, error=f"Sync push error ({type(exc).__name__}).")
+            self._sync_busy = False
+            self.push_done.emit(res)
+
+        threading.Thread(target=_run, daemon=True, name="morgana-wa-push").start()
+
+    def test_connection(self, cfg: WhatsAppSyncConfig) -> bool:
+        if self._test_busy:
+            return False
+        self._test_busy = True
+
+        def _run() -> None:
+            try:
+                ok, msg = test_whatsapp_connection(cfg)
+            except Exception as exc:
+                ok, msg = False, f"Connection test failed ({type(exc).__name__})."
+            self._test_busy = False
+            self.test_done.emit(ok, msg)
+
+        threading.Thread(target=_run, daemon=True, name="morgana-wa-test").start()
+        return True
+
+
 # ---------------------------------------------------------------------------
 # 8. CONTROLLER
 # ---------------------------------------------------------------------------
@@ -3211,6 +3283,14 @@ class PetController(QObject):
         self.ai_conversation = ConversationBuffer(max_turns=12)
         self._ai_talk_scene: AITalkScene | None = None
         self._ai_ambient_last_t = 0.0
+        self.wa_sync = WhatsAppSyncWorker(self)
+        self._wa_dirty = False
+        self._wa_fail_streak = 0
+        self._wa_followup_count = 0
+        self._wa_manual_sync = False
+        self._wa_applied_count = 0
+        self._wa_last_pushed_payload: list[dict] | None = None
+        self._wa_inflight_payload: list[dict] | None = None
         self.hotkeys = GlobalHotkeyManager(self)
         self.tasks_dialog: TasksDialog | None = None
         self.notes_dialog: NotesDialog | None = None
@@ -3297,6 +3377,9 @@ class PetController(QObject):
         self.ai_fetcher.talk_reply_done.connect(self._on_ai_talk_reply)
         self.ai_fetcher.ambient_done.connect(self._on_ai_ambient_reply)
         self.ai_fetcher.test_done.connect(self._on_ai_test_done)
+        self.wa_sync.outbox_done.connect(self._on_wa_outbox_done)
+        self.wa_sync.push_done.connect(self._on_wa_push_done)
+        self.wa_sync.test_done.connect(self._on_wa_test_done)
         self.hotkeys.activated.connect(lambda: self._open_quick_command(toggle=True))
 
         self._curfew_timer = QTimer(self)
@@ -3317,6 +3400,15 @@ class PetController(QObject):
         self._sleep_zzz_timer = QTimer(self)       # gentle Zzz particles during sleep/curfew
         self._sleep_zzz_timer.setInterval(6_500)
         self._sleep_zzz_timer.timeout.connect(self._sleep_zzz_tick)
+        self._wa_sync_timer = QTimer(self)         # periodic pull->ack->push (only active when opt-in enabled)
+        self._wa_sync_timer.setInterval(WA_SYNC_INTERVAL_MS)
+        self._wa_sync_timer.timeout.connect(self._trigger_wa_sync)
+        self._wa_debounce_timer = QTimer(self)     # debounce rapid task edits
+        self._wa_debounce_timer.setSingleShot(True)
+        self._wa_debounce_timer.timeout.connect(self._trigger_wa_sync)
+        self._wa_retry_timer = QTimer(self)        # backoff retry after boot/Wi-Fi timeout
+        self._wa_retry_timer.setSingleShot(True)
+        self._wa_retry_timer.timeout.connect(self._trigger_wa_sync)
 
     # -- siklus hidup -------------------------------------------------------
     def start(self) -> None:
@@ -3332,11 +3424,15 @@ class PetController(QObject):
         self._calendar_timer.start()
         self._awareness_timer.start()
         self._sleep_zzz_timer.start()
+        self._configure_wa_sync_timers(trigger_initial=True)
         self._schedule_chatter()
         QTimer.singleShot(900, self._startup_report)
         QTimer.singleShot(3000, self._refresh_calendar)
 
     def quit(self) -> None:
+        self._wa_sync_timer.stop()
+        self._wa_debounce_timer.stop()
+        self._wa_retry_timer.stop()
         self.hotkeys.unregister()
         self.screen_time.save()
         self.audio.stop_all()
@@ -4172,6 +4268,7 @@ class PetController(QObject):
             self._sync_events_view()
             self._sync_briefing_view()
             self._sync_wrapup_view()
+            self._schedule_wa_sync()
             play_ui("select")
             word = "task" if moved == 1 else "tasks"
             if self.pet.isVisible() and not self.is_dnd_active():
@@ -4262,6 +4359,7 @@ class PetController(QObject):
             self._sync_events_view()
             self._sync_briefing_view()
             self._sync_wrapup_view()
+            self._schedule_wa_sync()
         elif res.kind == "add_note":
             p = res.payload
             self.notes.add(p["title"], p["content"], category=p.get("category", "Personal"))
@@ -4363,6 +4461,151 @@ class PetController(QObject):
     def _on_ai_test_done(self, ok: bool, msg: str) -> None:
         if self.settings_dialog is not None:
             self.settings_dialog.set_ai_test_result(ok, msg)
+
+    # -- WhatsApp Bot Sync (Pull -> Apply & Save -> ACK + Push) ---------------
+    def _wa_sync_config(self, override: dict | None = None) -> WhatsAppSyncConfig:
+        if override is not None:
+            return WhatsAppSyncConfig(
+                enabled=bool(override.get("enabled", True)),
+                url=str(override.get("url") or ""),
+                token=str(override.get("token") or ""),
+            )
+        return WhatsAppSyncConfig(
+            enabled=bool(self.settings["wa_sync_enabled"]),
+            url=str(self.settings["wa_sync_url"] or ""),
+            token=str(self.settings["wa_sync_token"] or ""),
+        )
+
+    def _configure_wa_sync_timers(self, trigger_initial: bool = False) -> None:
+        cfg = self._wa_sync_config()
+        if not cfg.is_ready():
+            self._wa_sync_timer.stop()
+            self._wa_debounce_timer.stop()
+            self._wa_retry_timer.stop()
+            self._wa_fail_streak = 0
+            self._wa_followup_count = 0
+            self._wa_last_pushed_payload = None
+            return
+        if not self._wa_sync_timer.isActive():
+            self._wa_sync_timer.start()
+        if trigger_initial:
+            self._wa_retry_timer.start(WA_SYNC_STARTUP_DELAY_MS)
+
+    def _schedule_wa_sync(self) -> None:
+        if not self._wa_sync_config().is_ready():
+            return
+        self._wa_dirty = True
+        self._wa_debounce_timer.start(WA_SYNC_DEBOUNCE_MS)
+
+    def _trigger_wa_sync(self, cfg_override: WhatsAppSyncConfig | None = None,
+                         manual: bool = False) -> None:
+        cfg = cfg_override if cfg_override is not None else self._wa_sync_config()
+        if not cfg.is_ready():
+            if manual and self.settings_dialog is not None:
+                self.settings_dialog.set_wa_status(False, "Enter a valid http:// or https:// Bot API URL.")
+            return
+        if self.wa_sync.busy:
+            self._wa_dirty = True
+            if manual and self.settings_dialog is not None:
+                self.settings_dialog.set_wa_status(False, "Sync already in progress — please wait a moment.")
+            return
+        self._wa_manual_sync = bool(manual)
+        self._wa_applied_count = 0
+        self.wa_sync.begin_pull(cfg)
+
+    def _on_test_wa_sync_requested(self, data: dict) -> None:
+        cfg = self._wa_sync_config(override=data)
+        if not self.wa_sync.test_connection(cfg) and self.settings_dialog is not None:
+            self.settings_dialog.set_wa_status(False, "Already testing — please wait a second.")
+
+    def _on_sync_wa_now_requested(self, data: dict) -> None:
+        cfg = self._wa_sync_config(override=data)
+        self._trigger_wa_sync(cfg_override=cfg, manual=True)
+
+    def _on_wa_test_done(self, ok: bool, msg: str) -> None:
+        if self.settings_dialog is not None:
+            self.settings_dialog.set_wa_status(ok, msg)
+
+    def _schedule_wa_retry_backoff(self) -> None:
+        if not self._wa_sync_config().is_ready():
+            return
+        idx = self._wa_fail_streak
+        self._wa_fail_streak += 1
+        if idx < len(WA_SYNC_RETRY_DELAYS_MS):
+            self._wa_retry_timer.start(WA_SYNC_RETRY_DELAYS_MS[idx])
+
+    def _on_wa_outbox_done(self, res: OutboxResult, cfg: WhatsAppSyncConfig) -> None:
+        if not res.ok:
+            log.debug("WhatsApp outbox pull failed: %s", res.error)
+            if self._wa_manual_sync and self.settings_dialog is not None:
+                self.settings_dialog.set_wa_status(False, res.error or "Failed to reach Bot WA.")
+            self._wa_manual_sync = False
+            self._schedule_wa_retry_backoff()
+            return
+
+        push_started = False
+        try:
+            incoming = [(it.task_id, parse_remote_dt(it.done_at)) for it in res.items]
+            applied, ack_ids = self.tasks.apply_external_done_batch(incoming)
+            self._wa_applied_count = len(applied)
+            if applied:
+                if self.tasks_dialog is not None:
+                    self.tasks_dialog.refresh()
+                self._sync_events_view()
+                self._sync_briefing_view()
+                self._sync_wrapup_view()
+                if self.pet.isVisible() and not self.is_dnd_active():
+                    if len(applied) == 1:
+                        title = clip(applied[0].get("title") or "Task", 44)
+                        msg = f"Synced from WhatsApp: marked '{title}' as done!"
+                    else:
+                        msg = f"Synced from WhatsApp: marked {len(applied)} tasks as done!"
+                    self.say(msg, "talking", ms=4800, particle="sparkle")
+
+            tasks_payload = serialize_tasks_for_sync(self.tasks.all())
+            # Skip redundant POST when nothing changed since last successful push & outbox is empty
+            if (not ack_ids and not self._wa_manual_sync and not self._wa_dirty
+                    and self._wa_last_pushed_payload is not None
+                    and tasks_payload == self._wa_last_pushed_payload):
+                self._wa_fail_streak = 0
+                self._wa_retry_timer.stop()
+                return
+
+            self._wa_dirty = False
+            self._wa_inflight_payload = tasks_payload
+            self.wa_sync.continue_push(cfg, tasks_payload, ack_ids)
+            push_started = True
+        finally:
+            if not push_started:
+                self.wa_sync.release_sync()
+
+    def _on_wa_push_done(self, res: SyncPushResult) -> None:
+        manual = self._wa_manual_sync
+        self._wa_manual_sync = False
+        if not res.ok:
+            log.debug("WhatsApp sync push failed: %s", res.error)
+            self._wa_inflight_payload = None
+            if manual and self.settings_dialog is not None:
+                self.settings_dialog.set_wa_status(False, res.error or "Push to Bot WA failed.")
+            self._schedule_wa_retry_backoff()
+            return
+
+        self._wa_last_pushed_payload = self._wa_inflight_payload
+        self._wa_inflight_payload = None
+        self._wa_fail_streak = 0
+        self._wa_retry_timer.stop()
+        if manual and self.settings_dialog is not None:
+            done_note = f" · {self._wa_applied_count} done applied" if self._wa_applied_count else ""
+            noun = "deadline" if res.synced_count == 1 else "deadlines"
+            self.settings_dialog.set_wa_status(True, f"Synced {res.synced_count} active {noun}{done_note}.")
+
+        if res.remaining_outbox > 0 and self._wa_followup_count < 2:
+            self._wa_followup_count += 1
+            self._wa_retry_timer.start(1_500)
+        else:
+            self._wa_followup_count = 0
+            if self._wa_dirty and self._wa_sync_config().is_ready():
+                self._wa_debounce_timer.start(WA_SYNC_DEBOUNCE_MS)
 
     def _present_quick_result(self, res: CommandResult) -> None:
         if self.quick_cmd_dialog is not None:
@@ -4654,6 +4897,7 @@ class PetController(QObject):
             self.tasks_dialog.refresh()
         self._sync_events_view()
         self._sync_briefing_view()
+        self._schedule_wa_sync()
         self.pet.bump(0.8)
         self._say_tuple(self.dialogue.note_sent_to_task(task["title"]), ms=4400, particle="sparkle")
 
@@ -4728,6 +4972,7 @@ class PetController(QObject):
             self.tasks_dialog.tasks_changed.connect(self._sync_events_view)
             self.tasks_dialog.tasks_changed.connect(self._sync_briefing_view)
             self.tasks_dialog.tasks_changed.connect(self._sync_wrapup_view)
+            self.tasks_dialog.tasks_changed.connect(self._schedule_wa_sync)
             self.tasks_dialog.task_reward_eligible.connect(self._on_task_reward_eligible)
             self.tasks_dialog.task_completed.connect(self._on_task_completed)
             self.tasks_dialog.closed.connect(lambda: self._on_dialog_closed("tasks"))
@@ -5089,6 +5334,8 @@ class PetController(QObject):
             dlg.always_on_top_changed.connect(self.set_always_on_top)
             dlg.autostart_changed.connect(self._toggle_autostart)
             dlg.test_ai_requested.connect(self._on_test_ai_requested)
+            dlg.test_wa_sync_requested.connect(self._on_test_wa_sync_requested)
+            dlg.sync_wa_now_requested.connect(self._on_sync_wa_now_requested)
             dlg.closed.connect(lambda d=dlg: self._on_settings_closed(d))
             self.settings_dialog = dlg
         # If any panel is open, center Settings over it so it's never buried
@@ -5152,6 +5399,11 @@ class PetController(QObject):
         new_pct = int(self.settings["ui_scale"])
         if abs(new_pct / 100.0 - self.ui_scale) > 0.001:
             self.set_ui_scale(new_pct, save=False, reopen_settings=True)
+        self._wa_fail_streak = 0
+        self._wa_last_pushed_payload = None
+        self._configure_wa_sync_timers(trigger_initial=False)
+        if self._wa_sync_config().is_ready():
+            self._schedule_wa_sync()
         self._last_curfew_msg = None
         self._check_curfew()
 

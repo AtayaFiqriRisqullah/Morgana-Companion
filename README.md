@@ -11,6 +11,7 @@ Desktop companion bot themed after Morgana from Persona 5. Built with PyQt6.
 - **Focus Mode & Manual Timers (`TIMER`)**: redesigned Persona 5 Focus Mode scoreboard (Pomodoro focus/break durations, live progress, session count) + multiple concurrent manual countdown timers with quick presets and Morgana alerts, backed by a slanted Persona 5 HUD tag under Morgana
 - Cohesive Persona 5 dark-themed Notes (pin, categories, reminders, debounced autosave, undo), Tasks (priority, search, filters, undo), and Settings (bedtime, reminders, focus timer, audio volume, radial menu tab toggles, UI size, behavior) dialogs
 - Live UI scaling (`75%–150%`) via right-click **UI SIZE** presets (`85%` / `100%` / `115%` / `130%`) or **Settings → UI size**, scaling dialogue box, radial menu, menus, timer HUD, and all dialog windows without restarting
+- **WhatsApp Bot Sync (opt-in, Settings)**: syncs active task deadlines to a self-hosted WhatsApp Baileys FastAPI bot (e.g. Termux over Tailscale/LAN) with an outbox + ACK + retry-backoff protocol so staged WhatsApp reminders continue even when your PC is off, and tasks completed via WhatsApp sync back cleanly on reconnect
 - Bedtime reminders (default every 30 seconds during bedtime window), system monitor (CPU/RAM), and customizable Morgana quotes (edit `morgana_list.md`)
 - Auto-start on Windows and Linux
 
@@ -42,6 +43,7 @@ End users do **not** need any `.json` files to run the app (`tasks.json`, `notes
 | `theme.py` / `motion.py` | Persona 5 style (colors, fonts, spikes) and spring animation |
 | `storage_manager.py` | atomic JSON storage (`tasks`, `notes`, `social_stats`, `settings`) |
 | `calendar_service.py` | 7-day Google Calendar fetch, day grouping & Morgana briefing |
+| `whatsapp_sync.py` | opt-in stdlib WhatsApp Bot deadline sync client (outbox + ACK + push) |
 | `lines.py` / `morgana_list.md` | dialogue |
 | `emotions.py` | picks expression and voiceline from dialogue text |
 | `sprites.py` | composes base sprite + eye/mouth patches at their pixel offsets |
