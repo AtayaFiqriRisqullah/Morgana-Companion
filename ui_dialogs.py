@@ -25,8 +25,8 @@ from PyQt6.QtGui import (QColor, QFont, QFontMetrics, QGuiApplication, QKeySeque
                          QPainter, QPainterPath, QPen, QPixmap, QPolygonF, QRadialGradient,
                          QShortcut, QSyntaxHighlighter, QTextBlock, QTextBlockFormat,
                          QTextCharFormat, QTextCursor, QTextDocument, QTextFormat, QTextListFormat)
-from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDateTimeEdit,
-                             QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
+from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDateEdit,
+                             QDateTimeEdit, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
                              QListWidget, QListWidgetItem, QMenu, QProgressBar, QPushButton,
                              QScrollArea, QSizePolicy, QSlider, QSpinBox, QStyle,
                              QStyledItemDelegate, QTextEdit, QTimeEdit, QVBoxLayout, QWidget)
@@ -37,13 +37,15 @@ from calendar_service import CalendarResult, events_by_day, human_delta, morgana
 from lines import build_daily_briefing, build_evening_wrapup
 from motion import FrameTicker, Spring, clamp
 from particles import P5_NOTE_GOLD, P5_STAR_COLORS, Particle, draw_particle
-from storage_manager import (DAILY_BLOCK_TARGET, DEFAULT_STAT_POINTS, QUICK_HOTKEY_PRESETS,
-                             QUICK_STAT_POINTS, RADIAL_TAB_KEYS, SETTINGS_DEFAULTS,
-                             SOCIAL_STAT_KEYS, SOCIAL_STATS, STAT_MASTERY_STEP,
-                             STAT_RANK_THRESHOLDS, TIME_BLOCKS, HabitStore, LocalEventStore,
-                             NoteStore, SettingsStore, SocialStatsStore, TaskStore,
-                             default_time_block, overall_confidant_level, parse_dt, stat_level,
-                             stat_level_progress, stat_pentagon_fraction, stat_rank_title)
+from storage_manager import (DAILY_BLOCK_TARGET, DEFAULT_STAT_POINTS, FINANCE_CATEGORIES,
+                             FINANCE_CATEGORY_SHORT, FINANCE_WALLETS, FINANCE_WARN_RATIO,
+                             QUICK_HOTKEY_PRESETS, QUICK_STAT_POINTS, RADIAL_TAB_KEYS,
+                             SETTINGS_DEFAULTS, SOCIAL_STAT_KEYS, SOCIAL_STATS, STAT_MASTERY_STEP,
+                             STAT_RANK_THRESHOLDS, TIME_BLOCKS, FinanceStore, HabitStore,
+                             LocalEventStore, NoteStore, SettingsStore, SocialStatsStore,
+                             TaskStore, default_time_block, format_rupiah, overall_confidant_level,
+                             parse_dt, parse_rupiah, stat_level, stat_level_progress,
+                             stat_pentagon_fraction, stat_rank_title)
 from theme import (BLACK, DEEP_RED, GOLD, LIGHT_RED, P5_BG, P5_BORDER, P5_BORDER_HI,
                    P5_CARD, P5_GOLD_BG, P5_GOLD_FG, P5_HOVER, P5_MINT_BG, P5_MINT_FG, P5_MUTED,
                    P5_RED_BG, P5_RED_FG, P5_SELECTED, P5_SURFACE, P5_TEXT, RED, RED_HOVER, WHITE,
@@ -3629,11 +3631,12 @@ class SettingsDialog(P5FluidPanel):
             "notes": "Notes (Notebook)",
             "talk": "Talk (Choice Chat)",
             "stats": "Social Stats",
+            "finance": "Finance (Money)",
             "system": "System Menu",
         }
-        # Mirror radial menu layout: Left column (Events, Timer, Talk, System), Right column (Tasks, Notes, Stats)
+        # Mirror radial menu layout: Left column (Events, Timer, Talk, System), Right column (Tasks, Notes, Stats, Finance)
         left_keys = ("events", "timer", "talk", "system")
-        right_keys = ("tasks", "notes", "stats")
+        right_keys = ("tasks", "notes", "stats", "finance")
         for r_idx in range(max(len(left_keys), len(right_keys))):
             if r_idx < len(left_keys):
                 lk = left_keys[r_idx]
@@ -7777,3 +7780,1215 @@ class WrapUpDialog(P5FluidPanel):
         self.reflection_edit.clear()
         self.reflection_saved.emit(txt, self._selected_mood)
         self._ref_status.setText(f"Saved [{self._selected_mood}] reflection to Journal in Notes!")
+
+
+# ---------------------------------------------------------------------------
+# 10. FINANCE LEDGER (bot-wa inspired personal finance window)
+# ---------------------------------------------------------------------------
+class FinanceTxDelegate(QStyledItemDelegate):
+    """Paints Persona 5 finance transaction rows (OUT/IN/TF badge, title, metadata, Rupiah amount)."""
+
+    def __init__(self, parent: QWidget | None = None, scale: float = 1.0) -> None:
+        super().__init__(parent)
+        self._scale = scale
+
+    def sizeHint(self, option, index) -> QSize:
+        if index.data(ROLE_ID) is None:
+            return QSize(0, _sc(72, self._scale, 56))
+        return QSize(0, _sc(54, self._scale, 44))
+
+    def paint(self, p: QPainter, option, index) -> None:
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        r = QRectF(option.rect).adjusted(2, 2, -2, -2)
+        sc = self._scale
+
+        if index.data(ROLE_ID) is None:
+            p.setPen(P5_MUTED)
+            p.setFont(ui_font(_sc(13, sc, 10), bold=False))
+            p.drawText(r.adjusted(12, 0, -12, 0),
+                       Qt.AlignmentFlag.AlignCenter.value | Qt.TextFlag.TextWordWrap.value,
+                       index.data(Qt.ItemDataRole.DisplayRole) or "")
+            p.restore()
+            return
+
+        sel = bool(option.state & QStyle.StateFlag.State_Selected)
+        hov = bool(option.state & QStyle.StateFlag.State_MouseOver)
+        bg = P5_SELECTED if sel else (P5_HOVER if hov else P5_SURFACE)
+        bd = RED if sel else (P5_BORDER_HI if hov else P5_BORDER)
+        p.setPen(QPen(bd, 1.3 if sel else 1.0))
+        p.setBrush(bg)
+        p.drawRoundedRect(r, 7.0, 7.0)
+
+        tx_type = index.data(ROLE_CAT) or "expense"
+        amt_txt = index.data(ROLE_BADGE) or "Rp 0"
+        meta_txt = index.data(ROLE_DATE) or ""
+        title = index.data(Qt.ItemDataRole.DisplayRole) or ""
+
+        if tx_type == "income":
+            tag, tag_bg, tag_fg, amt_fg = "IN", P5_MINT_BG, P5_MINT_FG, P5_MINT_FG
+        elif tx_type == "transfer":
+            tag, tag_bg, tag_fg, amt_fg = "TF", P5_GOLD_BG, P5_GOLD_FG, P5_GOLD_FG
+        else:
+            tag, tag_bg, tag_fg, amt_fg = "OUT", P5_RED_BG, P5_RED_FG, P5_RED_FG
+
+        pill_w = _sc(38, sc, 30)
+        pill_h = _sc(22, sc, 18)
+        pill = QRectF(r.left() + _sc(8, sc, 6), r.center().y() - pill_h / 2.0, pill_w, pill_h)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(tag_bg)
+        p.drawRoundedRect(pill, 4.0, 4.0)
+        p.setFont(p5_font(_sc(11, sc, 9), italic=False))
+        p.setPen(tag_fg)
+        p.drawText(pill, Qt.AlignmentFlag.AlignCenter.value, tag)
+
+        # Right-aligned Rupiah amount
+        af = p5_font(_sc(13, sc, 10), italic=False)
+        p.setFont(af)
+        amt_w = min(_sc(125, sc, 94), max(_sc(76, sc, 62), QFontMetrics(af).horizontalAdvance(amt_txt) + _sc(10, sc, 6)))
+        amt_rect = QRectF(r.right() - amt_w - _sc(8, sc, 6), r.top(), amt_w, r.height())
+        p.setPen(amt_fg)
+        p.drawText(amt_rect, Qt.AlignmentFlag.AlignVCenter.value | Qt.AlignmentFlag.AlignRight.value, amt_txt)
+
+        # Middle title + metadata
+        tx = pill.right() + _sc(9, sc, 6)
+        tw = max(40.0, amt_rect.left() - tx - _sc(8, sc, 6))
+        tf = ui_font(_sc(13, sc, 10), bold=True)
+        p.setFont(tf)
+        p.setPen(WHITE)
+        elided = QFontMetrics(tf).elidedText(title, Qt.TextElideMode.ElideRight, int(tw))
+        p.drawText(QRectF(tx, r.top() + _sc(5, sc, 3), tw, _sc(21, sc, 16)),
+                   Qt.AlignmentFlag.AlignVCenter.value | Qt.AlignmentFlag.AlignLeft.value, elided)
+
+        mf = ui_font(_sc(11, sc, 9), bold=False)
+        p.setFont(mf)
+        p.setPen(P5_MUTED)
+        el_meta = QFontMetrics(mf).elidedText(meta_txt, Qt.TextElideMode.ElideRight, int(tw))
+        p.drawText(QRectF(tx, r.top() + _sc(25, sc, 20), tw, _sc(18, sc, 14)),
+                   Qt.AlignmentFlag.AlignVCenter.value | Qt.AlignmentFlag.AlignLeft.value, el_meta)
+        p.restore()
+
+
+class FinanceDialog(P5FluidPanel):
+    """Persona 5 personal finance ledger inspired by bot-wa (wallets, categories, budgets, bills & shortcuts)."""
+
+    finance_changed = pyqtSignal(str, dict)   # event_kind ("add"|"edit"|"delete"|"bill"), payload
+    open_settings = pyqtSignal()
+
+    _MONTH_NAMES = ("JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+                    "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
+
+    def __init__(self, store: FinanceStore, on_top: bool = True, ui_scale: float = 1.0) -> None:
+        super().__init__("FINANCE", QSize(890, 680), on_top=on_top, ui_scale=ui_scale)
+        sc = self._ui_scale
+        self.store = store
+        today = date.today()
+        self._view_year = today.year
+        self._view_month = today.month
+        self._active_tab = "tx"
+        self._tx_type = "expense"
+        self._selected_cat = "Jajan"
+        self._selected_wallet = "Tunai"
+        self._selected_to_wallet = "BNI"
+        self._tx_filter = "all"
+        self._editing_tx_id: str | None = None
+        self._undo_kind = ""
+        self._undo_payload: dict | None = None
+        self._budget_inputs: dict[str, QLineEdit] = {}
+        self._budget_bars: dict[str, tuple[QLabel, QLabel, QProgressBar]] = {}
+        self._wallet_rows: dict[str, tuple[QLabel, QProgressBar]] = {}
+
+        # -- Header bar: Month navigation + Settings + Close -----------------
+        prev_m = self._btn("◀", variant="soft", display=True, px=11)
+        prev_m.setFixedSize(_sc(28, sc, 22), _sc(26, sc, 22))
+        prev_m.setToolTip("Previous month")
+        prev_m.clicked.connect(lambda _c=False: self._shift_month(-1))
+        self.header_bar.addWidget(prev_m)
+
+        self._month_lbl = QLabel("")
+        self._month_lbl.setMinimumWidth(_sc(76, sc, 62))
+        self._month_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._month_lbl.setStyleSheet(
+            f'color: #FFE46B; font-family: "Barlow Condensed", "Anton", sans-serif; '
+            f'font-size: {_sc(13, sc, 10)}px; font-weight: 800; letter-spacing: 0.7px;'
+        )
+        self.header_bar.addWidget(self._month_lbl)
+
+        next_m = self._btn("▶", variant="soft", display=True, px=11)
+        next_m.setFixedSize(_sc(28, sc, 22), _sc(26, sc, 22))
+        next_m.setToolTip("Next month")
+        next_m.clicked.connect(lambda _c=False: self._shift_month(+1))
+        self.header_bar.addWidget(next_m)
+
+        today_m = self._btn("THIS MONTH", variant="gold", display=True, px=9)
+        today_m.setFixedHeight(_sc(26, sc, 22))
+        today_m.clicked.connect(self._jump_this_month)
+        self.header_bar.addWidget(today_m)
+
+        set_btn = self._btn("", variant="soft", icon="gear")
+        set_btn.setFixedSize(_sc(30, sc, 24), _sc(30, sc, 24))
+        set_btn.setToolTip("Settings (Ctrl+,)")
+        set_btn.clicked.connect(lambda _c=False: self.open_settings.emit())
+        self.header_bar.addWidget(set_btn)
+        self._add_close_button()
+
+        # -- Top KPI Summary Strip (Total Balance, Income, Expense, Today) ---
+        kpi_row = QHBoxLayout()
+        kpi_row.setSpacing(_sc(8, sc, 6))
+
+        def _kpi_card(title: str, accent: str) -> tuple[QFrame, QLabel, QLabel]:
+            card = _make_card("subcard")
+            cl = QVBoxLayout(card)
+            cl.setContentsMargins(_sc(10, sc, 7), _sc(6, sc, 4), _sc(10, sc, 7), _sc(6, sc, 4))
+            cl.setSpacing(_sc(2, sc, 1))
+            t_lbl = QLabel(title)
+            t_lbl.setStyleSheet(
+                f'color: #A0A5B5; font-family: "Barlow Condensed", sans-serif; '
+                f'font-size: {_sc(10, sc, 8)}px; font-weight: 800; letter-spacing: 0.7px;'
+            )
+            val_lbl = QLabel("Rp 0")
+            val_lbl.setStyleSheet(
+                f'color: {accent}; font-family: "Barlow Condensed", "Anton", sans-serif; '
+                f'font-size: {_sc(18, sc, 14)}px; font-weight: 900;'
+            )
+            sub_lbl = QLabel("")
+            sub_lbl.setStyleSheet(f'color: #9A9FA8; font-size: {_sc(10, sc, 8)}px;')
+            cl.addWidget(t_lbl)
+            cl.addWidget(val_lbl)
+            cl.addWidget(sub_lbl)
+            return card, val_lbl, sub_lbl
+
+        c_bal, self._kpi_bal_val, self._kpi_bal_sub = _kpi_card("TOTAL BALANCE", "#FFE46B")
+        c_inc, self._kpi_inc_val, self._kpi_inc_sub = _kpi_card("MONTH INCOME", "#5CE09A")
+        c_exp, self._kpi_exp_val, self._kpi_exp_sub = _kpi_card("MONTH EXPENSE", "#FF5C6C")
+        c_tod, self._kpi_tod_val, self._kpi_tod_sub = _kpi_card("TODAY SPEND", "#FFFFFF")
+        kpi_row.addWidget(c_bal, 3)
+        kpi_row.addWidget(c_inc, 2)
+        kpi_row.addWidget(c_exp, 2)
+        kpi_row.addWidget(c_tod, 2)
+        self.body.addLayout(kpi_row)
+
+        # -- Segmented Tab Bar: TRANSACTIONS | BUDGETS & BILLS ---------------
+        tab_row = QHBoxLayout()
+        tab_row.setSpacing(_sc(6, sc, 4))
+        self._tab_tx_btn = self._btn("TRANSACTIONS", variant="soft", display=True, px=11)
+        self._tab_tx_btn.setFixedHeight(_sc(28, sc, 24))
+        self._tab_tx_btn.clicked.connect(lambda _c=False: self._set_tab("tx"))
+        self._tab_plan_btn = self._btn("BUDGETS & BILLS", variant="soft", display=True, px=11)
+        self._tab_plan_btn.setFixedHeight(_sc(28, sc, 24))
+        self._tab_plan_btn.clicked.connect(lambda _c=False: self._set_tab("plan"))
+        tab_row.addWidget(self._tab_tx_btn, 1)
+        tab_row.addWidget(self._tab_plan_btn, 1)
+        self.body.addLayout(tab_row)
+
+        # ====================================================================
+        # PAGE 1: TRANSACTIONS (Quick Record / Edit + Searchable History)
+        # ====================================================================
+        self._tx_page = QWidget()
+        tx_cols = QHBoxLayout(self._tx_page)
+        tx_cols.setContentsMargins(0, 0, 0, 0)
+        tx_cols.setSpacing(_sc(10, sc, 7))
+
+        # Left column: Record / Edit form card
+        left_wrap = QVBoxLayout()
+        left_wrap.setSpacing(_sc(7, sc, 5))
+
+        self._form_card = _make_card()
+        fl = QVBoxLayout(self._form_card)
+        fl.setContentsMargins(_sc(10, sc, 8), _sc(8, sc, 6), _sc(10, sc, 8), _sc(8, sc, 6))
+        fl.setSpacing(_sc(6, sc, 4))
+
+        fh = QHBoxLayout()
+        self._form_hdr_lbl = QLabel("RECORD TRANSACTION")
+        self._form_hdr_lbl.setObjectName("section")
+        fh.addWidget(self._form_hdr_lbl)
+        fh.addStretch(1)
+        self._amt_preview_lbl = QLabel("")
+        self._amt_preview_lbl.setStyleSheet(
+            f'color: #FFE46B; font-family: "Barlow Condensed", sans-serif; '
+            f'font-size: {_sc(12, sc, 10)}px; font-weight: 800;'
+        )
+        fh.addWidget(self._amt_preview_lbl)
+        fl.addLayout(fh)
+
+        # Transaction type pills (EXPENSE / INCOME / TRANSFER)
+        type_row = QHBoxLayout()
+        type_row.setSpacing(_sc(5, sc, 4))
+        self._type_btns: dict[str, P5FluidButton] = {}
+        for tkey, tlbl in (("expense", "EXPENSE"), ("income", "INCOME"), ("transfer", "TRANSFER")):
+            tb = self._btn(tlbl, variant="soft", display=True, px=10)
+            tb.setFixedHeight(_sc(26, sc, 22))
+            tb.clicked.connect(lambda _c=False, k=tkey: self._select_tx_type(k))
+            self._type_btns[tkey] = tb
+            type_row.addWidget(tb, 1)
+        fl.addLayout(type_row)
+
+        # Quick Shortcuts strip (bot-wa /pintasan — shown for Expense)
+        self._sc_wrap = QWidget()
+        sc_vl = QVBoxLayout(self._sc_wrap)
+        sc_vl.setContentsMargins(0, 0, 0, 0)
+        sc_vl.setSpacing(_sc(3, sc, 2))
+        sc_title = QLabel("QUICK SHORTCUTS")
+        sc_title.setStyleSheet(
+            f'color: #A0A5B5; font-family: "Barlow Condensed", sans-serif; '
+            f'font-size: {_sc(10, sc, 8)}px; font-weight: 800; letter-spacing: 0.6px;'
+        )
+        sc_vl.addWidget(sc_title)
+        self._sc_grid = QGridLayout()
+        self._sc_grid.setContentsMargins(0, 0, 0, 0)
+        self._sc_grid.setSpacing(_sc(4, sc, 3))
+        sc_vl.addLayout(self._sc_grid)
+        fl.addWidget(self._sc_wrap)
+
+        # Amount + Date row
+        amt_row = QHBoxLayout()
+        amt_row.setSpacing(_sc(6, sc, 4))
+        self._amt_input = QLineEdit()
+        self._amt_input.setPlaceholderText("Amount (e.g. 15rb, 1.5jt, 25000)")
+        self._amt_input.textChanged.connect(self._update_amount_preview)
+        self._amt_input.returnPressed.connect(self._submit_transaction)
+        amt_row.addWidget(self._amt_input, 3)
+
+        self._date_edit = QDateEdit()
+        self._date_edit.setCalendarPopup(True)
+        self._date_edit.setDisplayFormat("dd/MM/yyyy")
+        self._date_edit.setDate(QDate.currentDate())
+        self._date_edit.setMinimumWidth(_sc(110, sc, 92))
+        self._date_edit.setFixedHeight(_sc(30, sc, 25))
+        amt_row.addWidget(self._date_edit, 2)
+        fl.addLayout(amt_row)
+
+        # Description / Source input
+        self._title_input = QLineEdit()
+        self._title_input.setPlaceholderText("Item or note (e.g. Kopi susu, Galon)")
+        self._title_input.returnPressed.connect(self._submit_transaction)
+        fl.addWidget(self._title_input)
+
+        # Category chips (shown for Expense)
+        self._cat_wrap = QWidget()
+        cat_vl = QVBoxLayout(self._cat_wrap)
+        cat_vl.setContentsMargins(0, 0, 0, 0)
+        cat_vl.setSpacing(_sc(3, sc, 2))
+        cat_hdr = QLabel("CATEGORY")
+        cat_hdr.setStyleSheet(
+            f'color: #A0A5B5; font-family: "Barlow Condensed", sans-serif; '
+            f'font-size: {_sc(10, sc, 8)}px; font-weight: 800; letter-spacing: 0.6px;'
+        )
+        cat_vl.addWidget(cat_hdr)
+        cat_grid = QGridLayout()
+        cat_grid.setContentsMargins(0, 0, 0, 0)
+        cat_grid.setSpacing(_sc(4, sc, 3))
+        self._cat_btns: dict[str, P5FluidButton] = {}
+        for idx, cat in enumerate(FINANCE_CATEGORIES):
+            cb = self._btn(FINANCE_CATEGORY_SHORT[cat], variant="soft", display=True, px=10)
+            cb.setFixedHeight(_sc(25, sc, 22))
+            cb.setToolTip(cat)
+            cb.clicked.connect(lambda _c=False, c=cat: self._select_category(c))
+            self._cat_btns[cat] = cb
+            cat_grid.addWidget(cb, idx // 2, idx % 2)
+        cat_vl.addLayout(cat_grid)
+        fl.addWidget(self._cat_wrap)
+
+        # Source / Active Wallet chips
+        self._wallet_hdr = QLabel("WALLET (QRIS = BNI / MANDIRI)")
+        self._wallet_hdr.setStyleSheet(
+            f'color: #A0A5B5; font-family: "Barlow Condensed", sans-serif; '
+            f'font-size: {_sc(10, sc, 8)}px; font-weight: 800; letter-spacing: 0.6px;'
+        )
+        fl.addWidget(self._wallet_hdr)
+        w_row = QHBoxLayout()
+        w_row.setSpacing(_sc(5, sc, 4))
+        self._wallet_btns: dict[str, P5FluidButton] = {}
+        for w in FINANCE_WALLETS:
+            wb = self._btn(w.upper(), variant="soft", display=True, px=10)
+            wb.setFixedHeight(_sc(25, sc, 22))
+            wb.clicked.connect(lambda _c=False, wk=w: self._select_wallet(wk))
+            self._wallet_btns[w] = wb
+            w_row.addWidget(wb, 1)
+        fl.addLayout(w_row)
+
+        # Target wallet chips (shown ONLY for Transfer)
+        self._to_wallet_wrap = QWidget()
+        tw_vl = QVBoxLayout(self._to_wallet_wrap)
+        tw_vl.setContentsMargins(0, 0, 0, 0)
+        tw_vl.setSpacing(_sc(3, sc, 2))
+        tw_hdr = QLabel("TO WALLET")
+        tw_hdr.setStyleSheet(
+            f'color: #A0A5B5; font-family: "Barlow Condensed", sans-serif; '
+            f'font-size: {_sc(10, sc, 8)}px; font-weight: 800; letter-spacing: 0.6px;'
+        )
+        tw_vl.addWidget(tw_hdr)
+        tw_row = QHBoxLayout()
+        tw_row.setSpacing(_sc(5, sc, 4))
+        self._to_wallet_btns: dict[str, P5FluidButton] = {}
+        for w in FINANCE_WALLETS:
+            twb = self._btn(w.upper(), variant="soft", display=True, px=10)
+            twb.setFixedHeight(_sc(25, sc, 22))
+            twb.clicked.connect(lambda _c=False, wk=w: self._select_to_wallet(wk))
+            self._to_wallet_btns[w] = twb
+            tw_row.addWidget(twb, 1)
+        tw_vl.addLayout(tw_row)
+        fl.addWidget(self._to_wallet_wrap)
+
+        # Primary CTA + Cancel Edit row
+        cta_row = QHBoxLayout()
+        cta_row.setSpacing(_sc(6, sc, 4))
+        self._submit_btn = self._btn("RECORD EXPENSE", variant="primary", icon="plus", display=True, px=11)
+        self._submit_btn.setFixedHeight(_sc(32, sc, 26))
+        self._submit_btn.clicked.connect(self._submit_transaction)
+        cta_row.addWidget(self._submit_btn, 1)
+
+        self._cancel_edit_btn = self._btn("CANCEL", variant="soft", display=True, px=10)
+        self._cancel_edit_btn.setFixedHeight(_sc(32, sc, 26))
+        self._cancel_edit_btn.setToolTip("Cancel edit (Esc)")
+        self._cancel_edit_btn.clicked.connect(self._cancel_edit)
+        self._cancel_edit_btn.hide()
+        cta_row.addWidget(self._cancel_edit_btn)
+        fl.addLayout(cta_row)
+
+        self._form_status = QLabel("")
+        self._form_status.setObjectName("tip")
+        self._form_status.setWordWrap(True)
+        fl.addWidget(self._form_status)
+        fl.addStretch(1)
+
+        left_wrap.addWidget(self._form_card, 1)
+        tx_cols.addLayout(left_wrap, 44)
+
+        # Right column: Searchable Transaction History + Undo bar
+        right_wrap = QVBoxLayout()
+        right_wrap.setSpacing(_sc(6, sc, 4))
+
+        hist_card = _make_card()
+        hl = QVBoxLayout(hist_card)
+        hl.setContentsMargins(_sc(10, sc, 8), _sc(8, sc, 6), _sc(10, sc, 8), _sc(8, sc, 6))
+        hl.setSpacing(_sc(5, sc, 4))
+
+        hh = QHBoxLayout()
+        h_lbl = QLabel("TRANSACTIONS")
+        h_lbl.setObjectName("section")
+        hh.addWidget(h_lbl)
+        hh.addStretch(1)
+        self._tx_count_lbl = QLabel("")
+        self._tx_count_lbl.setObjectName("tip")
+        hh.addWidget(self._tx_count_lbl)
+        hl.addLayout(hh)
+
+        self._search_input = QLineEdit()
+        self._search_input.setPlaceholderText("Search transactions, category, wallet...")
+        self._search_input.textChanged.connect(lambda _t: self._refresh_tx_list())
+        hl.addWidget(self._search_input)
+
+        # 2 clean compact filter rows (4 chips each -> zero crowding at 85%..130%)
+        self._filter_btns: dict[str, P5FluidButton] = {}
+        f_grid = QGridLayout()
+        f_grid.setContentsMargins(0, 0, 0, 0)
+        f_grid.setSpacing(_sc(4, sc, 3))
+        filters = (
+            ("all", "ALL"), ("expense", "OUT"), ("income", "IN"), ("transfer", "TF"),
+            ("cat:Jajan", "JAJAN"), ("cat:Alat", "ALAT"),
+            ("cat:Mingguan&Bulanan", "MINGGUAN"), ("cat:Hiburan", "HIBURAN"),
+        )
+        for idx, (fkey, flbl) in enumerate(filters):
+            fb = self._btn(flbl, variant="soft", display=True, px=9)
+            fb.setFixedHeight(_sc(22, sc, 19))
+            fb.clicked.connect(lambda _c=False, k=fkey: self._set_filter(k))
+            self._filter_btns[fkey] = fb
+            f_grid.addWidget(fb, idx // 4, idx % 4)
+        self._filter_btns["all"].set_active(True)
+        hl.addLayout(f_grid)
+
+        self._tx_list = _KeyAwareList()
+        self._tx_list.setMouseTracking(True)
+        self._tx_list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self._tx_list.setItemDelegate(FinanceTxDelegate(self._tx_list, scale=sc))
+        self._tx_list.delete_pressed.connect(self._delete_selected_tx)
+        self._tx_list.itemDoubleClicked.connect(lambda _it: self._start_edit_selected_tx())
+        hl.addWidget(self._tx_list, 1)
+
+        h_foot = QHBoxLayout()
+        h_foot.setSpacing(_sc(6, sc, 4))
+        tip = QLabel("Double-click to edit · Shorthand: 15rb, 1.5jt")
+        tip.setObjectName("tip")
+        h_foot.addWidget(tip, 1)
+
+        edit_btn = self._btn("EDIT", variant="gold", display=True, px=10)
+        edit_btn.setFixedHeight(_sc(26, sc, 22))
+        edit_btn.clicked.connect(self._start_edit_selected_tx)
+        h_foot.addWidget(edit_btn)
+
+        del_btn = self._btn("DELETE", variant="danger", display=True, px=10)
+        del_btn.setFixedHeight(_sc(26, sc, 22))
+        del_btn.clicked.connect(self._delete_selected_tx)
+        h_foot.addWidget(del_btn)
+        hl.addLayout(h_foot)
+
+        right_wrap.addWidget(hist_card, 1)
+
+        self._undo = UndoBar(scale=sc)
+        self._undo.undo_clicked.connect(self._undo_last)
+        right_wrap.addWidget(self._undo)
+        tx_cols.addLayout(right_wrap, 56)
+
+        self.body.addWidget(self._tx_page, 1)
+
+        # ====================================================================
+        # PAGE 2: BUDGETS, WALLETS, BILLS & SHORTCUTS
+        # ====================================================================
+        self._plan_page = QScrollArea()
+        self._plan_page.setWidgetResizable(True)
+        self._plan_page.setFrameShape(QFrame.Shape.NoFrame)
+        self._plan_page.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        plan_body = QWidget()
+        plan_body.setStyleSheet("background: transparent;")
+        plan_cols = QHBoxLayout(plan_body)
+        plan_cols.setContentsMargins(0, 0, _sc(4, sc, 2), 0)
+        plan_cols.setSpacing(_sc(10, sc, 7))
+
+        # Left side: Monthly Category Budgets + Wallet Balances
+        pl_left = QVBoxLayout()
+        pl_left.setSpacing(_sc(8, sc, 6))
+
+        bud_card = _make_card()
+        bl = QVBoxLayout(bud_card)
+        bl.setContentsMargins(_sc(10, sc, 8), _sc(8, sc, 6), _sc(10, sc, 8), _sc(8, sc, 6))
+        bl.setSpacing(_sc(7, sc, 5))
+        bh = QLabel("MONTHLY CATEGORY BUDGETS")
+        bh.setObjectName("section")
+        bl.addWidget(bh)
+
+        for cat in FINANCE_CATEGORIES:
+            box = QVBoxLayout()
+            box.setSpacing(_sc(3, sc, 2))
+            top = QHBoxLayout()
+            name_lbl = QLabel(cat)
+            name_lbl.setStyleSheet(f'color: #FFFFFF; font-size: {_sc(12, sc, 10)}px; font-weight: bold;')
+            pct_lbl = QLabel("No limit")
+            pct_lbl.setStyleSheet(
+                f'color: #A0A5B5; font-family: "Barlow Condensed", sans-serif; '
+                f'font-size: {_sc(11, sc, 9)}px; font-weight: 800;'
+            )
+            top.addWidget(name_lbl)
+            top.addStretch(1)
+            top.addWidget(pct_lbl)
+            box.addLayout(top)
+
+            bar = QProgressBar()
+            bar.setRange(0, 100)
+            bar.setTextVisible(False)
+            bar.setFixedHeight(_sc(7, sc, 5))
+            box.addWidget(bar)
+
+            edit_row = QHBoxLayout()
+            edit_row.setSpacing(_sc(5, sc, 3))
+            info_lbl = QLabel("Rp 0")
+            info_lbl.setObjectName("tip")
+            edit_row.addWidget(info_lbl, 1)
+
+            inp = QLineEdit()
+            inp.setPlaceholderText("Limit (e.g. 500rb)")
+            inp.setFixedWidth(_sc(118, sc, 94))
+            inp.setFixedHeight(_sc(25, sc, 22))
+            inp.returnPressed.connect(lambda c=cat: self._save_budget(c))
+            self._budget_inputs[cat] = inp
+            edit_row.addWidget(inp)
+
+            set_b = self._btn("SET", variant="gold", display=True, px=9)
+            set_b.setFixedHeight(_sc(25, sc, 22))
+            set_b.clicked.connect(lambda _c=False, c=cat: self._save_budget(c))
+            edit_row.addWidget(set_b)
+
+            clr_b = self._btn("×", variant="soft", display=True, px=10)
+            clr_b.setFixedSize(_sc(25, sc, 22), _sc(25, sc, 22))
+            clr_b.setToolTip(f"Clear {cat} budget limit")
+            clr_b.clicked.connect(lambda _c=False, c=cat: self._clear_budget(c))
+            edit_row.addWidget(clr_b)
+            box.addLayout(edit_row)
+
+            self._budget_bars[cat] = (info_lbl, pct_lbl, bar)
+            bl.addLayout(box)
+
+        pl_left.addWidget(bud_card)
+
+        # Wallet Balances Card
+        wal_card = _make_card()
+        wl = QVBoxLayout(wal_card)
+        wl.setContentsMargins(_sc(10, sc, 8), _sc(8, sc, 6), _sc(10, sc, 8), _sc(8, sc, 6))
+        wl.setSpacing(_sc(6, sc, 4))
+        wh = QLabel("WALLET BALANCES")
+        wh.setObjectName("section")
+        wl.addWidget(wh)
+        for w in FINANCE_WALLETS:
+            wr = QHBoxLayout()
+            w_name = QLabel(w)
+            w_name.setStyleSheet(f'color: #FFFFFF; font-size: {_sc(12, sc, 10)}px; font-weight: bold;')
+            w_val = QLabel("Rp 0")
+            w_val.setStyleSheet(
+                f'color: #FFE46B; font-family: "Barlow Condensed", sans-serif; '
+                f'font-size: {_sc(14, sc, 11)}px; font-weight: 800;'
+            )
+            wr.addWidget(w_name)
+            wr.addStretch(1)
+            wr.addWidget(w_val)
+            wl.addLayout(wr)
+            wbar = QProgressBar()
+            wbar.setRange(0, 100)
+            wbar.setTextVisible(False)
+            wbar.setFixedHeight(_sc(6, sc, 5))
+            wbar.setStyleSheet(
+                "QProgressBar { background: #1B1E28; border-radius: 3px; }"
+                "QProgressBar::chunk { background: #F5C400; border-radius: 3px; }"
+            )
+            wl.addWidget(wbar)
+            self._wallet_rows[w] = (w_val, wbar)
+        pl_left.addWidget(wal_card)
+        pl_left.addStretch(1)
+        plan_cols.addLayout(pl_left, 48)
+
+        # Right side: Recurring Bills + Quick Shortcuts Manager
+        pl_right = QVBoxLayout()
+        pl_right.setSpacing(_sc(8, sc, 6))
+
+        bill_card = _make_card()
+        bill_l = QVBoxLayout(bill_card)
+        bill_l.setContentsMargins(_sc(10, sc, 8), _sc(8, sc, 6), _sc(10, sc, 8), _sc(8, sc, 6))
+        bill_l.setSpacing(_sc(6, sc, 4))
+        bill_hdr = QLabel("RECURRING MONTHLY BILLS")
+        bill_hdr.setObjectName("section")
+        bill_l.addWidget(bill_hdr)
+
+        self._bills_box = QVBoxLayout()
+        self._bills_box.setSpacing(_sc(4, sc, 3))
+        bill_l.addLayout(self._bills_box)
+
+        # Compact add-bill form
+        b_add1 = QHBoxLayout()
+        b_add1.setSpacing(_sc(5, sc, 3))
+        self._bill_name_in = QLineEdit()
+        self._bill_name_in.setPlaceholderText("Bill name (e.g. Kos, Wi-Fi)")
+        b_add1.addWidget(self._bill_name_in, 2)
+        self._bill_amt_in = QLineEdit()
+        self._bill_amt_in.setPlaceholderText("Amount (e.g. 500rb)")
+        b_add1.addWidget(self._bill_amt_in, 1)
+        bill_l.addLayout(b_add1)
+
+        b_add2 = QHBoxLayout()
+        b_add2.setSpacing(_sc(5, sc, 3))
+        day_lbl = QLabel("Day")
+        day_lbl.setObjectName("tip")
+        b_add2.addWidget(day_lbl)
+        self._bill_day_spin = QSpinBox()
+        self._bill_day_spin.setRange(1, 31)
+        self._bill_day_spin.setValue(1)
+        self._bill_day_spin.setFixedWidth(_sc(56, sc, 48))
+        self._bill_day_spin.setFixedHeight(_sc(26, sc, 24))
+        b_add2.addWidget(self._bill_day_spin)
+
+        self._bill_cat_cb = QComboBox()
+        self._bill_cat_cb.addItems(list(FINANCE_CATEGORIES))
+        self._bill_cat_cb.setCurrentText("Mingguan&Bulanan")
+        self._bill_cat_cb.setFixedHeight(_sc(26, sc, 24))
+        b_add2.addWidget(self._bill_cat_cb, 1)
+
+        self._bill_wal_cb = QComboBox()
+        self._bill_wal_cb.addItems(list(FINANCE_WALLETS))
+        self._bill_wal_cb.setCurrentText("BNI")
+        self._bill_wal_cb.setFixedHeight(_sc(26, sc, 24))
+        b_add2.addWidget(self._bill_wal_cb)
+
+        add_bill_btn = self._btn("ADD BILL", variant="primary", icon="plus", display=True, px=9)
+        add_bill_btn.setFixedHeight(_sc(26, sc, 24))
+        add_bill_btn.clicked.connect(self._add_bill)
+        b_add2.addWidget(add_bill_btn)
+        bill_l.addLayout(b_add2)
+        pl_right.addWidget(bill_card)
+
+        # Quick Shortcuts Manager Card
+        sc_card = _make_card()
+        scl = QVBoxLayout(sc_card)
+        scl.setContentsMargins(_sc(10, sc, 8), _sc(8, sc, 6), _sc(10, sc, 8), _sc(8, sc, 6))
+        scl.setSpacing(_sc(6, sc, 4))
+        sch = QLabel("QUICK SHORTCUTS (PINTASAN)")
+        sch.setObjectName("section")
+        scl.addWidget(sch)
+
+        self._sc_mgr_box = QVBoxLayout()
+        self._sc_mgr_box.setSpacing(_sc(4, sc, 3))
+        scl.addLayout(self._sc_mgr_box)
+
+        sc_add = QHBoxLayout()
+        sc_add.setSpacing(_sc(5, sc, 3))
+        self._sc_name_in = QLineEdit()
+        self._sc_name_in.setPlaceholderText("Name (e.g. Parkir)")
+        sc_add.addWidget(self._sc_name_in, 2)
+        self._sc_amt_in = QLineEdit()
+        self._sc_amt_in.setPlaceholderText("Price (opt.)")
+        self._sc_amt_in.setFixedWidth(_sc(92, sc, 74))
+        sc_add.addWidget(self._sc_amt_in)
+        self._sc_cat_cb = QComboBox()
+        self._sc_cat_cb.addItems(list(FINANCE_CATEGORIES))
+        self._sc_cat_cb.setFixedHeight(_sc(26, sc, 24))
+        sc_add.addWidget(self._sc_cat_cb, 1)
+        add_sc_btn = self._btn("ADD", variant="gold", display=True, px=9)
+        add_sc_btn.setFixedHeight(_sc(26, sc, 24))
+        add_sc_btn.clicked.connect(self._add_shortcut)
+        sc_add.addWidget(add_sc_btn)
+        scl.addLayout(sc_add)
+
+        self._plan_status = QLabel("")
+        self._plan_status.setObjectName("tip")
+        scl.addWidget(self._plan_status)
+        pl_right.addWidget(sc_card)
+        pl_right.addStretch(1)
+        plan_cols.addLayout(pl_right, 52)
+
+        self._plan_page.setWidget(plan_body)
+        self.body.addWidget(self._plan_page, 1)
+
+        QShortcut(QKeySequence("Ctrl+,"), self).activated.connect(lambda: self.open_settings.emit())
+        self._select_tx_type("expense")
+        self._select_category("Jajan")
+        self._select_wallet("Tunai")
+        self._select_to_wallet("BNI")
+        self._set_tab("tx")
+        self.refresh()
+
+    # -- Navigation & Tab Switching ------------------------------------------
+    def on_shown(self) -> None:
+        self.refresh()
+        if self._active_tab == "tx":
+            QTimer.singleShot(20, self._amt_input.setFocus)
+
+    def on_closing(self) -> None:
+        if self._editing_tx_id is not None:
+            self._cancel_edit()
+
+    def keyPressEvent(self, e) -> None:
+        if e.key() == Qt.Key.Key_Escape and self._editing_tx_id is not None:
+            self._cancel_edit()
+            e.accept()
+            return
+        super().keyPressEvent(e)
+
+    def _set_tab(self, tab: str) -> None:
+        self._active_tab = tab
+        self._tx_page.setVisible(tab == "tx")
+        self._plan_page.setVisible(tab == "plan")
+        self._tab_tx_btn.set_active(tab == "tx")
+        self._tab_plan_btn.set_active(tab == "plan")
+
+    def _shift_month(self, delta: int) -> None:
+        m = self._view_month + delta
+        y = self._view_year
+        if m < 1:
+            m = 12
+            y -= 1
+        elif m > 12:
+            m = 1
+            y += 1
+        self._view_year, self._view_month = y, m
+        self.refresh()
+
+    def _jump_this_month(self) -> None:
+        today = date.today()
+        self._view_year, self._view_month = today.year, today.month
+        self.refresh()
+
+    # -- Form Controls -------------------------------------------------------
+    def _select_tx_type(self, kind: str) -> None:
+        self._tx_type = kind
+        for k, btn in self._type_btns.items():
+            btn.set_active(k == kind)
+        is_exp = kind == "expense"
+        is_tf = kind == "transfer"
+        self._sc_wrap.setVisible(is_exp and bool(self.store.shortcuts()))
+        self._cat_wrap.setVisible(is_exp)
+        self._to_wallet_wrap.setVisible(is_tf)
+        if is_tf:
+            self._wallet_hdr.setText("FROM WALLET")
+            if self._selected_to_wallet == self._selected_wallet:
+                alt = next((w for w in FINANCE_WALLETS if w != self._selected_wallet), "BNI")
+                self._select_to_wallet(alt)
+            self._title_input.setPlaceholderText("Note (optional, e.g. Tarik ATM)")
+        elif kind == "income":
+            self._wallet_hdr.setText("TO WALLET")
+            self._title_input.setPlaceholderText("Source (e.g. Uang saku, Gaji, Bonus)")
+        else:
+            self._wallet_hdr.setText("WALLET (QRIS = BNI / MANDIRI)")
+            self._title_input.setPlaceholderText("Item or note (e.g. Kopi susu, Galon)")
+        if self._editing_tx_id is None:
+            labels = {"expense": "RECORD EXPENSE", "income": "RECORD INCOME", "transfer": "RECORD TRANSFER"}
+            self._submit_btn.setText(labels[kind])
+
+    def _select_category(self, cat: str) -> None:
+        self._selected_cat = cat
+        for c, btn in self._cat_btns.items():
+            btn.set_active(c == cat)
+
+    def _select_wallet(self, wallet: str) -> None:
+        self._selected_wallet = wallet
+        for w, btn in self._wallet_btns.items():
+            btn.set_active(w == wallet)
+        if self._tx_type == "transfer" and self._selected_to_wallet == wallet:
+            alt = next((x for x in FINANCE_WALLETS if x != wallet), "BNI")
+            self._select_to_wallet(alt)
+
+    def _select_to_wallet(self, wallet: str) -> None:
+        self._selected_to_wallet = wallet
+        for w, btn in self._to_wallet_btns.items():
+            btn.set_active(w == wallet)
+
+    def _update_amount_preview(self, text: str) -> None:
+        raw = text.strip()
+        if not raw:
+            self._amt_preview_lbl.setText("")
+            return
+        amt = parse_rupiah(raw)
+        if amt is None:
+            self._amt_preview_lbl.setStyleSheet(
+                f'color: #FF5C6C; font-family: "Barlow Condensed", sans-serif; '
+                f'font-size: {_sc(12, self._ui_scale, 10)}px; font-weight: 800;'
+            )
+            self._amt_preview_lbl.setText("INVALID AMOUNT")
+        else:
+            self._amt_preview_lbl.setStyleSheet(
+                f'color: #FFE46B; font-family: "Barlow Condensed", sans-serif; '
+                f'font-size: {_sc(12, self._ui_scale, 10)}px; font-weight: 800;'
+            )
+            self._amt_preview_lbl.setText(f"= {format_rupiah(amt)}")
+
+    def _apply_shortcut(self, sc_entry: dict) -> None:
+        if self._editing_tx_id is not None:
+            self._cancel_edit()
+        self._select_tx_type("expense")
+        self._select_category(sc_entry["category"])
+        self._title_input.setText(sc_entry["name"])
+        if sc_entry.get("amount"):
+            self._amt_input.setText(str(sc_entry["amount"]))
+            self._form_status.setText(f"Shortcut '{sc_entry['name']}' ready — hit Enter or Record!")
+        else:
+            self._amt_input.clear()
+            self._amt_input.setFocus()
+            self._form_status.setText(f"Shortcut '{sc_entry['name']}' selected — type amount!")
+
+    def _set_filter(self, key: str) -> None:
+        self._tx_filter = key
+        for k, btn in self._filter_btns.items():
+            btn.set_active(k == key)
+        self._refresh_tx_list()
+
+    # -- Transaction CRUD + Inline Edit + Undo -------------------------------
+    def _submit_transaction(self) -> None:
+        amt = parse_rupiah(self._amt_input.text())
+        if amt is None:
+            self._form_status.setText("Enter a valid amount (e.g. 15rb, 1.5jt, or 25000).")
+            self._amt_input.setFocus()
+            return
+        if self._tx_type == "transfer" and self._selected_wallet == self._selected_to_wallet:
+            self._form_status.setText("Choose two different wallets for a transfer.")
+            return
+        title = self._title_input.text().strip()
+        qd = self._date_edit.date()
+        day_s = f"{qd.year():04d}-{qd.month():02d}-{qd.day():02d}"
+
+        if self._editing_tx_id is not None:
+            tx_id = self._editing_tx_id
+            updated, prev = self.store.update_transaction(
+                tx_id, self._tx_type, amt, title,
+                category=self._selected_cat,
+                wallet=self._selected_wallet,
+                to_wallet=self._selected_to_wallet,
+                day=day_s,
+            )
+            self._cancel_edit()
+            if updated is not None and prev is not None:
+                play_ui("select")
+                self._undo_kind = "tx_edit"
+                self._undo_payload = prev
+                self._undo.trigger(f"Updated '{updated['title'][:26]}'")
+                self._form_status.setText(f"Saved edit: {updated['title']} ({format_rupiah(updated['amount'])})")
+                self.refresh()
+                self.finance_changed.emit("edit", updated)
+            return
+
+        tx = self.store.add_transaction(
+            self._tx_type, amt, title,
+            category=self._selected_cat,
+            wallet=self._selected_wallet,
+            to_wallet=self._selected_to_wallet,
+            day=day_s,
+        )
+        if tx is None:
+            self._form_status.setText("Could not save transaction. Check inputs.")
+            return
+        play_ui("select")
+        self._amt_input.clear()
+        self._title_input.clear()
+        self._view_year, self._view_month = qd.year(), qd.month()
+        self._form_status.setText(f"Recorded {tx['title']} · {format_rupiah(tx['amount'])}")
+        self.refresh()
+        self.finance_changed.emit("add", tx)
+
+    def _start_edit_selected_tx(self) -> None:
+        item = self._tx_list.currentItem()
+        if item is None:
+            return
+        tx_id = item.data(ROLE_ID)
+        if not tx_id:
+            return
+        tx = self.store.get_transaction(tx_id)
+        if tx is None:
+            return
+        self._editing_tx_id = tx_id
+        self._select_tx_type(tx["type"])
+        if tx["type"] == "expense" and tx.get("category"):
+            self._select_category(tx["category"])
+        self._select_wallet(tx["wallet"])
+        if tx["type"] == "transfer" and tx.get("to_wallet"):
+            self._select_to_wallet(tx["to_wallet"])
+        self._amt_input.setText(str(tx["amount"]))
+        self._title_input.setText(tx["title"])
+        try:
+            d = date.fromisoformat(tx["date"])
+            self._date_edit.setDate(QDate(d.year, d.month, d.day))
+        except ValueError:
+            pass
+        self._form_hdr_lbl.setText("EDIT TRANSACTION")
+        self._form_hdr_lbl.setStyleSheet("color: #FAD02C;")
+        self._form_card.setStyleSheet(
+            "QFrame#card { background: #141720; border: 1.5px solid #FAD02C; border-radius: 10px; }"
+        )
+        self._submit_btn.setText("SAVE EDIT")
+        self._submit_btn.set_variant("gold")
+        self._cancel_edit_btn.show()
+        self._form_status.setText("Editing entry — press Esc or Cancel to discard.")
+        self._amt_input.setFocus()
+        self._amt_input.selectAll()
+
+    def _cancel_edit(self) -> None:
+        self._editing_tx_id = None
+        self._form_hdr_lbl.setText("RECORD TRANSACTION")
+        self._form_hdr_lbl.setStyleSheet("")
+        self._form_card.setStyleSheet("")
+        self._submit_btn.set_variant("primary")
+        self._cancel_edit_btn.hide()
+        self._amt_input.clear()
+        self._title_input.clear()
+        self._date_edit.setDate(QDate.currentDate())
+        self._form_status.setText("")
+        self._select_tx_type(self._tx_type)
+
+    def _delete_selected_tx(self) -> None:
+        item = self._tx_list.currentItem()
+        if item is None:
+            return
+        tx_id = item.data(ROLE_ID)
+        if not tx_id:
+            return
+        if self._editing_tx_id == tx_id:
+            self._cancel_edit()
+        removed = self.store.delete_transaction(tx_id)
+        if removed is None:
+            return
+        play_ui("close")
+        self._undo_kind = "tx_delete"
+        self._undo_payload = removed
+        self._undo.trigger(f"Deleted '{removed['title'][:26]}'")
+        self.refresh()
+        self.finance_changed.emit("delete", removed)
+
+    def _undo_last(self) -> None:
+        if not self._undo_payload:
+            return
+        if self._editing_tx_id is not None:
+            self._cancel_edit()
+        payload = self._undo_payload
+        self._undo_kind = ""
+        self._undo_payload = None
+        restored = self.store.restore_transaction(payload)
+        if restored is not None:
+            play_ui("select")
+            self.refresh()
+            self.finance_changed.emit("edit", restored)
+
+    # -- Budgets, Bills & Shortcuts Actions ----------------------------------
+    def _save_budget(self, category: str) -> None:
+        raw = self._budget_inputs[category].text().strip()
+        if not raw:
+            self._clear_budget(category)
+            return
+        if not self.store.set_budget(category, raw):
+            self._plan_status.setText(f"Invalid budget amount for {category} (try e.g. 500rb).")
+            return
+        play_ui("select")
+        self._plan_status.setText(f"Set {category} monthly budget to {format_rupiah(self.store.budgets()[category])}.")
+        self.refresh()
+
+    def _clear_budget(self, category: str) -> None:
+        self.store.set_budget(category, None)
+        self._budget_inputs[category].clear()
+        self._plan_status.setText(f"Cleared monthly budget for {category}.")
+        self.refresh()
+
+    def _add_bill(self) -> None:
+        name = self._bill_name_in.text().strip()
+        amt = parse_rupiah(self._bill_amt_in.text())
+        if not name or amt is None:
+            self._plan_status.setText("Enter a bill name and valid amount (e.g. Kos · 800rb).")
+            return
+        bill = self.store.add_bill(
+            name, self._bill_day_spin.value(), amt,
+            category=self._bill_cat_cb.currentText(),
+            wallet=self._bill_wal_cb.currentText(),
+        )
+        if bill is not None:
+            play_ui("select")
+            self._bill_name_in.clear()
+            self._bill_amt_in.clear()
+            self._plan_status.setText(f"Added monthly bill '{bill['name']}' (Day {bill['day']}).")
+            self.refresh()
+
+    def _pay_bill(self, bill_id: str) -> None:
+        bill, tx = self.store.pay_bill(bill_id, self._view_year, self._view_month)
+        if bill is not None and tx is not None:
+            play_ui("select")
+            self._plan_status.setText(f"Paid '{bill['name']}' ({format_rupiah(tx['amount'])})!")
+            self.refresh()
+            self.finance_changed.emit("bill", tx)
+
+    def _delete_bill(self, bill_id: str) -> None:
+        if self.store.delete_bill(bill_id):
+            play_ui("close")
+            self.refresh()
+
+    def _add_shortcut(self) -> None:
+        name = self._sc_name_in.text().strip()
+        raw_amt = self._sc_amt_in.text().strip()
+        if not name:
+            self._plan_status.setText("Enter a shortcut name first.")
+            return
+        if raw_amt and parse_rupiah(raw_amt) is None:
+            self._plan_status.setText("Invalid shortcut price (leave empty or type e.g. 7rb).")
+            return
+        sc_entry = self.store.add_shortcut(name, self._sc_cat_cb.currentText(), raw_amt or None)
+        if sc_entry is not None:
+            play_ui("select")
+            self._sc_name_in.clear()
+            self._sc_amt_in.clear()
+            self._plan_status.setText(f"Saved quick shortcut '{sc_entry['name']}'.")
+            self.refresh()
+
+    def _delete_shortcut(self, name: str) -> None:
+        if self.store.delete_shortcut(name):
+            play_ui("close")
+            self.refresh()
+
+    # -- Full UI Refresh -----------------------------------------------------
+    def refresh(self) -> None:
+        sc = self._ui_scale
+        self._month_lbl.setText(f"{self._MONTH_NAMES[self._view_month - 1]} {self._view_year}")
+
+        bal = self.store.wallet_balances()
+        summ = self.store.month_summary(self._view_year, self._view_month)
+
+        self._kpi_bal_val.setText(format_rupiah(bal["Total"]))
+        self._kpi_bal_sub.setText(
+            f"Tunai {format_rupiah(bal['Tunai'])} · BNI {format_rupiah(bal['BNI'])} · Mandiri {format_rupiah(bal['Mandiri'])}"
+        )
+        self._kpi_inc_val.setText("+" + format_rupiah(summ["income"]))
+        net = summ["net"]
+        net_prefix = "+" if net >= 0 else ""
+        self._kpi_inc_sub.setText(f"Net: {net_prefix}{format_rupiah(net)}")
+        self._kpi_exp_val.setText("-" + format_rupiah(summ["expense"]))
+        self._kpi_exp_sub.setText(f"{summ['count']} entries this month")
+        self._kpi_tod_val.setText(format_rupiah(summ["today_expense"]))
+        self._kpi_tod_sub.setText("Spent today")
+
+        self._refresh_shortcut_chips()
+        self._refresh_tx_list()
+        self._refresh_budgets_and_wallets(bal, summ)
+        self._refresh_bills_and_sc_mgr()
+
+    def _refresh_shortcut_chips(self) -> None:
+        sc = self._ui_scale
+        _clear_layout(self._sc_grid)
+        shortcuts = self.store.shortcuts()
+        self._sc_wrap.setVisible(self._tx_type == "expense" and bool(shortcuts))
+        for idx, entry in enumerate(shortcuts[:8]):
+            amt = entry.get("amount")
+            lbl = f"{entry['name']} · {amt // 1000}rb" if (amt and amt >= 1000 and amt % 1000 == 0) else (
+                f"{entry['name']} · {format_rupiah(amt)}" if amt else entry["name"]
+            )
+            btn = self._btn(lbl, variant="soft", display=False, px=10)
+            btn.setFixedHeight(_sc(23, sc, 20))
+            btn.setToolTip(f"{entry['category']}" + (f" · {format_rupiah(amt)}" if amt else ""))
+            btn.clicked.connect(lambda _c=False, e=dict(entry): self._apply_shortcut(e))
+            self._sc_grid.addWidget(btn, idx // 4, idx % 4)
+
+    def _refresh_tx_list(self) -> None:
+        items = self.store.month_transactions(self._view_year, self._view_month)
+        q = self._search_input.text().strip().lower()
+        flt = self._tx_filter
+        filtered: list[dict] = []
+        for t in items:
+            if flt in ("expense", "income", "transfer") and t["type"] != flt:
+                continue
+            if flt.startswith("cat:") and (t["type"] != "expense" or t.get("category") != flt[4:]):
+                continue
+            if q:
+                hay = f"{t['title']} {t.get('category', '')} {t['wallet']} {t.get('to_wallet', '')} {t['date']}".lower()
+                if q not in hay:
+                    continue
+            filtered.append(t)
+
+        self._tx_count_lbl.setText(f"{len(filtered)} {'entry' if len(filtered) == 1 else 'entries'}")
+        self._tx_list.clear()
+        if not filtered:
+            empty = QListWidgetItem("No transactions match this month or filter.\nRecord an expense, income, or transfer on the left!")
+            empty.setData(ROLE_ID, None)
+            empty.setFlags(Qt.ItemFlag.NoItemFlags)
+            self._tx_list.addItem(empty)
+            return
+
+        for t in filtered:
+            it = QListWidgetItem(t["title"])
+            it.setData(ROLE_ID, t["id"])
+            it.setData(ROLE_CAT, t["type"])
+            try:
+                d_str = date.fromisoformat(t["date"]).strftime("%d %b")
+            except ValueError:
+                d_str = t["date"]
+            if t["type"] == "income":
+                amt_txt = "+" + format_rupiah(t["amount"])
+                meta = f"{t['wallet']} · {d_str}"
+            elif t["type"] == "transfer":
+                amt_txt = format_rupiah(t["amount"])
+                meta = f"{t['wallet']} → {t.get('to_wallet', '')} · {d_str}"
+            else:
+                amt_txt = "-" + format_rupiah(t["amount"])
+                meta = f"{t.get('category', 'Jajan')} · {t['wallet']} · {d_str}"
+            it.setData(ROLE_BADGE, amt_txt)
+            it.setData(ROLE_DATE, meta)
+            self._tx_list.addItem(it)
+
+    def _refresh_budgets_and_wallets(self, bal: dict[str, int], summ: dict) -> None:
+        budgets = self.store.budgets()
+        by_cat = summ["by_category"]
+        for cat in FINANCE_CATEGORIES:
+            spent = by_cat.get(cat, 0)
+            limit = budgets.get(cat)
+            info_lbl, pct_lbl, bar = self._budget_bars[cat]
+            inp = self._budget_inputs[cat]
+            if not inp.hasFocus():
+                inp.setText(str(limit) if limit else "")
+            if limit and limit > 0:
+                ratio = spent / float(limit)
+                pct = int(round(ratio * 100))
+                bar.setValue(min(100, pct))
+                info_lbl.setText(f"{format_rupiah(spent)} / {format_rupiah(limit)}")
+                if ratio >= 1.0:
+                    col = "#E60012"
+                    pct_lbl.setText(f"{pct}% OVER!")
+                elif ratio >= FINANCE_WARN_RATIO:
+                    col = "#F5C400"
+                    pct_lbl.setText(f"{pct}% WARN")
+                else:
+                    col = "#5CE09A"
+                    pct_lbl.setText(f"{pct}%")
+                pct_lbl.setStyleSheet(
+                    f'color: {col}; font-family: "Barlow Condensed", sans-serif; '
+                    f'font-size: {_sc(11, self._ui_scale, 9)}px; font-weight: 800;'
+                )
+                bar.setStyleSheet(
+                    f"QProgressBar {{ background: #1B1E28; border-radius: 3px; }}"
+                    f"QProgressBar::chunk {{ background: {col}; border-radius: 3px; }}"
+                )
+            else:
+                bar.setValue(0)
+                info_lbl.setText(f"Spent: {format_rupiah(spent)}")
+                pct_lbl.setText("No limit")
+                pct_lbl.setStyleSheet(
+                    f'color: #8A8F9E; font-family: "Barlow Condensed", sans-serif; '
+                    f'font-size: {_sc(11, self._ui_scale, 9)}px; font-weight: 800;'
+                )
+                bar.setStyleSheet(
+                    "QProgressBar { background: #1B1E28; border-radius: 3px; }"
+                    "QProgressBar::chunk { background: #3E4457; border-radius: 3px; }"
+                )
+
+        max_pos = max([1] + [max(0, bal[w]) for w in FINANCE_WALLETS])
+        for w in FINANCE_WALLETS:
+            val_lbl, wbar = self._wallet_rows[w]
+            v = bal[w]
+            val_lbl.setText(format_rupiah(v))
+            val_lbl.setStyleSheet(
+                f'color: {"#FF5C6C" if v < 0 else "#FFE46B"}; font-family: "Barlow Condensed", sans-serif; '
+                f'font-size: {_sc(14, self._ui_scale, 11)}px; font-weight: 800;'
+            )
+            wbar.setValue(int(round(max(0, v) * 100.0 / max_pos)))
+
+    def _refresh_bills_and_sc_mgr(self) -> None:
+        sc = self._ui_scale
+        _clear_layout(self._bills_box)
+        bills = self.store.bills()
+        if not bills:
+            empty = QLabel("No recurring bills yet. Add rent, Wi-Fi, or subscriptions below!")
+            empty.setObjectName("tip")
+            empty.setWordWrap(True)
+            self._bills_box.addWidget(empty)
+        else:
+            for b in bills:
+                paid = self.store.is_bill_paid(b, self._view_year, self._view_month)
+                row = QFrame()
+                row.setStyleSheet("QFrame { background: #181B25; border: 1px solid #2A2F3E; border-radius: 6px; }")
+                rl = QHBoxLayout(row)
+                rl.setContentsMargins(_sc(8, sc, 6), _sc(5, sc, 4), _sc(8, sc, 6), _sc(5, sc, 4))
+                rl.setSpacing(_sc(6, sc, 4))
+
+                info = QLabel(f"Day {b['day']:02d} · {b['name']}  ({format_rupiah(b['amount'])} · {b['wallet']})")
+                info.setStyleSheet(f'color: {"#8A919E" if paid else "#FFFFFF"}; font-size: {_sc(12, sc, 9)}px; border: none;')
+                rl.addWidget(info, 1)
+
+                if paid:
+                    badge = QLabel("PAID")
+                    badge.setStyleSheet(
+                        f'background: #143324; color: #5CE09A; border: none; border-radius: 4px; '
+                        f'padding: 2px {_sc(7, sc, 5)}px; font-family: "Barlow Condensed", sans-serif; '
+                        f'font-size: {_sc(10, sc, 8)}px; font-weight: 800;'
+                    )
+                    rl.addWidget(badge)
+                else:
+                    pay_b = self._btn("PAY", variant="gold", display=True, px=9)
+                    pay_b.setFixedHeight(_sc(22, sc, 19))
+                    pay_b.clicked.connect(lambda _c=False, bid=b["id"]: self._pay_bill(bid))
+                    rl.addWidget(pay_b)
+
+                del_b = self._btn("×", variant="soft", display=True, px=10)
+                del_b.setFixedSize(_sc(22, sc, 19), _sc(22, sc, 19))
+                del_b.clicked.connect(lambda _c=False, bid=b["id"]: self._delete_bill(bid))
+                rl.addWidget(del_b)
+                self._bills_box.addWidget(row)
+
+        _clear_layout(self._sc_mgr_box)
+        shortcuts = self.store.shortcuts()
+        if not shortcuts:
+            empty_sc = QLabel("No shortcuts yet.")
+            empty_sc.setObjectName("tip")
+            self._sc_mgr_box.addWidget(empty_sc)
+        else:
+            for entry in shortcuts:
+                row = QFrame()
+                row.setStyleSheet("QFrame { background: #181B25; border: 1px solid #2A2F3E; border-radius: 6px; }")
+                rl = QHBoxLayout(row)
+                rl.setContentsMargins(_sc(8, sc, 6), _sc(4, sc, 3), _sc(8, sc, 6), _sc(4, sc, 3))
+                rl.setSpacing(_sc(6, sc, 4))
+                amt_s = f" · {format_rupiah(entry['amount'])}" if entry.get("amount") else " · manual price"
+                lbl = QLabel(f"{entry['name']}  ({entry['category']}{amt_s})")
+                lbl.setStyleSheet(f'color: #ECEEF5; font-size: {_sc(11, sc, 9)}px; border: none;')
+                rl.addWidget(lbl, 1)
+                del_s = self._btn("×", variant="soft", display=True, px=10)
+                del_s.setFixedSize(_sc(22, sc, 19), _sc(22, sc, 19))
+                del_s.clicked.connect(lambda _c=False, nm=entry["name"]: self._delete_shortcut(nm))
+                rl.addWidget(del_s)
+                self._sc_mgr_box.addWidget(row)

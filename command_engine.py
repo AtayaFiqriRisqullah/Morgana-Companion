@@ -20,6 +20,9 @@ import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, time as dtime, timedelta
 
+from storage_manager import (FINANCE_CATEGORY_ALIASES, FINANCE_WALLET_ALIASES,
+                             format_rupiah, parse_rupiah)
+
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
@@ -246,6 +249,15 @@ _TIMER_RE = re.compile(
     re.IGNORECASE,
 )
 
+_FINANCE_OUT_RE = re.compile(
+    r"^(?:/?(?:out|qris|spend|keluar))\s+([^\s]+)(?:\s+(.+))?$",
+    re.IGNORECASE,
+)
+_FINANCE_IN_RE = re.compile(
+    r"^(?:/?(?:in|masuk|income))\s+([^\s]+)(?:\s+(.+))?$",
+    re.IGNORECASE,
+)
+
 _NAV_MAP: dict[str, tuple[str, str, str]] = {
     "tasks": ("tasks", "Opening Tasks! Let's check what's on the board.", "OPENING TASKS"),
     "todo": ("tasks", "Opening Tasks! Let's check what's on the board.", "OPENING TASKS"),
@@ -256,6 +268,12 @@ _NAV_MAP: dict[str, tuple[str, str, str]] = {
     "schedule": ("events", "Opening Events! Let's look over your schedule.", "OPENING EVENTS"),
     "stats": ("stats", "Opening Social Stats & Habits!", "OPENING STATS"),
     "habits": ("stats", "Opening Social Stats & Habits!", "OPENING STATS"),
+    "finance": ("finance", "Opening Finance! Let's check your wallets and budget.", "OPENING FINANCE"),
+    "keuangan": ("finance", "Opening Finance! Let's check your wallets and budget.", "OPENING FINANCE"),
+    "budget": ("finance", "Opening Finance! Let's check your wallets and budget.", "OPENING FINANCE"),
+    "saldo": ("finance", "Opening Finance! Let's check your wallets and budget.", "OPENING FINANCE"),
+    "dompet": ("finance", "Opening Finance! Let's check your wallets and budget.", "OPENING FINANCE"),
+    "money": ("finance", "Opening Finance! Let's check your wallets and budget.", "OPENING FINANCE"),
     "timer": ("timer", "Opening Timer & Focus!", "OPENING TIMER"),
     "briefing": ("briefing", "Pulling up your Daily Briefing right now!", "DAILY BRIEFING"),
     "morning": ("briefing", "Pulling up your Daily Briefing right now!", "DAILY BRIEFING"),
@@ -680,6 +698,76 @@ def parse_and_plan(raw_text: str, ctx: dict | None = None,
             badge="TIMER SET",
             payload={"seconds": secs, "label": label[:60]},
         )
+
+    # 5b) Quick Finance Capture (`out 15rb kopi`, `qris 25rb jajan makan`, `in bni 1jt gaji`)
+    m_out = _FINANCE_OUT_RE.match(text)
+    if m_out:
+        cmd_word = text.split(None, 1)[0].lstrip("/").lower()
+        tok1 = m_out.group(1)
+        rest = (m_out.group(2) or "").strip()
+        wallet = "BNI" if cmd_word == "qris" else "Tunai"
+        amt = parse_rupiah(tok1)
+        # Allow `qris mandiri 20rb kopi` or `out bni 20rb kopi`
+        if amt is None and tok1.lower() in FINANCE_WALLET_ALIASES and rest:
+            parts = rest.split(None, 1)
+            cand_amt = parse_rupiah(parts[0])
+            if cand_amt is not None:
+                wallet = FINANCE_WALLET_ALIASES[tok1.lower()]
+                amt = cand_amt
+                rest = parts[1].strip() if len(parts) > 1 else ""
+        if amt is not None:
+            category = "Jajan"
+            title = rest
+            if rest:
+                first_w, *tail = rest.split(None, 1)
+                if first_w.lower() in FINANCE_CATEGORY_ALIASES:
+                    category = FINANCE_CATEGORY_ALIASES[first_w.lower()]
+                    title = tail[0].strip() if tail else category
+            if not title:
+                title = category
+            return CommandResult(
+                kind="add_finance",
+                reply=f"Logged {format_rupiah(amt)} ({title[:36]}) in {category} [{wallet}]!",
+                emotion="wink",
+                voice="hmm",
+                badge="EXPENSE LOGGED",
+                action_label="OPEN FINANCE",
+                action_target="finance",
+                payload={
+                    "type": "expense", "amount": amt, "title": title[:120],
+                    "category": category, "wallet": wallet,
+                },
+            )
+
+    m_in = _FINANCE_IN_RE.match(text)
+    if m_in:
+        tok1 = m_in.group(1)
+        rest = (m_in.group(2) or "").strip()
+        wallet = "Tunai"
+        amt = parse_rupiah(tok1)
+        if amt is None and tok1.lower() in FINANCE_WALLET_ALIASES and rest:
+            parts = rest.split(None, 1)
+            cand_amt = parse_rupiah(parts[0])
+            if cand_amt is not None:
+                wallet = FINANCE_WALLET_ALIASES[tok1.lower()]
+                amt = cand_amt
+                rest = parts[1].strip() if len(parts) > 1 else ""
+        if amt is not None:
+            title = rest or f"Income ({wallet})"
+            return CommandResult(
+                kind="add_finance",
+                reply=f"Logged +{format_rupiah(amt)} ({title[:36]}) to {wallet}!",
+                emotion="excited",
+                voice="oh_excited",
+                particle="sparkle",
+                badge="INCOME LOGGED",
+                action_label="OPEN FINANCE",
+                action_target="finance",
+                payload={
+                    "type": "income", "amount": amt, "title": title[:120],
+                    "category": "", "wallet": wallet,
+                },
+            )
 
     # 6) DND / Sound / Sleep / Show-Hide toggles
     if re.match(r"^(?:/?dnd|do\s+not\s+disturb|quiet(?:\s+mode)?)(?:\s+(on|off|toggle))?$", low):

@@ -40,7 +40,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from datetime import time as dtime
 from pathlib import Path
 
@@ -72,16 +72,17 @@ from lines import (ContextualDialogue, LineBag, build_daily_briefing, build_even
 from particles import ParticleOverlay
 import sprites
 from sprites import EYE_CLOSED, EYE_HALF, EYE_OPEN, MOUTH_BASE, MorganaSprites
-from storage_manager import (RADIAL_TAB_KEYS, SOCIAL_STAT_KEYS, SOCIAL_STATS, HabitStore,
-                             LocalEventStore, NoteStore, SettingsStore, SocialStatsStore,
-                             TaskStore, overall_confidant_level, parse_dt, stat_level,
-                             stat_rank_title)
+from storage_manager import (RADIAL_TAB_KEYS, SOCIAL_STAT_KEYS, SOCIAL_STATS, FinanceStore,
+                             HabitStore, LocalEventStore, NoteStore, SettingsStore,
+                             SocialStatsStore, TaskStore, format_rupiah, overall_confidant_level,
+                             parse_dt, stat_level, stat_rank_title)
 from theme import (BLACK, BLUE, GOLD, LIGHT_RED, MENU_QSS, P5_MINT_FG,
                    P5_SURFACE, RED, UI_SCALE_PRESETS, WHITE, lerp_color,
                    load_fonts, menu_qss, p5_dialogue_font, p5_font, pen, scale_polygon,
                    star_polygon, tapered_wedge)
-from ui_dialogs import (BriefingDialog, EventsDialog, NotesDialog, QuickCommandDialog,
-                        SettingsDialog, SocialStatsDialog, TasksDialog, TimerDialog, WrapUpDialog)
+from ui_dialogs import (BriefingDialog, EventsDialog, FinanceDialog, NotesDialog,
+                        QuickCommandDialog, SettingsDialog, SocialStatsDialog, TasksDialog,
+                        TimerDialog, WrapUpDialog)
 from sheets_sync import (SheetsPushResult, SheetsSyncConfig, push_tasks_to_sheets,
                          serialize_tasks_to_rows, test_sheets_connection)
 
@@ -1790,6 +1791,7 @@ _RADIAL_BASE_SLOTS: dict[int, tuple[tuple[float, float], ...]] = {
     5: (( -96.0, +22.0), ( -48.0, +11.0), (   0.0,   0.0), ( +48.0, -11.0), ( +96.0, -22.0)),
     6: ((-112.5, +20.0), ( -67.5, +12.0), ( -22.5,  +4.0), ( +22.5,  -4.0), ( +67.5, -12.0), (+112.5, -20.0)),
     7: ((-126.0, +22.5), ( -84.0, +15.0), ( -42.0,  +7.5), (   0.0,   0.0), ( +42.0,  -7.5), ( +84.0, -15.0), (+126.0, -22.5)),
+    8: ((-136.5, +24.5), ( -97.5, +17.5), ( -58.5, +10.5), ( -19.5,  +3.5), ( +19.5,  -3.5), ( +58.5, -10.5), ( +97.5, -17.5), (+136.5, -24.5)),
 }
 
 
@@ -1837,7 +1839,7 @@ def _radial_button_extents(
 def _ray_clip_polygon(
     pts: tuple[tuple[float, float], ...],
     x_lo: float, x_hi: float, y_lo: float, y_hi: float,
-    min_scale: float = 0.28,
+    min_scale: float = 0.22,
 ) -> tuple[tuple[float, float], ...] | None:
     """Scale a spike polygon radially from (0, 0) so every tip stays sharp and inside screen bounds."""
     s = 1.0
@@ -1857,28 +1859,82 @@ def _ray_clip_polygon(
     return tuple((vx * s, vy * s) for vx, vy in pts)
 
 
-def _spike_poly(
-    side: int, phi: float, r_in: float, r_out: float,
-    half_w_in: float, half_w_out: float = 0.0, skew: float = 0.0,
+def _oriented_poly(
+    angle: float, local_pts: tuple[tuple[float, float], ...],
 ) -> tuple[tuple[float, float], ...]:
-    """Build a sharp Persona 5 crimson/obsidian spike along local side angle `phi`."""
-    ux = side * math.cos(phi)
-    uy = math.sin(phi)
-    px, py = -uy, ux
-    bx, by = ux * r_in, uy * r_in
-    tx, ty = ux * r_out, uy * r_out
-    if half_w_out <= 0.5:
+    """Rotate local (along, perp) points around (0, 0) to screen angle `angle` (radians)."""
+    ca, sa = math.cos(angle), math.sin(angle)
+    return tuple((u * ca - v * sa, u * sa + v * ca) for u, v in local_pts)
+
+
+def _stepped_slash_poly(
+    angle: float, length: float, half_w: float, step_sign: float = 1.0,
+    notch_t: float = 0.60, back_anchor: float = 28.0,
+) -> tuple[tuple[float, float], ...]:
+    """Iconic Persona 5 diagonal crimson beam: straight outer edge + abrupt inward notch -> razor needle."""
+    s = step_sign
+    pts = (
+        (-back_anchor,              -0.44 * half_w * s),
+        (length * 0.42,             -0.48 * half_w * s),
+        (length,                    -0.12 * half_w * s),   # ultra-sharp needle tip
+        (length * (notch_t - 0.03), +0.06 * half_w * s),   # razor spear underside
+        (length * (notch_t + 0.03), +0.62 * half_w * s),   # abrupt Persona 5 comic step!
+        (length * 0.24,             +1.00 * half_w * s),   # broad angular crimson belly
+        (-back_anchor,              +0.52 * half_w * s),
+    )
+    return _oriented_poly(angle, pts)
+
+
+def _needle_poly(
+    angle: float, length: float, half_w: float,
+    back_anchor: float = 22.0, offset_v: float = 0.0,
+) -> tuple[tuple[float, float], ...]:
+    """Long sleek Persona 5 razor needle (used for lower-left crimson tail & piercing black spears)."""
+    pts = (
+        (-back_anchor,  offset_v - 0.55 * half_w),
+        (length * 0.22, offset_v - 0.85 * half_w),
+        (length,        offset_v),
+        (length * 0.20, offset_v + 0.72 * half_w),
+        (-back_anchor,  offset_v + 0.48 * half_w),
+    )
+    return _oriented_poly(angle, pts)
+
+
+def _impact_wing_poly(
+    side: int, phi_top: float, phi_bot: float, r_top: float, r_bot: float,
+    u_sprite: float,
+) -> tuple[tuple[float, float], ...]:
+    """Bold irregular Persona 5 crimson cutout wing backing a side's button cluster (no repetitive spokes)."""
+    r_in = 14.0 * u_sprite
+    span = phi_bot - phi_top
+    a_top = max(-1.38, phi_top - (0.14 if span < 0.25 else 0.10))
+    a_bot = min(+1.38, phi_bot + (0.14 if span < 0.25 else 0.10))
+    a_mid = 0.5 * (a_top + a_bot)
+    r_mid = 0.5 * (r_top + r_bot)
+
+    def _pt(a: float, r: float) -> tuple[float, float]:
+        return (side * r * math.cos(a), r * math.sin(a))
+
+    if span < 0.25:
+        # Compact 1-tab angular cutout slash
         return (
-            (bx + px * half_w_in, by + py * half_w_in),
-            (tx + px * skew,      ty + py * skew),
-            (bx - px * half_w_in, by - py * half_w_in),
+            _pt(a_top, r_in),
+            _pt(a_top, r_top * 0.90),
+            _pt(a_mid - 0.04, r_mid * 0.72),
+            _pt(a_mid + 0.05, r_mid * 1.02),
+            _pt(a_bot, r_bot * 0.84),
+            _pt(a_bot, r_in),
         )
-    t2x, t2y = ux * (r_out * 0.91), uy * (r_out * 0.91)
+    # Asymmetric 3-corner comic-cutout wing with one crisp inward notch
+    a_q1 = a_top + 0.34 * (a_bot - a_top)
+    a_q2 = a_top + 0.58 * (a_bot - a_top)
     return (
-        (bx + px * half_w_in,              by + py * half_w_in),
-        (tx + px * (half_w_out + skew),    ty + py * (half_w_out + skew)),
-        (t2x - px * (half_w_out - skew),   t2y - py * (half_w_out - skew)),
-        (bx - px * half_w_in,              by - py * half_w_in),
+        _pt(a_top, r_in),
+        _pt(a_top, r_top * 0.96),
+        _pt(a_q1,  r_mid * 0.66),          # sharp comic inward notch
+        _pt(a_q2,  r_mid * 0.98),          # bold outer angular corner
+        _pt(a_bot, r_bot * 0.88),
+        _pt(a_bot, r_in),
     )
 
 
@@ -1891,12 +1947,12 @@ def build_radial_burst_shards(
     y_lo: float,
     y_hi: float,
 ) -> tuple[list[tuple[tuple[float, float], ...]], list[tuple[tuple[float, float], ...]]]:
-    """Generate Persona 5 crimson & obsidian backdrop shards adapted to active tabs & screen bounds."""
+    """Generate Persona 5 stepped diagonal crimson slash & piercing black counter-spears."""
     red: list[tuple[tuple[float, float], ...]] = []
     black: list[tuple[tuple[float, float], ...]] = []
 
     def _add(target: list[tuple[tuple[float, float], ...]],
-             pts: tuple[tuple[float, float], ...], min_s: float = 0.28) -> None:
+             pts: tuple[tuple[float, float], ...], min_s: float = 0.22) -> None:
         clipped = _ray_clip_polygon(pts, x_lo, x_hi, y_lo, y_hi, min_scale=min_s)
         if clipped is not None:
             target.append(clipped)
@@ -1911,83 +1967,94 @@ def build_radial_burst_shards(
         by_side[side].append((phi, dist))
 
     active_sides = [s for s in (-1, +1) if by_side[s]]
-    r_base = 14.0 * u_sprite
-    max_r = 390.0 * u_btn
+    if not active_sides:
+        return red, black
 
+    max_r = 395.0 * u_btn
+    # 1) Bold asymmetric crimson impact wing behind each active side's button cluster
+    side_info: dict[int, tuple[float, float, float, float, int]] = {}
     for side in active_sides:
         rays = sorted(by_side[side], key=lambda item: item[0])
-        n = len(rays)
         phi_min, r_top = rays[0]
         phi_max, r_bot = rays[-1]
+        r_top = min(r_top, max_r)
+        r_bot = min(r_bot, max_r)
+        side_info[side] = (phi_min, phi_max, r_top, r_bot, len(rays))
+        _add(red, _impact_wing_poly(side, phi_min, phi_max, r_top, r_bot, u_sprite), min_s=0.30)
 
-        # 1) Multi-point sawtooth crimson burst core hugging the active side's angular span
-        pad_core = 0.17 if n == 1 else 0.13
-        a0 = max(-1.38, phi_min - pad_core)
-        a1 = min(+1.38, phi_max + pad_core)
-        n_peaks = max(3, min(7, n + 2))
-        core_pts: list[tuple[float, float]] = [
-            (side * r_base * math.cos(a0) - math.sin(a0) * 6.0 * u_sprite,
-             r_base * math.sin(a0) + side * math.cos(a0) * 6.0 * u_sprite),
-        ]
-        for k in range(n_peaks):
-            t_pk = k / max(1, n_peaks - 1)
-            a_pk = a0 + (a1 - a0) * t_pk
-            idx_near = min(n - 1, int(round(t_pk * (n - 1))))
-            r_near = min(rays[idx_near][1], max_r)
-            r_pk = r_near * (0.96 if k % 2 == 0 else 0.86)
-            core_pts.append((side * r_pk * math.cos(a_pk), r_pk * math.sin(a_pk)))
-            if k < n_peaks - 1:
-                a_val = a0 + (a1 - a0) * ((k + 0.5) / max(1, n_peaks - 1))
-                r_val = r_near * (0.58 if k % 2 == 0 else 0.64)
-                core_pts.append((side * r_val * math.cos(a_val), r_val * math.sin(a_val)))
-        core_pts.append((
-            side * r_base * math.cos(a1) + math.sin(a1) * 6.0 * u_sprite,
-            r_base * math.sin(a1) - side * math.cos(a1) * 6.0 * u_sprite,
-        ))
-        _add(red, tuple(core_pts), min_s=0.35)
+    # 2) Hero Stepped Diagonal Crimson Lightning-Slash + Piercing Black Counter-Spears
+    if len(active_sides) == 2:
+        # Classic Persona 5 Royal diagonal (reference image.png):
+        # lower-left razor needle + black spear -> bold stepped crimson beam shooting upper-right!
+        l_min, l_max, l_rt, l_rb, l_n = side_info[-1]
+        r_min, r_max, r_rt, r_rb, r_n = side_info[+1]
+        compact = (l_n + r_n) <= 2
+        hero_ang = clamp(r_min - (0.14 if compact else 0.16), -0.82, -0.26)
+        hero_len = min(max(r_rt * 1.44, 330.0 * u_btn), 460.0 * u_btn)
+        hero_w = (30.0 if compact else 44.0) * u_btn
+        tail_len = min(max(l_rb * 1.18, 255.0 * u_btn), 360.0 * u_btn)
 
-        # 2) Dramatic crimson flank & gap spikes peeking past the command wedges
-        if n == 1:
-            phi0, r0 = rays[0]
-            r0 = min(r0, max_r)
-            _add(red, _spike_poly(side, max(-1.38, phi0 - 0.22), r_base, r0 * 1.00, 12.0 * u_btn, 7.0 * u_btn, -4.0 * u_btn))
-            _add(red, _spike_poly(side, phi0 + 0.04,             r_base, r0 * 1.11, 10.0 * u_btn, 0.0,           +3.0 * u_btn))
-            _add(red, _spike_poly(side, min(+1.38, phi0 + 0.21), r_base, r0 * 0.96, 11.0 * u_btn, 6.0 * u_btn,  +4.0 * u_btn))
-            _add(black, _spike_poly(side, max(-1.36, phi0 - 0.13), r_base, r0 * 0.90, 8.0 * u_btn))
-            _add(black, _spike_poly(side, min(+1.36, phi0 + 0.14), r_base, r0 * 0.86, 7.5 * u_btn))
+        # Upper-right hero stepped beam (straight top edge, stepped bottom edge -> needle tip)
+        _add(red, _stepped_slash_poly(hero_ang, hero_len, hero_w, step_sign=+1.0,
+                                      notch_t=0.62, back_anchor=26.0 * u_sprite), min_s=0.35)
+        # Lower-left razor crimson tail along exact opposite diagonal
+        _add(red, _needle_poly(hero_ang + math.pi, tail_len, (14.0 if compact else 18.0) * u_btn,
+                               back_anchor=24.0 * u_sprite), min_s=0.30)
+        # Sharp upper-left crimson flare wing (like behind NETWORK in reference image)
+        if not compact:
+            ul_ang = math.pi - clamp(l_min - 0.12, -0.95, -0.18)
+            _add(red, _needle_poly(ul_ang, l_rt * 1.08, 22.0 * u_btn, back_anchor=18.0 * u_sprite), min_s=0.30)
+
+        # Piercing obsidian-black lower-left counter-spear (signature P5 contrast from image.png)
+        _add(black, _needle_poly(hero_ang + math.pi + 0.075, tail_len * 0.94,
+                                 (13.0 if compact else 18.0) * u_btn,
+                                 back_anchor=20.0 * u_sprite, offset_v=-5.0 * u_btn), min_s=0.28)
+        # Sleek secondary black accent dagger slicing under the right wing
+        br_ang = clamp(r_max + 0.08, 0.08, 0.92)
+        _add(black, _needle_poly(br_ang, r_rb * 0.90, 12.0 * u_btn,
+                                 back_anchor=16.0 * u_sprite), min_s=0.28)
+    else:
+        # Single-sided mode (edge / corner / single tab): orient hero stepped slash into open quadrant!
+        side = active_sides[0]
+        phi_min, phi_max, r_top, r_bot, n = side_info[side]
+        phi_mid = 0.5 * (phi_min + phi_max)
+        go_down = phi_mid > 0.14   # Top corners: fan hangs downward -> shoot slash diagonally DOWN-OUTWARD
+        if go_down:
+            local_phi = clamp(phi_max + (0.14 if n == 1 else 0.02), +0.18, +1.08)
+            lead_r = r_bot
+            flank_phi = clamp(phi_min - 0.12, -1.20, +0.90)
+            flank_r = r_top
+            step_sign = -1.0 if side > 0 else +1.0
         else:
-            r_top_c = min(r_top, max_r)
-            r_bot_c = min(r_bot, max_r)
-            # Top & bottom outer crimson crown spikes
-            _add(red, _spike_poly(side, max(-1.40, phi_min - 0.17), r_base, r_top_c * 1.11, 13.0 * u_btn, 7.0 * u_btn, -4.0 * u_btn))
-            _add(red, _spike_poly(side, min(+1.40, phi_max + 0.16), r_base, r_bot_c * 1.08, 12.0 * u_btn, 6.0 * u_btn, +4.0 * u_btn))
-            # Outer black flanking daggers
-            _add(black, _spike_poly(side, max(-1.38, phi_min - 0.09), r_base, r_top_c * 0.92, 8.5 * u_btn))
-            _add(black, _spike_poly(side, min(+1.38, phi_max + 0.09), r_base, r_bot_c * 0.89, 8.0 * u_btn))
+            local_phi = clamp(phi_min - (0.14 if n == 1 else 0.02), -1.08, -0.18)
+            lead_r = r_top
+            flank_phi = clamp(phi_max + 0.12, -0.90, +1.20)
+            flank_r = r_bot
+            step_sign = +1.0 if side > 0 else -1.0
 
-            # Interleaved crimson blades & obsidian daggers between adjacent buttons
-            for i in range(n - 1):
-                phi_mid = 0.5 * (rays[i][0] + rays[i + 1][0])
-                r_mid = min(0.5 * (rays[i][1] + rays[i + 1][1]), max_r)
-                skew = (-4.0 if i % 2 == 0 else +4.0) * u_btn
-                r_red_len = r_mid * (1.09 if i % 2 == 0 else 1.00)
-                w_out = (8.0 if i % 2 == 0 else 0.0) * u_btn
-                _add(red, _spike_poly(side, phi_mid + (0.025 if i % 2 == 0 else -0.025),
-                                      r_base, r_red_len, 12.0 * u_btn, w_out, skew))
-                if n <= 4 or i % 2 == 0 or i == n - 2:
-                    r_blk_len = r_mid * (0.94 if i % 2 == 0 else 0.84)
-                    _add(black, _spike_poly(side, phi_mid - (0.03 if i % 2 == 0 else -0.03),
-                                            r_base, r_blk_len, 8.0 * u_btn))
+        hero_ang = math.atan2(math.sin(local_phi), side * math.cos(local_phi))
+        flank_ang = math.atan2(math.sin(flank_phi), side * math.cos(flank_phi))
+        hero_len = min(max(lead_r * 1.46, 330.0 * u_btn), 520.0 * u_btn)
+        hero_w = (28.0 if n == 1 else 44.0) * u_btn
 
-    # Subtle compact back-spurs right behind Morgana's torso when single-sided so the burst stays anchored
-    if len(active_sides) == 1:
-        back_side = -active_sides[0]
-        rays = sorted(by_side[active_sides[0]], key=lambda item: item[0])
-        phi_mid = 0.5 * (rays[0][0] + rays[-1][0])
-        spur_r = 66.0 * u_sprite
-        _add(red,   _spike_poly(back_side, clamp(-phi_mid * 0.45 - 0.32, -1.1, 1.1), 8.0 * u_sprite, spur_r,        10.0 * u_sprite, 0.0), min_s=0.45)
-        _add(red,   _spike_poly(back_side, clamp(-phi_mid * 0.45 + 0.34, -1.1, 1.1), 8.0 * u_sprite, spur_r * 0.92,  9.0 * u_sprite, 0.0), min_s=0.45)
-        _add(black, _spike_poly(back_side, clamp(-phi_mid * 0.45,        -1.0, 1.0), 8.0 * u_sprite, spur_r * 0.80,  7.0 * u_sprite, 0.0), min_s=0.45)
+        # Hero stepped crimson lightning-spear shooting past the leading outer tab
+        _add(red, _stepped_slash_poly(hero_ang, hero_len, hero_w, step_sign=step_sign,
+                                      notch_t=0.61, back_anchor=24.0 * u_sprite), min_s=0.35)
+        # Compact opposite tail needle behind Morgana (auto ray-clipped cleanly inside corner/edge!)
+        _add(red, _needle_poly(hero_ang + math.pi, 130.0 * u_sprite, 15.0 * u_sprite,
+                               back_anchor=14.0 * u_sprite), min_s=0.35)
+        # Secondary crimson counter-slash framing the opposite edge of the fan
+        if n >= 2:
+            _add(red, _needle_poly(flank_ang, flank_r * 1.04, 18.0 * u_btn,
+                                   back_anchor=16.0 * u_sprite), min_s=0.30)
+
+        # Piercing obsidian-black counter-spears (one along tail/back, one slicing across flank)
+        _add(black, _needle_poly(hero_ang + math.pi + (0.09 if side > 0 else -0.09),
+                                 118.0 * u_sprite, 14.0 * u_sprite,
+                                 back_anchor=14.0 * u_sprite), min_s=0.35)
+        _add(black, _needle_poly(flank_ang + (-0.06 if go_down else +0.06),
+                                 flank_r * 0.88, 12.0 * u_btn,
+                                 back_anchor=16.0 * u_sprite), min_s=0.28)
 
     return red, black
 
@@ -2069,7 +2136,7 @@ def compute_radial_layout(
         for side, defs in sides_data:
             if not defs:
                 continue
-            slots = _RADIAL_BASE_SLOTS[min(7, len(defs))]
+            slots = _RADIAL_BASE_SLOTS[min(8, len(defs))]
             for (key, label, sub, _pref_side, hi), (oy_b, rot_up) in zip(defs, slots):
                 oy_final = oy_b + dy_b
                 ax = _radial_side_ax(oy_final)
@@ -2112,7 +2179,7 @@ def compute_radial_layout(
     # 4) Quadrant angle bias (keeps corners tightly hugged & radiating organically away from edges)
     max_base_rot = max(
         (abs(r) for n in (len(left_defs), len(right_defs)) if n > 0
-         for _, r in _RADIAL_BASE_SLOTS[min(7, n)]),
+         for _, r in _RADIAL_BASE_SLOTS[min(8, n)]),
         default=0.0,
     )
     max_bias = max(0.0, min(8.0, 30.0 - max_base_rot))
@@ -2292,13 +2359,14 @@ class RadialMenu(QWidget):
 
     # Master tab definitions: (key, label, subtitle, preferred_side, hi_idx)
     _TAB_DEFS: tuple[tuple[str, str, str, int, int], ...] = (
-        ("events", "EVENTS", "This Week",       -1, 2),
-        ("tasks",  "TASKS",  "To-Do List",      +1, 2),
-        ("timer",  "TIMER",  "Focus & Timers",  -1, 2),
-        ("notes",  "NOTES",  "Notebook",        +1, 2),
-        ("talk",   "TALK",   "Chat with Mona",  -1, 1),
-        ("stats",  "STATS",  "Social Stats",    +1, 2),
-        ("system", "SYSTEM", "Options & Sleep", -1, 2),
+        ("events",  "EVENTS",  "This Week",       -1, 2),
+        ("tasks",   "TASKS",   "To-Do List",      +1, 2),
+        ("timer",   "TIMER",   "Focus & Timers",  -1, 2),
+        ("notes",   "NOTES",   "Notebook",        +1, 2),
+        ("talk",    "TALK",    "Chat with Mona",  -1, 1),
+        ("stats",   "STATS",   "Social Stats",    +1, 2),
+        ("finance", "FINANCE", "Money & Budget",  +1, 2),
+        ("system",  "SYSTEM",  "Options & Sleep", -1, 2),
     )
 
     def __init__(self, pet: PetWindow) -> None:
@@ -3239,6 +3307,7 @@ class PetController(QObject):
         self.social_stats = SocialStatsStore(APP_DIR / "social_stats.json")
         self.local_events = LocalEventStore(APP_DIR / "local_events.json")
         self.habits = HabitStore(APP_DIR / "habits.json")
+        self.finance = FinanceStore(APP_DIR / "finance.json")
         self.screen_time = ScreenTimeStore(APP_DIR / "screen_time.json")
         self.awareness = AppAwarenessMonitor()
         self.dialogue_memory = DialogueMemoryStore(APP_DIR / "dialogue_memory.json")
@@ -3276,6 +3345,7 @@ class PetController(QObject):
         self.notes_dialog: NotesDialog | None = None
         self.events_dialog: EventsDialog | None = None
         self.stats_dialog: SocialStatsDialog | None = None
+        self.finance_dialog: FinanceDialog | None = None
         self.timer_dialog: TimerDialog | None = None
         self.settings_dialog: SettingsDialog | None = None
         self.briefing_dialog: BriefingDialog | None = None
@@ -4345,6 +4415,29 @@ class PetController(QObject):
             self.local_events.add(p["title"], p["start"])
             self._sync_events_view()
             self._sync_briefing_view()
+        elif res.kind == "add_finance":
+            p = res.payload
+            tx = self.finance.add_transaction(
+                tx_type=p.get("type", "expense"),
+                amount=p["amount"],
+                title=p.get("title", ""),
+                category=p.get("category", "Jajan"),
+                wallet=p.get("wallet", "Tunai"),
+                source="quick_cmd",
+            )
+            if self.finance_dialog is not None:
+                self.finance_dialog.refresh()
+            if tx is not None and tx["type"] == "expense":
+                today = date.today()
+                warn = self.finance.budget_warning(tx["category"], today.year, today.month)
+                if warn is not None:
+                    kind_w, ratio, spent, limit = warn
+                    pct = int(round(ratio * 100))
+                    res.reply += (
+                        f" Watch out—{tx['category']} is at {pct}% ({format_rupiah(spent)} / {format_rupiah(limit)})!"
+                        if kind_w == "warn"
+                        else f" Heads up—{tx['category']} just crossed its budget ({format_rupiah(spent)} / {format_rupiah(limit)})!"
+                    )
         elif res.kind == "start_focus":
             stat_arg = str(res.payload.get("stat") or "")
             if stat_arg:
@@ -4572,6 +4665,8 @@ class PetController(QObject):
             self._open_events()
         elif target == "stats":
             self._open_stats(announce=False)
+        elif target == "finance":
+            self._open_finance(announce=False)
         elif target == "timer":
             self._open_timer()
         elif target == "briefing":
@@ -4976,6 +5071,41 @@ class PetController(QObject):
         self._sync_briefing_view()
         self._sync_wrapup_view()
 
+    def _open_finance(self, announce: bool = True) -> None:
+        was_open = self.finance_dialog is not None and self.finance_dialog.isVisible()
+        if self.finance_dialog is None:
+            self.finance_dialog = FinanceDialog(self.finance, on_top=self.on_top, ui_scale=self.ui_scale)
+            self.finance_dialog.finance_changed.connect(self._on_finance_changed)
+            self.finance_dialog.open_settings.connect(self._open_settings_deferred)
+            self.finance_dialog.closed.connect(lambda: self._on_dialog_closed("finance"))
+        self.finance_dialog.refresh()
+        self.finance_dialog.show_near(self.pet.geometry())
+        if announce and not was_open and not self._rebuilding_ui:
+            self._say_tuple(self.dialogue.window_open("finance", self._ctx()), ms=4800)
+
+    def _on_finance_changed(self, kind: str, tx: dict) -> None:
+        if self._rebuilding_ui or kind not in ("add", "bill"):
+            return
+        if tx.get("type") == "expense" and tx.get("category"):
+            try:
+                d = date.fromisoformat(str(tx.get("date") or ""))
+            except ValueError:
+                d = date.today()
+            warn = self.finance.budget_warning(tx["category"], d.year, d.month)
+            if warn is not None:
+                level, ratio, spent, limit = warn
+                pct = int(round(ratio * 100))
+                if level == "over":
+                    self._say_tuple((
+                        f"Whoa! {tx['category']} just passed its monthly budget ({format_rupiah(spent)} / {format_rupiah(limit)})!",
+                        "surprised", "uwooh",
+                    ), ms=5600)
+                else:
+                    self._say_tuple((
+                        f"Careful! {tx['category']} is at {pct}% of this month's budget ({format_rupiah(spent)} / {format_rupiah(limit)}).",
+                        "neutral", "naa",
+                    ), ms=5000)
+
     def _open_timer(self) -> None:
         was_open = self.timer_dialog is not None and self.timer_dialog.isVisible()
         if self.timer_dialog is None:
@@ -4997,8 +5127,9 @@ class PetController(QObject):
     def _visible_dialog_rects(self) -> list[QRect]:
         rects: list[QRect] = []
         for dlg in (self.tasks_dialog, self.notes_dialog, self.events_dialog,
-                    self.stats_dialog, self.timer_dialog, self.settings_dialog,
-                    self.briefing_dialog, self.wrapup_dialog, self.quick_cmd_dialog):
+                    self.stats_dialog, self.finance_dialog, self.timer_dialog,
+                    self.settings_dialog, self.briefing_dialog, self.wrapup_dialog,
+                    self.quick_cmd_dialog):
             if dlg is not None and dlg.isVisible():
                 rects.append(dlg.geometry())
         return rects
@@ -5019,6 +5150,8 @@ class PetController(QObject):
             self._start_talk()
         elif key == "stats":
             self._open_stats()
+        elif key == "finance":
+            self._open_finance()
         elif key == "timer":
             self._open_timer()
         elif key == "system":
@@ -5274,8 +5407,8 @@ class PetController(QObject):
         # If any panel is open, center Settings over it so it's never buried
         shown = False
         for panel in (self.notes_dialog, self.tasks_dialog, self.events_dialog,
-                      self.stats_dialog, self.timer_dialog, self.briefing_dialog,
-                      self.wrapup_dialog):
+                      self.stats_dialog, self.finance_dialog, self.timer_dialog,
+                      self.briefing_dialog, self.wrapup_dialog):
             if panel is not None and panel.isVisible():
                 self.settings_dialog.show_near(panel.geometry(), prefer_center=True)
                 shown = True
@@ -5318,7 +5451,7 @@ class PetController(QObject):
         try:
             for key, attr in (("events", "events_dialog"), ("tasks", "tasks_dialog"),
                               ("notes", "notes_dialog"), ("stats", "stats_dialog"),
-                              ("timer", "timer_dialog")):
+                              ("finance", "finance_dialog"), ("timer", "timer_dialog")):
                 dlg = getattr(self, attr)
                 if key not in enabled_set and dlg is not None and dlg.isVisible():
                     dlg.on_closing()
@@ -5740,6 +5873,7 @@ class PetController(QObject):
         tm.addAction("EVENTS...", self._open_events)
         tm.addAction("TIMER & FOCUS...", self._open_timer)
         tm.addAction("SOCIAL STATS...", lambda: self._open_stats(announce=False))
+        tm.addAction("FINANCE...", lambda: self._open_finance(announce=False))
         tm.addSeparator()
 
         self.act_tray_sound = tm.addAction("SOUND EFFECTS")
@@ -5839,6 +5973,7 @@ class PetController(QObject):
                 ("notes_dialog", self._open_notes, True),
                 ("events_dialog", self._open_events, False),
                 ("stats_dialog", self._open_stats, False),
+                ("finance_dialog", self._open_finance, True),
                 ("timer_dialog", self._open_timer, False),
                 ("briefing_dialog", lambda: self._open_briefing(announce=False), False),
                 ("wrapup_dialog", lambda: self._open_wrapup(announce=False), False),
@@ -5894,8 +6029,9 @@ class PetController(QObject):
             self.pet.show()
         self._ensure_state_healthy()
         for dlg in (self.tasks_dialog, self.notes_dialog, self.events_dialog,
-                    self.stats_dialog, self.timer_dialog, self.settings_dialog,
-                    self.briefing_dialog, self.wrapup_dialog, self.quick_cmd_dialog):
+                    self.stats_dialog, self.finance_dialog, self.timer_dialog,
+                    self.settings_dialog, self.briefing_dialog, self.wrapup_dialog,
+                    self.quick_cmd_dialog):
             if dlg is not None:
                 dlg.set_on_top(on)
 

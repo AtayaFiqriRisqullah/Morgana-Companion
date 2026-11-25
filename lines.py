@@ -359,6 +359,12 @@ class ContextualDialogue:
                 (f"Nice momentum with {blocks} logs today! Ready to push for a Rank Up?", "wink", "hmm"),
             ])
 
+        if kind == "finance":
+            return self._pick("open_finance", [
+                ("Finance ledger open! Let's keep those wallets and budgets sharp!", "smug", "oh_asking"),
+                ("Checking your cash flow? Smart—Phantom Thieves always count their yen!", "wink", "hmm"),
+            ])
+
         if kind == "timer":
             if ctx.get("focus_running"):
                 rem = ctx.get("focus_rem", "")
@@ -424,6 +430,12 @@ class ContextualDialogue:
             return self._pick("close_stats", [
                 ("Keep stacking those habits and wins—that gold star will be maxed in no time!", "smug", "hmm"),
                 ("Nice work tracking your growth! Every point counts.", "wink", "hmm"),
+            ])
+
+        if kind == "finance":
+            return self._pick("close_finance", [
+                ("Books balanced! Tap FINANCE anytime you want to log a transaction.", "wink", "hmm"),
+                ("Ledger safely tucked away—watch that budget!", "smug", "hmm"),
             ])
 
         if kind == "timer":

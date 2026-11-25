@@ -9,6 +9,7 @@ Tanpa dependensi Qt, jadi mudah diuji terpisah. Fitur penting:
 """
 from __future__ import annotations
 
+import calendar
 import json
 import logging
 import os
@@ -980,19 +981,617 @@ class HabitStore(JsonListStore):
 
 
 # ---------------------------------------------------------------------------
+# Catatan Keuangan (finance.json) — terinspirasi alur bot-wa
+# ---------------------------------------------------------------------------
+FINANCE_CATEGORIES: tuple[str, ...] = (
+    "Jajan",
+    "Alat",
+    "Mingguan&Bulanan",
+    "Hiburan",
+)
+FINANCE_CATEGORY_SHORT: dict[str, str] = {
+    "Jajan": "JAJAN",
+    "Alat": "ALAT",
+    "Mingguan&Bulanan": "MINGGUAN",
+    "Hiburan": "HIBURAN",
+}
+FINANCE_CATEGORY_ALIASES: dict[str, str] = {
+    "jajan": "Jajan",
+    "snack": "Jajan",
+    "makan": "Jajan",
+    "food": "Jajan",
+    "kopi": "Jajan",
+    "alat": "Alat",
+    "gear": "Alat",
+    "tools": "Alat",
+    "mingguan": "Mingguan&Bulanan",
+    "bulanan": "Mingguan&Bulanan",
+    "mingguan&bulanan": "Mingguan&Bulanan",
+    "essentials": "Mingguan&Bulanan",
+    "hiburan": "Hiburan",
+    "fun": "Hiburan",
+    "entertainment": "Hiburan",
+}
+FINANCE_WALLETS: tuple[str, ...] = ("Tunai", "BNI", "Mandiri")
+FINANCE_WALLET_ALIASES: dict[str, str] = {
+    "tunai": "Tunai",
+    "cash": "Tunai",
+    "dompet": "Tunai",
+    "bni": "BNI",
+    "qris": "BNI",
+    "mandiri": "Mandiri",
+}
+FINANCE_TX_TYPES: tuple[str, ...] = ("expense", "income", "transfer")
+FINANCE_WARN_RATIO: float = 0.80
+FINANCE_MAX_AMOUNT: int = 999_999_999_999
+
+DEFAULT_FINANCE_SHORTCUTS: tuple[dict, ...] = (
+    {"name": "Galon",    "category": "Mingguan&Bulanan", "amount": 7000},
+    {"name": "Kopi",     "category": "Jajan",            "amount": None},
+    {"name": "Tempe",    "category": "Jajan",            "amount": None},
+    {"name": "Billiard", "category": "Hiburan",          "amount": None},
+)
+
+_RUPIAH_SUFFIX_RE = re.compile(r"^(\d+(?:[.,]\d+)?)\s*(jt|juta|m|rb|ribu|k)$", re.IGNORECASE)
+_RUPIAH_THOUS_RE = re.compile(r"^\d{1,3}(?:[.,]\d{3})+$")
+_RUPIAH_PLAIN_RE = re.compile(r"^\d+$")
+
+
+def parse_rupiah(text: str | int | float | None) -> int | None:
+    """Parse Indonesian Rupiah shorthand ('15rb', '1.5jt', '25k', 'Rp 25.000', '15000') -> int."""
+    if isinstance(text, bool) or text is None:
+        return None
+    if isinstance(text, int):
+        return text if 0 < text <= FINANCE_MAX_AMOUNT else None
+    if isinstance(text, float):
+        if text != text or text <= 0 or text > FINANCE_MAX_AMOUNT:
+            return None
+        val = int(round(text))
+        return val if 0 < val <= FINANCE_MAX_AMOUNT else None
+    raw = str(text).strip()
+    if not raw:
+        return None
+    raw = re.sub(r"^rp\.?\s*", "", raw, flags=re.IGNORECASE).strip()
+    if not raw or raw.startswith("-"):
+        return None
+    m = _RUPIAH_SUFFIX_RE.match(raw)
+    if m:
+        num_s = m.group(1).replace(",", ".")
+        suf = m.group(2).lower()
+        mult = 1_000_000 if suf in ("jt", "juta", "m") else 1_000
+        try:
+            val = int(round(float(num_s) * mult))
+        except ValueError:
+            return None
+        return val if 0 < val <= FINANCE_MAX_AMOUNT else None
+    if _RUPIAH_THOUS_RE.match(raw):
+        val = int(raw.replace(".", "").replace(",", ""))
+        return val if 0 < val <= FINANCE_MAX_AMOUNT else None
+    if _RUPIAH_PLAIN_RE.match(raw):
+        val = int(raw)
+        return val if 0 < val <= FINANCE_MAX_AMOUNT else None
+    return None
+
+
+def format_rupiah(amount: int | float) -> str:
+    """Format integer Rupiah cleanly with Indonesian dot thousand separators (e.g. Rp 15.000)."""
+    val = int(round(float(amount)))
+    sign = "-" if val < 0 else ""
+    digits = f"{abs(val):,}".replace(",", ".")
+    return f"{sign}Rp {digits}"
+
+
+def normalize_finance_category(value: str | None) -> str:
+    if not value:
+        return "Jajan"
+    low = str(value).strip().lower()
+    if low in FINANCE_CATEGORY_ALIASES:
+        return FINANCE_CATEGORY_ALIASES[low]
+    for cat in FINANCE_CATEGORIES:
+        if cat.lower() == low:
+            return cat
+    return "Jajan"
+
+
+def normalize_finance_wallet(value: str | None) -> str:
+    if not value:
+        return "Tunai"
+    low = str(value).strip().lower()
+    if low in FINANCE_WALLET_ALIASES:
+        return FINANCE_WALLET_ALIASES[low]
+    for w in FINANCE_WALLETS:
+        if w.lower() == low:
+            return w
+    return "Tunai"
+
+
+class FinanceStore:
+    """Local personal finance ledger (transactions, budgets, shortcuts & monthly bills)."""
+
+    MAX_TRANSACTIONS = 3000
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+        self._transactions: list[dict] = []
+        self._budgets: dict[str, int] = {}
+        self._shortcuts: list[dict] = [dict(s) for s in DEFAULT_FINANCE_SHORTCUTS]
+        self._bills: list[dict] = []
+        self.last_error = ""
+        self.load()
+
+    def load(self) -> None:
+        self._transactions = []
+        self._budgets = {}
+        self._shortcuts = [dict(s) for s in DEFAULT_FINANCE_SHORTCUTS]
+        self._bills = []
+        if not self.path.is_file():
+            return
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                raise ValueError("bukan objek JSON")
+        except (OSError, ValueError) as exc:
+            log.warning("Gagal membaca %s: %s", self.path.name, exc)
+            backup_corrupt(self.path)
+            return
+
+        tx_list = raw.get("transactions")
+        if isinstance(tx_list, list):
+            for item in tx_list:
+                cleaned = self._clean_tx(item)
+                if cleaned is not None:
+                    self._transactions.append(cleaned)
+            self._transactions = self._transactions[-self.MAX_TRANSACTIONS:]
+
+        raw_budgets = raw.get("budgets")
+        if isinstance(raw_budgets, dict):
+            for k, v in raw_budgets.items():
+                cat = normalize_finance_category(k)
+                amt = parse_rupiah(v)
+                if amt is not None:
+                    self._budgets[cat] = amt
+
+        raw_sc = raw.get("shortcuts")
+        if isinstance(raw_sc, list):
+            cleaned_sc: list[dict] = []
+            seen: set[str] = set()
+            for item in raw_sc:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or "").strip()[:40]
+                if not name or name.lower() in seen:
+                    continue
+                seen.add(name.lower())
+                amt = parse_rupiah(item.get("amount")) if item.get("amount") is not None else None
+                cleaned_sc.append({
+                    "name": name,
+                    "category": normalize_finance_category(item.get("category")),
+                    "amount": amt,
+                })
+            self._shortcuts = cleaned_sc
+
+        raw_bills = raw.get("bills")
+        if isinstance(raw_bills, list):
+            for item in raw_bills:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or "").strip()[:60]
+                amt = parse_rupiah(item.get("amount"))
+                if not name or amt is None:
+                    continue
+                try:
+                    due_day = max(1, min(31, int(item.get("day", 1))))
+                except (TypeError, ValueError):
+                    due_day = 1
+                paid_raw = item.get("paid_months")
+                paid_months = sorted({
+                    str(m).strip() for m in (paid_raw if isinstance(paid_raw, list) else [])
+                    if re.match(r"^\d{4}-\d{2}$", str(m).strip())
+                })[-24:]
+                self._bills.append({
+                    "id": str(item.get("id") or uuid.uuid4().hex[:8]),
+                    "name": name,
+                    "day": due_day,
+                    "amount": amt,
+                    "category": normalize_finance_category(item.get("category")),
+                    "wallet": normalize_finance_wallet(item.get("wallet")),
+                    "paid_months": paid_months,
+                })
+
+    @staticmethod
+    def _clean_tx(raw: object) -> dict | None:
+        if not isinstance(raw, dict):
+            return None
+        tx_type = str(raw.get("type") or "expense").strip().lower()
+        if tx_type not in FINANCE_TX_TYPES:
+            return None
+        amt = parse_rupiah(raw.get("amount"))
+        if amt is None:
+            return None
+        day_s = str(raw.get("date") or "").strip()
+        try:
+            date.fromisoformat(day_s)
+        except ValueError:
+            day_s = date.today().isoformat()
+        wallet = normalize_finance_wallet(raw.get("wallet"))
+        to_wallet = normalize_finance_wallet(raw.get("to_wallet")) if tx_type == "transfer" else ""
+        if tx_type == "transfer" and to_wallet == wallet:
+            return None
+        category = normalize_finance_category(raw.get("category")) if tx_type == "expense" else ""
+        title = str(raw.get("title") or "").strip()[:120]
+        if not title:
+            title = f"Transfer {wallet} -> {to_wallet}" if tx_type == "transfer" else ("Income" if tx_type == "income" else category)
+        return {
+            "id": str(raw.get("id") or uuid.uuid4().hex[:8]),
+            "type": tx_type,
+            "amount": amt,
+            "title": title,
+            "category": category,
+            "wallet": wallet,
+            "to_wallet": to_wallet,
+            "date": day_s,
+            "created": str(raw.get("created") or now_iso()),
+            "source": str(raw.get("source") or "manual")[:24],
+        }
+
+    def save(self) -> bool:
+        payload = {
+            "transactions": self._transactions[-self.MAX_TRANSACTIONS:],
+            "budgets": dict(self._budgets),
+            "shortcuts": list(self._shortcuts),
+            "bills": list(self._bills),
+        }
+        ok, err = write_json_atomic(self.path, payload)
+        self.last_error = err
+        return ok
+
+    # -- Transactions --------------------------------------------------------
+    def all_transactions(self) -> list[dict]:
+        return [dict(t) for t in self._transactions]
+
+    def get_transaction(self, tx_id: str) -> dict | None:
+        for t in self._transactions:
+            if t["id"] == tx_id:
+                return dict(t)
+        return None
+
+    def add_transaction(
+        self,
+        tx_type: str,
+        amount: int | str,
+        title: str,
+        category: str = "Jajan",
+        wallet: str = "Tunai",
+        to_wallet: str = "",
+        day: str | None = None,
+        source: str = "manual",
+        _save: bool = True,
+    ) -> dict | None:
+        kind = str(tx_type or "expense").strip().lower()
+        if kind not in FINANCE_TX_TYPES:
+            return None
+        amt = parse_rupiah(amount)
+        if amt is None:
+            return None
+        w_from = normalize_finance_wallet(wallet)
+        w_to = normalize_finance_wallet(to_wallet) if kind == "transfer" else ""
+        if kind == "transfer" and w_to == w_from:
+            return None
+        cat = normalize_finance_category(category) if kind == "expense" else ""
+        day_s = (day or date.today().isoformat()).strip()
+        try:
+            date.fromisoformat(day_s)
+        except ValueError:
+            day_s = date.today().isoformat()
+        clean_title = (title or "").strip()[:120]
+        if not clean_title:
+            if kind == "transfer":
+                clean_title = f"Transfer {w_from} -> {w_to}"
+            elif kind == "income":
+                clean_title = f"Income ({w_from})"
+            else:
+                clean_title = cat
+        entry = {
+            "id": uuid.uuid4().hex[:8],
+            "type": kind,
+            "amount": amt,
+            "title": clean_title,
+            "category": cat,
+            "wallet": w_from,
+            "to_wallet": w_to,
+            "date": day_s,
+            "created": now_iso(),
+            "source": str(source or "manual")[:24],
+        }
+        self._transactions.append(entry)
+        if len(self._transactions) > self.MAX_TRANSACTIONS:
+            self._transactions = self._transactions[-self.MAX_TRANSACTIONS:]
+        if _save:
+            self.save()
+        return dict(entry)
+
+    def update_transaction(
+        self,
+        tx_id: str,
+        tx_type: str,
+        amount: int | str,
+        title: str,
+        category: str = "Jajan",
+        wallet: str = "Tunai",
+        to_wallet: str = "",
+        day: str | None = None,
+    ) -> tuple[dict | None, dict | None]:
+        """Update an existing transaction in-place; returns (updated, prev_snapshot)."""
+        kind = str(tx_type or "expense").strip().lower()
+        amt = parse_rupiah(amount)
+        if kind not in FINANCE_TX_TYPES or amt is None:
+            return None, None
+        w_from = normalize_finance_wallet(wallet)
+        w_to = normalize_finance_wallet(to_wallet) if kind == "transfer" else ""
+        if kind == "transfer" and w_to == w_from:
+            return None, None
+        cat = normalize_finance_category(category) if kind == "expense" else ""
+        for entry in self._transactions:
+            if entry["id"] != tx_id:
+                continue
+            prev = dict(entry)
+            day_s = (day or entry["date"]).strip()
+            try:
+                date.fromisoformat(day_s)
+            except ValueError:
+                day_s = entry["date"]
+            clean_title = (title or "").strip()[:120]
+            if not clean_title:
+                clean_title = f"Transfer {w_from} -> {w_to}" if kind == "transfer" else (cat or "Income")
+            entry["type"] = kind
+            entry["amount"] = amt
+            entry["title"] = clean_title
+            entry["category"] = cat
+            entry["wallet"] = w_from
+            entry["to_wallet"] = w_to
+            entry["date"] = day_s
+            self.save()
+            return dict(entry), prev
+        return None, None
+
+    def delete_transaction(self, tx_id: str) -> dict | None:
+        for i, entry in enumerate(self._transactions):
+            if entry["id"] == tx_id:
+                removed = self._transactions.pop(i)
+                self.save()
+                return dict(removed)
+        return None
+
+    def restore_transaction(self, entry: dict) -> dict | None:
+        cleaned = self._clean_tx(entry)
+        if cleaned is None:
+            return None
+        for i, existing in enumerate(self._transactions):
+            if existing["id"] == cleaned["id"]:
+                self._transactions[i] = cleaned
+                self.save()
+                return dict(cleaned)
+        self._transactions.append(cleaned)
+        self._transactions.sort(key=lambda x: (x.get("date", ""), x.get("created", "")))
+        self.save()
+        return dict(cleaned)
+
+    def month_transactions(self, year: int, month: int) -> list[dict]:
+        prefix = f"{int(year):04d}-{int(month):02d}-"
+        items = [dict(t) for t in self._transactions if t["date"].startswith(prefix)]
+        items.sort(key=lambda x: (x.get("date", ""), x.get("created", "")), reverse=True)
+        return items
+
+    def wallet_balances(self) -> dict[str, int]:
+        bal: dict[str, int] = {w: 0 for w in FINANCE_WALLETS}
+        for t in self._transactions:
+            amt = t["amount"]
+            kind = t["type"]
+            w = t["wallet"]
+            if kind == "income":
+                bal[w] = bal.get(w, 0) + amt
+            elif kind == "expense":
+                bal[w] = bal.get(w, 0) - amt
+            elif kind == "transfer":
+                bal[w] = bal.get(w, 0) - amt
+                tw = t.get("to_wallet") or ""
+                if tw in bal:
+                    bal[tw] += amt
+        bal["Total"] = sum(bal[w] for w in FINANCE_WALLETS)
+        return bal
+
+    def month_summary(self, year: int, month: int, today: date | None = None) -> dict:
+        prefix = f"{int(year):04d}-{int(month):02d}-"
+        today_s = (today or date.today()).isoformat()
+        income = 0
+        expense = 0
+        today_expense = 0
+        count = 0
+        by_cat: dict[str, int] = {c: 0 for c in FINANCE_CATEGORIES}
+        for t in self._transactions:
+            if not t["date"].startswith(prefix):
+                continue
+            count += 1
+            amt = t["amount"]
+            if t["type"] == "income":
+                income += amt
+            elif t["type"] == "expense":
+                expense += amt
+                cat = t.get("category") or "Jajan"
+                by_cat[cat] = by_cat.get(cat, 0) + amt
+                if t["date"] == today_s:
+                    today_expense += amt
+        return {
+            "income": income,
+            "expense": expense,
+            "net": income - expense,
+            "today_expense": today_expense,
+            "by_category": by_cat,
+            "count": count,
+        }
+
+    # -- Monthly Budgets (/batas) --------------------------------------------
+    def budgets(self) -> dict[str, int]:
+        return dict(self._budgets)
+
+    def set_budget(self, category: str, amount: int | str | None) -> bool:
+        cat = normalize_finance_category(category)
+        if amount is None or str(amount).strip() == "":
+            self._budgets.pop(cat, None)
+            self.save()
+            return True
+        amt = parse_rupiah(amount)
+        if amt is None:
+            return False
+        self._budgets[cat] = amt
+        self.save()
+        return True
+
+    def budget_warning(self, category: str, year: int, month: int) -> tuple[str, float, int, int] | None:
+        """Return ('over'|'warn', ratio, spent, limit) when category spend >= 80% of budget."""
+        cat = normalize_finance_category(category)
+        limit = self._budgets.get(cat)
+        if not limit or limit <= 0:
+            return None
+        spent = self.month_summary(year, month)["by_category"].get(cat, 0)
+        ratio = spent / float(limit)
+        if ratio >= 1.0:
+            return ("over", ratio, spent, limit)
+        if ratio >= FINANCE_WARN_RATIO:
+            return ("warn", ratio, spent, limit)
+        return None
+
+    # -- Quick Shortcuts (/pintasan) -----------------------------------------
+    def shortcuts(self) -> list[dict]:
+        return [dict(s) for s in self._shortcuts]
+
+    def add_shortcut(self, name: str, category: str = "Jajan",
+                     amount: int | str | None = None) -> dict | None:
+        clean = (name or "").strip()[:40]
+        if not clean:
+            return None
+        cat = normalize_finance_category(category)
+        amt = parse_rupiah(amount) if (amount is not None and str(amount).strip() != "") else None
+        if amount is not None and str(amount).strip() != "" and amt is None:
+            return None
+        entry = {"name": clean, "category": cat, "amount": amt}
+        for i, sc in enumerate(self._shortcuts):
+            if sc["name"].lower() == clean.lower():
+                self._shortcuts[i] = entry
+                self.save()
+                return dict(entry)
+        self._shortcuts.append(entry)
+        self.save()
+        return dict(entry)
+
+    def delete_shortcut(self, name: str) -> bool:
+        low = (name or "").strip().lower()
+        before = len(self._shortcuts)
+        self._shortcuts = [s for s in self._shortcuts if s["name"].lower() != low]
+        if len(self._shortcuts) != before:
+            self.save()
+            return True
+        return False
+
+    # -- Recurring Monthly Bills (/tagihan) ----------------------------------
+    def bills(self) -> list[dict]:
+        items = [dict(b, paid_months=list(b.get("paid_months", []))) for b in self._bills]
+        items.sort(key=lambda b: (b["day"], b["name"].lower()))
+        return items
+
+    @staticmethod
+    def is_bill_paid(bill: dict, year: int, month: int) -> bool:
+        ym = f"{int(year):04d}-{int(month):02d}"
+        return ym in (bill.get("paid_months") or ())
+
+    def add_bill(
+        self, name: str, day: int, amount: int | str,
+        category: str = "Mingguan&Bulanan", wallet: str = "BNI",
+    ) -> dict | None:
+        clean = (name or "").strip()[:60]
+        amt = parse_rupiah(amount)
+        if not clean or amt is None:
+            return None
+        try:
+            due_day = max(1, min(31, int(day)))
+        except (TypeError, ValueError):
+            due_day = 1
+        bill = {
+            "id": uuid.uuid4().hex[:8],
+            "name": clean,
+            "day": due_day,
+            "amount": amt,
+            "category": normalize_finance_category(category),
+            "wallet": normalize_finance_wallet(wallet),
+            "paid_months": [],
+        }
+        self._bills.append(bill)
+        self.save()
+        return dict(bill)
+
+    def delete_bill(self, bill_id: str) -> bool:
+        before = len(self._bills)
+        self._bills = [b for b in self._bills if b["id"] != bill_id]
+        if len(self._bills) != before:
+            self.save()
+            return True
+        return False
+
+    def pay_bill(
+        self, bill_id: str, year: int, month: int,
+        amount_override: int | str | None = None,
+    ) -> tuple[dict | None, dict | None]:
+        """Record an expense transaction for a bill and mark it paid for (year, month)."""
+        ym = f"{int(year):04d}-{int(month):02d}"
+        for bill in self._bills:
+            if bill["id"] != bill_id:
+                continue
+            amt = parse_rupiah(amount_override) if amount_override is not None else bill["amount"]
+            if amt is None:
+                return None, None
+            today = date.today()
+            if today.year == year and today.month == month:
+                pay_day = today.isoformat()
+            else:
+                last_d = calendar.monthrange(year, month)[1]
+                pay_day = date(year, month, min(bill["day"], last_d)).isoformat()
+            tx = self.add_transaction(
+                tx_type="expense",
+                amount=amt,
+                title=bill["name"],
+                category=bill["category"],
+                wallet=bill["wallet"],
+                day=pay_day,
+                source="bill",
+                _save=False,
+            )
+            if tx is None:
+                return None, None
+            paid = list(bill.get("paid_months", []))
+            if ym not in paid:
+                paid.append(ym)
+                bill["paid_months"] = sorted(paid)[-24:]
+            self.save()
+            return dict(bill), tx
+        return None, None
+
+
+# ---------------------------------------------------------------------------
 # Pengaturan (settings.json)
 # ---------------------------------------------------------------------------
 RADIAL_TABS: tuple[tuple[str, str], ...] = (
-    ("events", "Events (7-Day Calendar)"),
-    ("tasks",  "Tasks (To-Do List)"),
-    ("timer",  "Timer (Focus & Manual)"),
-    ("notes",  "Notes (Knowledge Base)"),
-    ("talk",   "Talk (Choice Chat)"),
-    ("stats",  "Social Stats"),
-    ("system", "System Menu"),
+    ("events",  "Events (7-Day Calendar)"),
+    ("tasks",   "Tasks (To-Do List)"),
+    ("timer",   "Timer (Focus & Manual)"),
+    ("notes",   "Notes (Knowledge Base)"),
+    ("talk",    "Talk (Choice Chat)"),
+    ("stats",   "Social Stats"),
+    ("finance", "Finance (Money & Budget)"),
+    ("system",  "System Menu"),
 )
 RADIAL_TAB_KEYS: tuple[str, ...] = tuple(k for k, _ in RADIAL_TABS)
 _LEGACY_6_TABS = frozenset({"events", "tasks", "timer", "notes", "stats", "system"})
+_LEGACY_7_TABS = frozenset({"events", "tasks", "timer", "notes", "talk", "stats", "system"})
 
 QUICK_HOTKEY_PRESETS: tuple[str, ...] = (
     "Ctrl+Shift+M",
@@ -1046,6 +1645,7 @@ SETTINGS_DEFAULTS = {
     "sheets_sync_key_path": "",         # Path to Service Account JSON (optional if placed beside app)
     "last_briefing_date": "",           # YYYY-MM-DD of last auto-delivered Daily Briefing
     "last_wrapup_date": "",             # YYYY-MM-DD of last auto-delivered Evening Wrap-up
+    "finance_tab_migrated": True,       # Tracks one-time upgrade from legacy 7-tab radial defaults
     "enabled_tabs": list(RADIAL_TAB_KEYS),  # Active tabs shown in Morgana's radial menu
 }
 _INT_RANGES = {
@@ -1077,6 +1677,7 @@ _BOOL_KEYS = (
     "ai_enabled",
     "ai_dialogue_enabled",
     "sheets_sync_enabled",
+    "finance_tab_migrated",
 )
 _STR_KEYS = (
     "ai_endpoint",
@@ -1154,9 +1755,12 @@ class SettingsStore:
                     patch["voice_volume"] = int(old_v)
                 if "sfx_volume" not in raw:
                     patch["sfx_volume"] = int(old_v)
-        # Upgrade default 6-tab configs cleanly to include the new `talk` tab on first v1.3 load
+        # Upgrade default 6-tab / 7-tab configs cleanly to include new radial tabs once
         if "app_awareness_enabled" not in raw and isinstance(patch.get("enabled_tabs"), list):
             if set(str(x).lower() for x in patch["enabled_tabs"]) == _LEGACY_6_TABS:
+                patch["enabled_tabs"] = list(RADIAL_TAB_KEYS)
+        if "finance_tab_migrated" not in raw and isinstance(patch.get("enabled_tabs"), list):
+            if set(str(x).lower() for x in patch["enabled_tabs"]) == _LEGACY_7_TABS:
                 patch["enabled_tabs"] = list(RADIAL_TAB_KEYS)
         # Smooth upgrade from v1.4.0/v1.4.1 -> current Gemini 3.5 Flash-Lite
         if "ai_provider" not in raw:
