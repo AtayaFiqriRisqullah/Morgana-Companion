@@ -769,6 +769,16 @@ def parse_and_plan(raw_text: str, ctx: dict | None = None,
                 },
             )
 
+    if re.match(r"^(?:/?(?:saldo|balance|cek\s+saldo|my\s+balance|duit|uang))$", low):
+        return CommandResult(
+            kind="finance_balance",
+            reply="Checking your current wallet balances...",
+            emotion="neutral",
+            badge="FINANCE",
+            action_label="OPEN FINANCE",
+            action_target="finance",
+        )
+
     # 6) DND / Sound / Sleep / Show-Hide toggles
     if re.match(r"^(?:/?dnd|do\s+not\s+disturb|quiet(?:\s+mode)?)(?:\s+(on|off|toggle))?$", low):
         parts = low.split()

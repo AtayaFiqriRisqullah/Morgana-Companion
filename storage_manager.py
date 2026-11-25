@@ -1663,6 +1663,7 @@ SETTINGS_DEFAULTS = {
     "ai_dialogue_enabled": True,        # Use AI for Talk / Choice Prompts & live app reactions
     "sheets_sync_enabled": False,       # Opt-in write-only Google Sheets task deadline sync (WhatsApp relay)
     "finance_sheets_enabled": False,    # Opt-in Google Sheets Finance sync (bot-wa Monthly Budget tabs)
+    "finance_sheets_migrated": True,    # Tracks one-time upgrade for existing Google Sheets users
     "sheets_sync_id": "",               # Google Spreadsheet ID or URL shared with Service Account
     "sheets_sync_tab": "Morgana",       # Dedicated worksheet tab name for synced deadlines
     "sheets_sync_key_path": "",         # Path to Service Account JSON (optional if placed beside app)
@@ -1701,6 +1702,7 @@ _BOOL_KEYS = (
     "ai_dialogue_enabled",
     "sheets_sync_enabled",
     "finance_sheets_enabled",
+    "finance_sheets_migrated",
     "finance_tab_migrated",
 )
 _STR_KEYS = (
@@ -1786,6 +1788,13 @@ class SettingsStore:
         if "finance_tab_migrated" not in raw and isinstance(patch.get("enabled_tabs"), list):
             if set(str(x).lower() for x in patch["enabled_tabs"]) == _LEGACY_7_TABS:
                 patch["enabled_tabs"] = list(RADIAL_TAB_KEYS)
+        # Upgrade existing Google Sheets users (who already connected Monthly Budget) to Finance Sheets sync once
+        migrated_finance_sheets = False
+        if "finance_sheets_migrated" not in raw:
+            if bool(raw.get("sheets_sync_enabled")) and str(raw.get("sheets_sync_id") or "").strip():
+                patch["finance_sheets_enabled"] = True
+                migrated_finance_sheets = True
+            patch["finance_sheets_migrated"] = True
         # Smooth upgrade from v1.4.0/v1.4.1 -> current Gemini 3.5 Flash-Lite
         if "ai_provider" not in raw:
             if bool(raw.get("ai_enabled")):
@@ -1796,7 +1805,7 @@ class SettingsStore:
         elif str(patch.get("ai_provider") or raw.get("ai_provider") or "gemini").strip().lower() == "gemini":
             if str(patch.get("ai_model") or "").strip().lower() in ("gemini-2.5-flash", "gemini-2.0-flash"):
                 patch["ai_model"] = "gemini-3.5-flash-lite"
-        self.set(save=False, **patch)
+        self.set(save=migrated_finance_sheets, **patch)
 
     def set(self, save: bool = True, **values) -> None:
         # Accept legacy curfew_interval_min keyword cleanly

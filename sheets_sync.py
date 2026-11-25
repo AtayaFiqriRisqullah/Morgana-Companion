@@ -235,6 +235,49 @@ def _create_tab(service, sheet_id: str, tab_name: str, HttpError) -> None:
             raise
 
 
+def _format_rupiah_plain(amount: int) -> str:
+    sign = "-" if amount < 0 else ""
+    return f"{sign}Rp {abs(int(amount)):,}".replace(",", ".")
+
+
+_ENGLISH_MONTH_TABS: tuple[str, ...] = (
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+)
+
+
+def _match_month_tab(existing_tabs: list[str] | set[str], month: int) -> str | None:
+    """Match a worksheet tab for `month` (1..12), tolerant of case, whitespace, Indonesian & English names."""
+    idx = (int(month) - 1) % 12
+    id_name = FINANCE_MONTH_TABS[idx].lower()
+    en_name = _ENGLISH_MONTH_TABS[idx].lower()
+    prefixes = {id_name[:3], en_name[:3]}
+    tabs_list = [str(t) for t in existing_tabs if str(t).strip()]
+    # 1. Exact Indonesian / English match (case & surrounding whitespace insensitive)
+    for t in tabs_list:
+        low = t.strip().lower()
+        if low == id_name or low == en_name:
+            return t
+    # 2. Prefix match (e.g. 'Nov', 'Okt', 'November 2026')
+    for t in tabs_list:
+        low = t.strip().lower()
+        first = low.split()[0] if low else ""
+        if first in prefixes or low.startswith(id_name) or low.startswith(en_name):
+            return t
+    return None
+
+
+def _month_tabs_in(existing_tabs: list[str] | set[str]) -> list[str]:
+    """Return worksheet tabs that match any calendar month, preserving spreadsheet order."""
+    out: list[str] = []
+    for t in existing_tabs:
+        for m in range(1, 13):
+            if _match_month_tab([t], m) is not None:
+                out.append(str(t))
+                break
+    return out
+
+
 def test_sheets_connection(
     cfg: SheetsSyncConfig,
     base_dir: Path,
@@ -260,10 +303,11 @@ def test_sheets_connection(
             fields="properties.title,sheets.properties.title",
         ).execute()
         doc_title = str((meta.get("properties") or {}).get("title") or "Spreadsheet")
-        existing_tabs = {
+        existing_list = [
             str((s.get("properties") or {}).get("title") or "")
             for s in (meta.get("sheets") or ())
-        }
+        ]
+        existing_tabs = set(existing_list)
         notes: list[str] = []
         if check_tasks or not check_finance:
             created_note = ""
@@ -278,11 +322,30 @@ def test_sheets_connection(
                 created_note = " (created)"
             notes.append(f"Tasks tab '{tab}' ready{created_note}")
         if check_finance:
-            fin_tab = month_tab_name(date.today().month)
-            if fin_tab in existing_tabs:
-                notes.append(f"Finance tab '{fin_tab}' ready")
+            cur_month = date.today().month
+            matched = _match_month_tab(existing_list, cur_month)
+            if matched is not None:
+                bal_note = ""
+                try:
+                    snap = service.spreadsheets().values().batchGet(
+                        spreadsheetId=sheet_id,
+                        ranges=[_a1_range(matched, FINANCE_SUMMARY_RANGE), _a1_range(matched, FINANCE_BANK_BAL_RANGE)],
+                        valueRenderOption="UNFORMATTED_VALUE",
+                    ).execute()
+                    vrs = snap.get("valueRanges") or []
+                    b0 = (vrs[0].get("values") or []) if len(vrs) > 0 else []
+                    b1 = (vrs[1].get("values") or []) if len(vrs) > 1 else []
+                    h_map = {str(r[0]).strip().lower(): float(r[1]) for r in b0 if len(r) >= 2 and _is_number(r[1])}
+                    k_map = {str(r[0]).strip().lower(): float(r[1]) for r in b1 if len(r) >= 2 and _is_number(r[1])}
+                    tot = int(round(h_map.get("sisa uang", 0.0) + k_map.get("bni", 0.0) + k_map.get("mandiri", 0.0)))
+                    bal_note = f" ({_format_rupiah_plain(tot)})"
+                except Exception:
+                    pass
+                notes.append(f"Finance tab '{matched}' ready{bal_note}")
             else:
-                notes.append(f"Finance tab '{fin_tab}' not found yet")
+                avail = _month_tabs_in(existing_list)
+                avail_hint = f" (found: {', '.join(avail[-4:])})" if avail else ""
+                notes.append(f"Finance tab '{month_tab_name(cur_month)}' not found yet{avail_hint}")
         return True, f"Connected · '{doc_title}' · " + " · ".join(notes)
     except HttpError as exc:
         return False, _friendly_http_error(exc, client_email)
@@ -362,6 +425,8 @@ class FinanceSheetMonthData:
     balances: dict[str, int] = field(default_factory=dict)
     summary: dict = field(default_factory=dict)
     transactions: list[dict] = field(default_factory=list)
+    synced_at: str = ""
+    available_tabs: list[str] = field(default_factory=list)
     error: str = ""
 
 
@@ -449,9 +514,17 @@ def _is_missing_tab_error(exc) -> bool:
     return status == 400 and ("unable to parse range" in txt or "not found" in txt)
 
 
-def _friendly_finance_http_error(exc, client_email: str, tab: str) -> str:
+def _friendly_finance_http_error(exc, client_email: str, tab: str, avail: list[str] | None = None) -> str:
     if _is_missing_tab_error(exc):
+        if avail:
+            return f"Tab '{tab}' not found. Available tabs: {', '.join(avail)}."
         return f"Tab '{tab}' not found in spreadsheet. Create the '{tab}' sheet tab first."
+    status = int(getattr(getattr(exc, "resp", None), "status", 0) or 0)
+    if status == 400:
+        detail = str(exc)
+        if "exceeds grid limits" in detail.lower():
+            return f"Tab '{tab}' grid range error (HTTP 400) — check tab rows/columns."
+        return f"Google Sheets rejected range on '{tab}' (HTTP 400)."
     return _friendly_http_error(exc, client_email)
 
 
@@ -495,6 +568,35 @@ def _strip_transfer_note(label: str) -> str:
     return ""
 
 
+def _resolve_finance_tab_or_list(service, sheet_id: str, month: int) -> tuple[str | None, list[str]]:
+    """Inspect spreadsheet tabs and match `month` (handles trailing spaces, casing, EN/ID names)."""
+    meta = service.spreadsheets().get(
+        spreadsheetId=sheet_id,
+        fields="sheets.properties.title",
+    ).execute()
+    titles = [
+        str((s.get("properties") or {}).get("title") or "")
+        for s in (meta.get("sheets") or ())
+    ]
+    return _match_month_tab(titles, month), _month_tabs_in(titles)
+
+
+def _finance_batch_ranges(tab: str) -> list[str]:
+    """Build open-ended ranges safe for any sheet row count (never triggers HTTP 400 grid limits)."""
+    ranges = [
+        _a1_range(tab, FINANCE_SUMMARY_RANGE),    # 0: G9:H12 (Hasil Akhir)
+        _a1_range(tab, FINANCE_BANK_BAL_RANGE),   # 1: K9:L12 (Sisa Saldo Bank — Okt/Nov+)
+        _a1_range(tab, "P9:Q12"),                 # 2: P9:Q12 (Aktivitas Bank — fallback for Sep)
+    ]
+    for cat in FINANCE_SHEET_CAT_COLS:
+        col_a, col_c = FINANCE_SHEET_CAT_COLS[cat]
+        ranges.append(_a1_range(tab, f"{col_a}{FINANCE_EXPENSE_TOTAL_ROW}:{col_c}"))  # 3..6: open-ended!
+    ranges.append(_a1_range(tab, "B9:D34"))       # 7: Pemasukan B9:D31 + legacy Agustus B16:D34 check
+    ranges.append(_a1_range(tab, "T8:V31"))       # 8: Pemasukan Bank T10:V31 (with header check T8)
+    ranges.append(_a1_range(tab, "S8:U31"))       # 9: Legacy Pemasukan Bank S9:U31 (September)
+    return ranges
+
+
 def fetch_finance_month_from_sheets(
     cfg: SheetsSyncConfig,
     base_dir: Path,
@@ -517,26 +619,40 @@ def fetch_finance_month_from_sheets(
         return FinanceSheetMonthData(ok=False, tab=tab, year=year, month=month, error=err)
 
     cat_names = list(FINANCE_SHEET_CAT_COLS.keys())
-    ranges = [
-        _a1_range(tab, FINANCE_SUMMARY_RANGE),
-        _a1_range(tab, FINANCE_BANK_BAL_RANGE),
-    ]
-    for cat in cat_names:
-        col_a, col_c = FINANCE_SHEET_CAT_COLS[cat]
-        ranges.append(_a1_range(tab, f"{col_a}{FINANCE_EXPENSE_TOTAL_ROW}:{col_c}{FINANCE_EXPENSE_ROW_END}"))
-    ranges.append(_a1_range(tab, f"B{FINANCE_INCOME_ROW_START}:D{FINANCE_INCOME_ROW_END}"))
-    ranges.append(_a1_range(tab, f"T{FINANCE_BANK_ROW_START}:V{FINANCE_BANK_ROW_END}"))
+    avail_tabs: list[str] = []
 
     try:
-        resp = service.spreadsheets().values().batchGet(
-            spreadsheetId=sheet_id,
-            ranges=ranges,
-            valueRenderOption="UNFORMATTED_VALUE",
-        ).execute()
+        ranges = _finance_batch_ranges(tab)
+        try:
+            resp = service.spreadsheets().values().batchGet(
+                spreadsheetId=sheet_id,
+                ranges=ranges,
+                valueRenderOption="UNFORMATTED_VALUE",
+            ).execute()
+        except HttpError as exc:
+            if _is_missing_tab_error(exc):
+                matched, avail_tabs = _resolve_finance_tab_or_list(service, sheet_id, month)
+                if matched is not None and matched != tab:
+                    tab = matched
+                    ranges = _finance_batch_ranges(tab)
+                    resp = service.spreadsheets().values().batchGet(
+                        spreadsheetId=sheet_id,
+                        ranges=ranges,
+                        valueRenderOption="UNFORMATTED_VALUE",
+                    ).execute()
+                else:
+                    return FinanceSheetMonthData(
+                        ok=False, tab=tab, year=int(year), month=int(month),
+                        available_tabs=avail_tabs,
+                        error=_friendly_finance_http_error(exc, client_email, tab, avail=avail_tabs),
+                    )
+            else:
+                raise
+
         vrs = resp.get("valueRanges") or []
         blocks = [(vrs[i].get("values") or []) if i < len(vrs) else [] for i in range(len(ranges))]
 
-        # 1. Summary & Bank balances (exact bot-wa G9:H12 & K9:L12 parsing)
+        # 1. Summary & Bank balances (G9:H12 + K9:L12, with P9:Q12 fallback for legacy September tab)
         hasil: dict[str, float] = {}
         for row in blocks[0]:
             if len(row) >= 2 and _is_number(row[1]):
@@ -545,10 +661,31 @@ def fetch_finance_month_from_sheets(
         for row in blocks[1]:
             if len(row) >= 2 and _is_number(row[1]):
                 bank_hasil[str(row[0]).strip().lower()] = float(row[1])
+        bank_act_hasil: dict[str, float] = {}
+        for row in blocks[2]:
+            if len(row) >= 2 and _is_number(row[1]):
+                bank_act_hasil[str(row[0]).strip().lower()] = float(row[1])
+
+        b9_34 = blocks[7]
+        t8_31 = blocks[8]
+        s8_31 = blocks[9]
+
+        # Detect legacy Agustus single-column expense table (B16='Pengeluaran', B17='Source')
+        b16_val = str(b9_34[7][0]).strip().lower() if (len(b9_34) > 7 and b9_34[7]) else ""
+        b17_val = str(b9_34[8][0]).strip().lower() if (len(b9_34) > 8 and b9_34[8]) else ""
+        legacy_single_table = (b16_val == "pengeluaran" and b17_val == "source")
+
+        # Detect legacy September bank table at S8:U31 when T8 is NOT 'Source' and S8 == 'Source'
+        t8_hdr = str(t8_31[0][0]).strip().lower() if (t8_31 and t8_31[0]) else ""
+        s8_hdr = str(s8_31[0][0]).strip().lower() if (s8_31 and s8_31[0]) else ""
+        legacy_sep_bank = (t8_hdr != "source" and s8_hdr == "source")
 
         tunai_bal = int(round(hasil.get("sisa uang", 0.0)))
         bni_bal = int(round(bank_hasil.get("bni", 0.0)))
         mandiri_bal = int(round(bank_hasil.get("mandiri", 0.0)))
+        if not bank_hasil and "sisa uang" in bank_act_hasil:
+            # Legacy September sheet tracks combined bank remainder in P12 ('Sisa Uang')
+            bni_bal = int(round(bank_act_hasil.get("sisa uang", 0.0)))
         balances = {
             "Tunai": tunai_bal,
             "BNI": bni_bal,
@@ -556,38 +693,40 @@ def fetch_finance_month_from_sheets(
             "Total": tunai_bal + bni_bal + mandiri_bal,
         }
 
-        # 2. Expense tables (row 35 = TOTAL, rows 36..1000 = entries)
-        by_category: dict[str, int] = {}
+        # 2. Expense tables
+        by_category: dict[str, int] = {c: 0 for c in cat_names}
         transactions: list[dict] = []
         default_date = f"{int(year):04d}-{int(month):02d}-01"
         today_str = date.today().isoformat()
         today_expense = 0
 
-        for c_idx, cat in enumerate(cat_names):
-            col_a, col_c = FINANCE_SHEET_CAT_COLS[cat]
-            rows = blocks[2 + c_idx]
-            total_row = rows[0] if rows else []
-            cat_sum = 0
-            for offset, r in enumerate(rows[1:]):
-                row_num = FINANCE_EXPENSE_ROW_START + offset
+        if legacy_single_table:
+            # Legacy Agustus layout: expenses start at B18:D and continue past row 35
+            combined_exp: list[tuple[int, list]] = []
+            for offset, r in enumerate(b9_34[9:]):  # rows 18..34
+                combined_exp.append((18 + offset, r))
+            for offset, r in enumerate(blocks[3]):  # rows 35+
+                row_num = FINANCE_EXPENSE_TOTAL_ROW + offset
+                if row_num > FINANCE_EXPENSE_ROW_END:
+                    break
+                combined_exp.append((row_num, r))
+            for row_num, r in combined_exp:
                 nama, tgl, nilai = (list(r) + ["", "", ""])[:3]
                 nama_str = str(nama).strip()
-                if not nama_str and not _is_number(nilai):
-                    continue
                 if not _is_number(nilai):
                     continue
                 val_int = int(round(float(nilai)))
-                cat_sum += val_int
+                by_category["Jajan"] += val_int
                 d_str = parse_sheet_date(tgl) or default_date
                 if d_str == today_str:
                     today_expense += abs(val_int)
-                rng = f"{col_a}{row_num}:{col_c}{row_num}"
+                rng = f"B{row_num}:D{row_num}"
                 transactions.append({
                     "id": f"sh:{tab}:{rng}",
                     "type": "expense",
                     "amount": abs(val_int),
-                    "title": nama_str or cat,
-                    "category": cat,
+                    "title": nama_str or "Expense",
+                    "category": "Jajan",
                     "wallet": "",
                     "to_wallet": "",
                     "date": d_str,
@@ -595,15 +734,56 @@ def fetch_finance_month_from_sheets(
                     "sheet_row": row_num,
                     "sheet_cells": [{"tab": tab, "range": rng, "name": nama_str, "amount": val_int}],
                 })
-            if len(total_row) >= 3 and _is_number(total_row[2]):
-                by_category[cat] = int(round(float(total_row[2])))
-            else:
-                by_category[cat] = cat_sum
+        else:
+            # Standard bot-wa 4-category expense tables (row 35 = TOTAL, rows 36..1000 = entries)
+            for c_idx, cat in enumerate(cat_names):
+                col_a, col_c = FINANCE_SHEET_CAT_COLS[cat]
+                rows = blocks[3 + c_idx]
+                total_row = rows[0] if rows else []
+                cat_sum = 0
+                for offset, r in enumerate(rows[1:]):
+                    row_num = FINANCE_EXPENSE_ROW_START + offset
+                    if row_num > FINANCE_EXPENSE_ROW_END:
+                        break
+                    nama, tgl, nilai = (list(r) + ["", "", ""])[:3]
+                    nama_str = str(nama).strip()
+                    if not nama_str and not _is_number(nilai):
+                        continue
+                    if not _is_number(nilai):
+                        continue
+                    val_int = int(round(float(nilai)))
+                    cat_sum += val_int
+                    d_str = parse_sheet_date(tgl) or default_date
+                    if d_str == today_str:
+                        today_expense += abs(val_int)
+                    rng = f"{col_a}{row_num}:{col_c}{row_num}"
+                    transactions.append({
+                        "id": f"sh:{tab}:{rng}",
+                        "type": "expense",
+                        "amount": abs(val_int),
+                        "title": nama_str or cat,
+                        "category": cat,
+                        "wallet": "",
+                        "to_wallet": "",
+                        "date": d_str,
+                        "source": "sheets",
+                        "sheet_row": row_num,
+                        "sheet_cells": [{"tab": tab, "range": rng, "name": nama_str, "amount": val_int}],
+                    })
+                if len(total_row) >= 3 and _is_number(total_row[2]):
+                    by_category[cat] = int(round(float(total_row[2])))
+                else:
+                    by_category[cat] = cat_sum
 
-        # 3. Parse Pemasukan (B10:D31) & Pemasukan Bank (T10:V31) including paired transfers
+        # 3. Parse Pemasukan (B10:D31, or B9:D15 on legacy Agustus) & Pemasukan Bank (T10:V31 or legacy S9:U31)
         cash_raw: list[dict] = []
-        for idx, r in enumerate(blocks[2 + len(cat_names)]):
-            row_num = FINANCE_INCOME_ROW_START + idx
+        if legacy_single_table:
+            inc_slice = list(enumerate(b9_34[:7], start=9))  # rows 9..15
+        else:
+            # Skip row 9 ('Sisa Bulanan' carry-over) so users don't accidentally edit/delete it; read rows 10..31
+            inc_slice = list(enumerate(b9_34[1:23], start=FINANCE_INCOME_ROW_START))
+
+        for row_num, r in inc_slice:
             nama, tgl, nilai = (list(r) + ["", "", ""])[:3]
             nama_str = str(nama).strip()
             if not nama_str and not _is_number(nilai):
@@ -622,8 +802,14 @@ def fetch_finance_month_from_sheets(
             })
 
         bank_raw: list[dict] = []
-        for idx, r in enumerate(blocks[3 + len(cat_names)]):
-            row_num = FINANCE_BANK_ROW_START + idx
+        if legacy_sep_bank:
+            bank_col_a, bank_col_c = "S", "U"
+            bank_slice = list(enumerate(s8_31[1:], start=9))  # rows 9..31
+        else:
+            bank_col_a, bank_col_c = "T", "V"
+            bank_slice = list(enumerate(t8_31[2:], start=FINANCE_BANK_ROW_START))  # rows 10..31
+
+        for row_num, r in bank_slice:
             nama, tgl, nilai = (list(r) + ["", "", ""])[:3]
             nama_str = str(nama).strip()
             if not nama_str and not _is_number(nilai):
@@ -631,7 +817,7 @@ def fetch_finance_month_from_sheets(
             if not _is_number(nilai):
                 continue
             val_int = int(round(float(nilai)))
-            rng = f"T{row_num}:V{row_num}"
+            rng = f"{bank_col_a}{row_num}:{bank_col_c}{row_num}"
             bank_raw.append({
                 "row": row_num,
                 "name": nama_str,
@@ -648,13 +834,13 @@ def fetch_finance_month_from_sheets(
         for item in cash_raw:
             low = item["low"]
             amt = item["amount"]
-            if low in ("qris bni", "qris mandiri"):
+            if low in ("qris bni", "qris mandiri", "qris"):
                 bank = "Mandiri" if "mandiri" in low else "BNI"
                 transactions.append({
                     "id": f"sh:{tab}:{item['cell']['range']}",
                     "type": "transfer",
                     "amount": abs(amt),
-                    "title": f"{item['name']} (Monthly Pool)",
+                    "title": f"{item['name']} (Monthly Pool)" if low != "qris" else "QRIS",
                     "category": "",
                     "wallet": bank,
                     "to_wallet": "QRIS",
@@ -664,7 +850,7 @@ def fetch_finance_month_from_sheets(
                     "sheet_row": item["row"],
                     "sheet_cells": [item["cell"]],
                 })
-            elif low.startswith("tarik uang bni") or low.startswith("tarik uang mandiri"):
+            elif low.startswith("tarik uang"):
                 bank = "Mandiri" if "mandiri" in low else "BNI"
                 note = _strip_transfer_note(item["name"])
                 transactions.append({
@@ -740,7 +926,7 @@ def fetch_finance_month_from_sheets(
                     "sheet_cells": [item["cell"]],
                 })
 
-        # Process Pemasukan Bank (T10:V31) — pair bank-to-bank transfers first
+        # Process Pemasukan Bank (T10:V31 or legacy S9:U31) — pair bank-to-bank transfers first
         for b in bank_raw:
             if b["row"] in used_bank_rows:
                 continue
@@ -812,20 +998,23 @@ def fetch_finance_month_from_sheets(
             balances=balances,
             summary=summary,
             transactions=transactions,
+            synced_at=datetime.now().strftime("%H:%M"),
+            available_tabs=avail_tabs,
         )
     except HttpError as exc:
         return FinanceSheetMonthData(
-            ok=False, tab=tab, year=year, month=month,
-            error=_friendly_finance_http_error(exc, client_email, tab),
+            ok=False, tab=tab, year=int(year), month=int(month),
+            available_tabs=avail_tabs,
+            error=_friendly_finance_http_error(exc, client_email, tab, avail=avail_tabs),
         )
     except TimeoutError:
         return FinanceSheetMonthData(
-            ok=False, tab=tab, year=year, month=month,
+            ok=False, tab=tab, year=int(year), month=int(month),
             error="Google Sheets request timed out.",
         )
     except Exception as exc:
         return FinanceSheetMonthData(
-            ok=False, tab=tab, year=year, month=month,
+            ok=False, tab=tab, year=int(year), month=int(month),
             error=f"Failed to read Google Sheets ({type(exc).__name__}).",
         )
     finally:
@@ -842,9 +1031,10 @@ def _write_finance_with_service(
     wallet: str,
     to_wallet: str,
     dt: date,
+    tab_override: str | None = None,
 ) -> FinanceSheetWriteResult:
     """Core bot-wa Monthly Budget writer operating on an open Google Sheets service."""
-    tab = month_tab_name(dt.month)
+    tab = tab_override or month_tab_name(dt.month)
     date_str = dt.isoformat()
     amt = int(amount)
     if amt <= 0:
@@ -883,7 +1073,7 @@ def _write_finance_with_service(
     if tx_t == "expense":
         col_a, col_c = FINANCE_SHEET_CAT_COLS[cat]
         name = clean_title or cat
-        exp_col_rng = _a1_range(tab, f"{col_a}{FINANCE_EXPENSE_ROW_START}:{col_a}{FINANCE_EXPENSE_ROW_END}")
+        exp_col_rng = _a1_range(tab, f"{col_a}{FINANCE_EXPENSE_ROW_START}:{col_a}")
 
         if wal in QRIS_SOURCE_BY_BANK:
             # Exact bot-wa /qris flow: pre-check BOTH Pemasukan (B10:D31) and Expense table before writing!
@@ -1157,12 +1347,26 @@ def write_finance_tx_to_sheets(
         return FinanceSheetWriteResult(ok=False, tab=tab, error=err)
 
     with _FINANCE_WRITE_LOCK:
+        avail_tabs: list[str] = []
         try:
-            return _write_finance_with_service(
-                service, sheet_id, tx_type, amount, title, category, wallet, to_wallet, dt,
-            )
+            try:
+                return _write_finance_with_service(
+                    service, sheet_id, tx_type, amount, title, category, wallet, to_wallet, dt,
+                )
+            except HttpError as exc:
+                if _is_missing_tab_error(exc):
+                    matched, avail_tabs = _resolve_finance_tab_or_list(service, sheet_id, dt.month)
+                    if matched is not None and matched != tab:
+                        tab = matched
+                        return _write_finance_with_service(
+                            service, sheet_id, tx_type, amount, title, category, wallet, to_wallet, dt,
+                            tab_override=matched,
+                        )
+                raise
         except HttpError as exc:
-            return FinanceSheetWriteResult(ok=False, tab=tab, error=_friendly_finance_http_error(exc, client_email, tab))
+            return FinanceSheetWriteResult(
+                ok=False, tab=tab, error=_friendly_finance_http_error(exc, client_email, tab, avail=avail_tabs),
+            )
         except TimeoutError:
             return FinanceSheetWriteResult(ok=False, tab=tab, error="Google Sheets write timed out.")
         except Exception as exc:

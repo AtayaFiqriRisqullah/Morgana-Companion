@@ -3463,7 +3463,9 @@ class PetController(QObject):
         self._ai_ambient_last_t = 0.0
         self.sheets_sync = SheetsSyncWorker(APP_DIR, self)
         self.finance_sheets = FinanceSheetsWorker(APP_DIR, self)
+        self._finance_sheet_latest: FinanceSheetMonthData | None = None
         self._pending_sheet_budget_check: dict | None = None
+        self._pending_balance_reply = False
         self._sheets_dirty = False
         self._sheets_fail_streak = 0
         self._sheets_manual_sync = False
@@ -3586,6 +3588,9 @@ class PetController(QObject):
         self._sheets_retry_timer = QTimer(self)    # single-shot startup push / offline retry backoff
         self._sheets_retry_timer.setSingleShot(True)
         self._sheets_retry_timer.timeout.connect(self._trigger_sheets_sync)
+        self._finance_auto_sync_timer = QTimer(self)  # 60s silent pull while Finance window is open
+        self._finance_auto_sync_timer.setInterval(60_000)
+        self._finance_auto_sync_timer.timeout.connect(self._auto_sync_finance_sheets)
 
     # -- siklus hidup -------------------------------------------------------
     def start(self) -> None:
@@ -3605,10 +3610,12 @@ class PetController(QObject):
         self._schedule_chatter()
         QTimer.singleShot(900, self._startup_report)
         QTimer.singleShot(3000, self._refresh_calendar)
+        QTimer.singleShot(3500, self._preload_finance_sheets)
 
     def quit(self) -> None:
         self._sheets_debounce_timer.stop()
         self._sheets_retry_timer.stop()
+        self._finance_auto_sync_timer.stop()
         self.hotkeys.unregister()
         self.screen_time.save()
         self.audio.stop_all()
@@ -4606,6 +4613,40 @@ class PetController(QObject):
                             if kind_w == "warn"
                             else f" Heads up—{tx['category']} just crossed its budget ({format_rupiah(spent)} / {format_rupiah(limit)})!"
                         )
+        elif res.kind == "finance_balance":
+            today = date.today()
+            if bool(self.settings["finance_sheets_enabled"]):
+                cfg = self._finance_sheets_config()
+                if not cfg.is_ready(APP_DIR):
+                    res.reply = "Google Sheets Finance sync is on, but Sheet ID or kunci-google.json is missing. Check Settings!"
+                    res.emotion = "worried"
+                    res.action_label = "OPEN SETTINGS"
+                    res.action_target = "settings"
+                else:
+                    snap = self._finance_sheet_latest
+                    if snap is not None and snap.ok and (snap.year, snap.month) == (today.year, today.month):
+                        bal = snap.balances
+                        res.badge = f"SHEET · {snap.tab[:3].upper()}"
+                        res.reply = (
+                            f"Total {format_rupiah(bal['Total'])} "
+                            f"(Tunai {format_rupiah(bal['Tunai'])} · BNI {format_rupiah(bal['BNI'])} · Mandiri {format_rupiah(bal['Mandiri'])})."
+                        )
+                        res.emotion = "wink"
+                        # Trigger a quiet background refresh so next check stays fresh
+                        self.finance_sheets.fetch_month(cfg, today.year, today.month)
+                    else:
+                        self._pending_balance_reply = True
+                        self.finance_sheets.fetch_month(cfg, today.year, today.month)
+                        res.badge = "SHEET · SYNCING"
+                        res.reply = "Pulling your live balances from Google Sheets right now..."
+            else:
+                bal = self.finance.wallet_balances()
+                res.badge = "FINANCE · LOCAL"
+                res.reply = (
+                    f"Total {format_rupiah(bal['Total'])} "
+                    f"(Tunai {format_rupiah(bal['Tunai'])} · BNI {format_rupiah(bal['BNI'])} · Mandiri {format_rupiah(bal['Mandiri'])})."
+                )
+                res.emotion = "wink"
         elif res.kind == "start_focus":
             stat_arg = str(res.payload.get("stat") or "")
             if stat_arg:
@@ -5258,24 +5299,81 @@ class PetController(QObject):
         self._sync_briefing_view()
         self._sync_wrapup_view()
 
+    def _sheets_credentials_ready(self) -> bool:
+        probe = SheetsSyncConfig(
+            enabled=True,
+            spreadsheet_id=str(self.settings["sheets_sync_id"] or ""),
+            tab_name=str(self.settings["sheets_sync_tab"] or "Morgana"),
+            key_path=str(self.settings["sheets_sync_key_path"] or ""),
+        )
+        return probe.is_ready(APP_DIR)
+
+    def _preload_finance_sheets(self) -> None:
+        cfg = self._finance_sheets_config()
+        if not cfg.is_ready(APP_DIR):
+            return
+        today = date.today()
+        self.finance_sheets.fetch_month(cfg, today.year, today.month)
+
+    def _auto_sync_finance_sheets(self) -> None:
+        if (self.finance_dialog is None or not self.finance_dialog.isVisible()
+                or not self.finance_dialog.is_sheet_mode()):
+            self._finance_auto_sync_timer.stop()
+            return
+        if self.finance_dialog.is_sheet_busy():
+            return
+        if self._finance_sheets_config().is_ready(APP_DIR):
+            self.finance_dialog.request_sheet_refresh(silent=True)
+
+    def _on_finance_closed(self) -> None:
+        self._finance_auto_sync_timer.stop()
+        self._on_dialog_closed("finance")
+
+    def _on_finance_sheet_connect_requested(self) -> None:
+        """1-click activate Google Sheets Finance sync when Sheet ID & Key JSON are already set."""
+        if not self._sheets_credentials_ready():
+            self._open_settings_deferred()
+            return
+        self.settings.set(finance_sheets_enabled=True, finance_sheets_migrated=True)
+        if self.settings_dialog is not None:
+            self.settings_dialog.refresh()
+        if self.finance_dialog is not None:
+            self.finance_dialog.set_sheets_credentials_ready(True)
+            self.finance_dialog.set_sheet_mode(True)
+            if self.finance_dialog.isVisible():
+                self._finance_auto_sync_timer.start()
+
     def _open_finance(self, announce: bool = True) -> None:
         was_open = self.finance_dialog is not None and self.finance_dialog.isVisible()
         sheet_on = bool(self.settings["finance_sheets_enabled"])
+        creds_ready = self._sheets_credentials_ready()
         if self.finance_dialog is None:
             self.finance_dialog = FinanceDialog(
-                self.finance, on_top=self.on_top, ui_scale=self.ui_scale, sheet_mode=sheet_on,
+                self.finance,
+                on_top=self.on_top,
+                ui_scale=self.ui_scale,
+                sheet_mode=sheet_on,
+                sheet_creds_ready=creds_ready,
             )
             self.finance_dialog.finance_changed.connect(self._on_finance_changed)
             self.finance_dialog.open_settings.connect(self._open_settings_deferred)
+            self.finance_dialog.sheet_connect_requested.connect(self._on_finance_sheet_connect_requested)
             self.finance_dialog.sheet_refresh_requested.connect(self._on_finance_sheet_refresh)
             self.finance_dialog.sheet_write_requested.connect(self._on_finance_sheet_write)
             self.finance_dialog.sheet_edit_requested.connect(self._on_finance_sheet_edit)
             self.finance_dialog.sheet_delete_requested.connect(self._on_finance_sheet_delete)
             self.finance_dialog.sheet_undo_requested.connect(self._on_finance_sheet_undo)
-            self.finance_dialog.closed.connect(lambda: self._on_dialog_closed("finance"))
+            self.finance_dialog.closed.connect(self._on_finance_closed)
+            if sheet_on and self._finance_sheet_latest is not None and self._finance_sheet_latest.ok:
+                self.finance_dialog.apply_sheet_month(self._finance_sheet_latest)
         else:
+            self.finance_dialog.set_sheets_credentials_ready(creds_ready)
             self.finance_dialog.set_sheet_mode(sheet_on)
         self.finance_dialog.show_near(self.pet.geometry())
+        if sheet_on:
+            self._finance_auto_sync_timer.start()
+        else:
+            self._finance_auto_sync_timer.stop()
         if announce and not was_open and not self._rebuilding_ui:
             self._say_tuple(self.dialogue.window_open("finance", self._ctx()), ms=4800)
 
@@ -5377,8 +5475,39 @@ class PetController(QObject):
             self.finance_dialog.on_sheet_op_done(False, "undo", "Cannot undo right now — wait a moment and try again.")
 
     def _on_finance_sheet_month_loaded(self, data: FinanceSheetMonthData) -> None:
+        if data.ok:
+            today = date.today()
+            if (data.year, data.month) == (today.year, today.month):
+                self._finance_sheet_latest = data
+        elif data.error:
+            log.warning("Finance Google Sheets read failed (%s %04d-%02d): %s",
+                        data.tab, data.year, data.month, data.error)
         if self.finance_dialog is not None and self.finance_dialog.is_sheet_mode():
             self.finance_dialog.apply_sheet_month(data)
+        if self._pending_balance_reply:
+            self._pending_balance_reply = False
+            if data.ok:
+                bal = data.balances
+                msg = (
+                    f"Total {format_rupiah(bal['Total'])} "
+                    f"(Tunai {format_rupiah(bal['Tunai'])} · BNI {format_rupiah(bal['BNI'])} · Mandiri {format_rupiah(bal['Mandiri'])})."
+                )
+                if self.quick_cmd_dialog is not None and self.quick_cmd_dialog.isVisible():
+                    self.quick_cmd_dialog.show_reply(
+                        msg, badge=f"SHEET · {data.tab[:3].upper()}",
+                        action_label="OPEN FINANCE", action_target="finance",
+                    )
+                if self.pet.isVisible() and not self.is_dnd_active():
+                    self.say(msg, "talking", ms=5500, emotion="wink")
+            else:
+                err_msg = f"Couldn't read Google Sheets balance: {data.error}"
+                if self.quick_cmd_dialog is not None and self.quick_cmd_dialog.isVisible():
+                    self.quick_cmd_dialog.show_reply(
+                        err_msg, badge="SHEET ERR", action_label="OPEN SETTINGS",
+                        action_target="settings", accent_red=True,
+                    )
+                elif self.pet.isVisible() and not self.is_dnd_active():
+                    self.say(err_msg, "talking", ms=5500, emotion="worried")
         pending = self._pending_sheet_budget_check
         if data.ok and pending is not None:
             if (int(pending["year"]), int(pending["month"])) == (data.year, data.month):
@@ -5389,6 +5518,8 @@ class PetController(QObject):
 
     def _on_finance_sheet_op_done(self, action: str, res: FinanceSheetWriteResult, ctx: dict) -> None:
         payload = ctx.get("payload") or {}
+        if not res.ok and res.error:
+            log.warning("Finance Google Sheets op '%s' failed: %s", action, res.error)
         if action == "quick_add":
             if not res.ok:
                 self.say(f"Couldn't save to Google Sheets: {res.error}", "talking", ms=5500, emotion="worried")
@@ -5400,11 +5531,10 @@ class PetController(QObject):
                 }
             cfg = self._finance_sheets_config()
             if self.finance_dialog is not None and self.finance_dialog.isVisible() and self.finance_dialog.is_sheet_mode():
-                self.finance_dialog.request_sheet_refresh()
-            elif self._pending_sheet_budget_check is not None and cfg.is_ready(APP_DIR):
-                self.finance_sheets.fetch_month(
-                    cfg, self._pending_sheet_budget_check["year"], self._pending_sheet_budget_check["month"],
-                )
+                self.finance_dialog.request_sheet_refresh(silent=True)
+            elif cfg.is_ready(APP_DIR):
+                today = date.today()
+                self.finance_sheets.fetch_month(cfg, today.year, today.month)
             return
 
         if not res.ok:
@@ -5436,7 +5566,7 @@ class PetController(QObject):
         if self.finance_dialog is not None:
             self.finance_dialog.on_sheet_op_done(True, action, res.message or "Synced with Google Sheets!", undo_kind, undo_payload)
             if self.finance_dialog.is_sheet_mode():
-                self.finance_dialog.request_sheet_refresh()
+                self.finance_dialog.request_sheet_refresh(silent=True)
 
     def _open_timer(self) -> None:
         was_open = self.timer_dialog is not None and self.timer_dialog.isVisible()
@@ -5802,12 +5932,20 @@ class PetController(QObject):
         self._configure_sheets_sync(trigger_initial=False)
         if self._sheets_sync_config().is_ready(APP_DIR):
             self._schedule_sheets_sync()
+        fin_sh_on = bool(self.settings["finance_sheets_enabled"])
+        creds_ready = self._sheets_credentials_ready()
         if self.finance_dialog is not None:
-            fin_sh_on = bool(self.settings["finance_sheets_enabled"])
             was_sheet = self.finance_dialog.is_sheet_mode()
+            self.finance_dialog.set_sheets_credentials_ready(creds_ready)
             self.finance_dialog.set_sheet_mode(fin_sh_on)
-            if fin_sh_on and was_sheet and self.finance_dialog.isVisible():
-                self.finance_dialog.request_sheet_refresh()
+            if fin_sh_on and self.finance_dialog.isVisible():
+                self._finance_auto_sync_timer.start()
+                if was_sheet:
+                    self.finance_dialog.request_sheet_refresh(silent=False)
+            else:
+                self._finance_auto_sync_timer.stop()
+        elif fin_sh_on and creds_ready:
+            self._preload_finance_sheets()
         self._last_curfew_msg = None
         self._check_curfew()
 
