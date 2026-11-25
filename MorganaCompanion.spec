@@ -18,7 +18,7 @@ a = Analysis(
         (str(ROOT / "assets"), "assets"),
         (str(ROOT / "morgana_list.md"), "."),
     ],
-    hiddenimports=["PyQt6.QtMultimedia"],
+    hiddenimports=["PyQt6.QtMultimedia", "google.oauth2.service_account"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

@@ -15,7 +15,7 @@ import os
 import re
 import tempfile
 import uuid
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from datetime import time as dtime
 from pathlib import Path
 
@@ -234,55 +234,6 @@ class TaskStore(JsonListStore):
         task["updated_at"] = ts
         self.save()
         return True
-
-    def apply_external_done_batch(
-        self,
-        items: list[tuple[str, datetime | None]],
-        skew_grace_sec: float = 5.0,
-    ) -> tuple[list[dict], list[str]]:
-        """Apply task completions received from WhatsApp Bot in one atomic save.
-
-        Uses last-write-wins timestamp comparison (`updated_at` vs remote `done_at`)
-        with a small clock-skew grace window so a newer local edit/reopen is preserved.
-        Returns `(newly_completed_tasks, ack_ids)` where `ack_ids` covers every valid
-        incoming `task_id` (applied, already done, missing, or superseded) so the bot
-        outbox can be cleared idempotently.
-        """
-        by_id = {str(t.get("id") or ""): t for t in self._items}
-        applied: list[dict] = []
-        ack_ids: list[str] = []
-        seen: set[str] = set()
-        for raw_id, remote_dt in items:
-            tid = str(raw_id or "").strip()
-            if not tid or tid in seen:
-                continue
-            seen.add(tid)
-            ack_ids.append(tid)
-            task = by_id.get(tid)
-            if task is None or task.get("done"):
-                continue
-            remote_aware = (
-                remote_dt if (remote_dt is not None and remote_dt.tzinfo is not None)
-                else (remote_dt.astimezone() if remote_dt is not None else None)
-            )
-            local_dt = parse_dt(task.get("updated_at") or task.get("created"))
-            if remote_aware is not None and local_dt is not None:
-                local_aware = local_dt if local_dt.tzinfo is not None else local_dt.astimezone()
-                if local_aware.astimezone(timezone.utc).timestamp() > (
-                    remote_aware.astimezone(timezone.utc).timestamp() + skew_grace_sec
-                ):
-                    continue
-            done_local = (
-                remote_aware.astimezone().replace(tzinfo=None).isoformat(timespec="seconds")
-                if remote_aware is not None else now_iso()
-            )
-            task["done"] = True
-            task["done_at"] = done_local
-            task["updated_at"] = now_iso()
-            applied.append(dict(task))
-        if applied:
-            self.save()
-        return applied, ack_ids
 
     def pending(self) -> list[dict]:
         return [t for t in self._items if not t.get("done")]
@@ -1089,9 +1040,10 @@ SETTINGS_DEFAULTS = {
     "ai_api_key": "",
     "ai_call_user": "Joker",            # How Morgana addresses you in AI conversations
     "ai_dialogue_enabled": True,        # Use AI for Talk / Choice Prompts & live app reactions
-    "wa_sync_enabled": False,           # Opt-in task deadline sync with personal WhatsApp Bot
-    "wa_sync_url": "",                  # Termux / LAN / Tailscale Bot WA FastAPI URL (e.g. http://100.x.y.z:8000)
-    "wa_sync_token": "",                # Shared secret matching MORGANA_SYNC_TOKEN in bot-wa .env
+    "sheets_sync_enabled": False,       # Opt-in write-only Google Sheets task deadline sync (WhatsApp relay)
+    "sheets_sync_id": "",               # Google Spreadsheet ID or URL shared with Service Account
+    "sheets_sync_tab": "Morgana",       # Dedicated worksheet tab name for synced deadlines
+    "sheets_sync_key_path": "",         # Path to Service Account JSON (optional if placed beside app)
     "last_briefing_date": "",           # YYYY-MM-DD of last auto-delivered Daily Briefing
     "last_wrapup_date": "",             # YYYY-MM-DD of last auto-delivered Evening Wrap-up
     "enabled_tabs": list(RADIAL_TAB_KEYS),  # Active tabs shown in Morgana's radial menu
@@ -1124,15 +1076,16 @@ _BOOL_KEYS = (
     "manual_dnd",
     "ai_enabled",
     "ai_dialogue_enabled",
-    "wa_sync_enabled",
+    "sheets_sync_enabled",
 )
 _STR_KEYS = (
     "ai_endpoint",
     "ai_model",
     "ai_api_key",
     "ai_call_user",
-    "wa_sync_url",
-    "wa_sync_token",
+    "sheets_sync_id",
+    "sheets_sync_tab",
+    "sheets_sync_key_path",
 )
 
 

@@ -26,10 +26,10 @@ from PyQt6.QtGui import (QColor, QFont, QFontMetrics, QGuiApplication, QKeySeque
                          QShortcut, QSyntaxHighlighter, QTextBlock, QTextBlockFormat,
                          QTextCharFormat, QTextCursor, QTextDocument, QTextFormat, QTextListFormat)
 from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDateTimeEdit,
-                             QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget,
-                             QListWidgetItem, QMenu, QProgressBar, QPushButton, QScrollArea,
-                             QSizePolicy, QSlider, QSpinBox, QStyle, QStyledItemDelegate,
-                             QTextEdit, QTimeEdit, QVBoxLayout, QWidget)
+                             QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
+                             QListWidget, QListWidgetItem, QMenu, QProgressBar, QPushButton,
+                             QScrollArea, QSizePolicy, QSlider, QSpinBox, QStyle,
+                             QStyledItemDelegate, QTextEdit, QTimeEdit, QVBoxLayout, QWidget)
 
 import sprites
 from audio_manager import audio, play_ui, play_voice
@@ -3329,8 +3329,8 @@ class SettingsDialog(P5FluidPanel):
     always_on_top_changed = pyqtSignal(bool)
     autostart_changed = pyqtSignal(bool)
     test_ai_requested = pyqtSignal(dict)
-    test_wa_sync_requested = pyqtSignal(dict)
-    sync_wa_now_requested = pyqtSignal(dict)
+    test_sheets_sync_requested = pyqtSignal(dict)
+    sync_sheets_now_requested = pyqtSignal(dict)
 
     def __init__(self, store: SettingsStore, get_on_top=None, get_autostart=None,
                  get_hotkey_status=None, on_top: bool = True, ui_scale: float = 1.0) -> None:
@@ -3552,47 +3552,62 @@ class SettingsDialog(P5FluidPanel):
         lai.addLayout(test_row)
         cards_lay.addWidget(c_ai)
 
-        # Card 7: WhatsApp Bot Sync (Offline Task Deadline Reminders via Termux / Baileys API)
-        c_wa = _make_card()
-        lwa = QVBoxLayout(c_wa)
-        lwa.setContentsMargins(pad_x, pad_y, pad_x, pad_y)
-        lwa.setSpacing(row_gap)
-        hwa = QLabel("WHATSAPP BOT SYNC (OFFLINE REMINDERS)")
-        hwa.setObjectName("section")
-        lwa.addWidget(hwa)
+        # Card 7: Google Sheets Sync (Write-Only Cloud Relay for WhatsApp Bot Reminders)
+        c_sh = _make_card()
+        lsh = QVBoxLayout(c_sh)
+        lsh.setContentsMargins(pad_x, pad_y, pad_x, pad_y)
+        lsh.setSpacing(row_gap)
+        hsh = QLabel("GOOGLE SHEETS SYNC (WHATSAPP RELAY)")
+        hsh.setObjectName("section")
+        lsh.addWidget(hsh)
 
-        self.wa_sync_enabled_check = P5CheckBox("Sync task deadlines to WhatsApp Bot (opt-in)", scale=sc)
-        self.wa_sync_enabled_check.toggled.connect(self._sync_wa_fields)
-        lwa.addWidget(self.wa_sync_enabled_check)
+        self.sheets_sync_enabled_check = P5CheckBox("Sync task deadlines to Google Sheets (opt-in)", scale=sc)
+        self.sheets_sync_enabled_check.toggled.connect(self._sync_sheets_fields)
+        lsh.addWidget(self.sheets_sync_enabled_check)
 
-        self.wa_sync_url_edit = QLineEdit()
-        self.wa_sync_url_edit.setPlaceholderText("http://100.x.y.z:8000 (Tailscale / LAN IP)")
-        self._row(lwa, "Bot API URL", self.wa_sync_url_edit, wide=True)
+        self.sheets_id_edit = QLineEdit()
+        self.sheets_id_edit.setPlaceholderText("Spreadsheet ID or Google Sheets URL")
+        self._row(lsh, "Sheet ID / URL", self.sheets_id_edit, wide=True)
 
-        self.wa_sync_token_edit = QLineEdit()
-        self.wa_sync_token_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.wa_sync_token_edit.setPlaceholderText("Matches MORGANA_SYNC_TOKEN in bot-wa .env")
-        self._row(lwa, "Sync Token", self.wa_sync_token_edit, wide=True)
+        self.sheets_tab_edit = QLineEdit()
+        self.sheets_tab_edit.setPlaceholderText("Morgana")
+        self._row(lsh, "Tab Name", self.sheets_tab_edit, wide=True)
 
-        wa_btn_row = QHBoxLayout()
-        wa_btn_row.setSpacing(_sc(8, sc, 6))
-        self._wa_test_btn = self._btn("TEST", variant="gold", display=True, px=10)
-        self._wa_test_btn.setFixedHeight(_sc(26, sc, 22))
-        self._wa_test_btn.clicked.connect(self._on_test_wa_clicked)
-        wa_btn_row.addWidget(self._wa_test_btn)
+        key_wrap = QWidget()
+        key_lay = QHBoxLayout(key_wrap)
+        key_lay.setContentsMargins(0, 0, 0, 0)
+        key_lay.setSpacing(_sc(6, sc, 4))
+        self.sheets_key_edit = QLineEdit()
+        self.sheets_key_edit.setPlaceholderText("Path to kunci-google.json (or place beside app)")
+        self.sheets_key_edit.setMinimumHeight(_sc(30, sc, 25))
+        key_lay.addWidget(self.sheets_key_edit, 1)
+        self._sheets_browse_btn = self._btn("BROWSE", variant="soft", display=True, px=9)
+        self._sheets_browse_btn.setFixedHeight(_sc(30, sc, 25))
+        self._sheets_browse_btn.clicked.connect(self._browse_sheets_key)
+        key_lay.addWidget(self._sheets_browse_btn)
+        self._row(lsh, "Key JSON", key_wrap, wide=True)
 
-        self._wa_sync_btn = self._btn("SYNC NOW", variant="soft", display=True, px=10)
-        self._wa_sync_btn.setFixedHeight(_sc(26, sc, 22))
-        self._wa_sync_btn.clicked.connect(self._on_sync_wa_now_clicked)
-        wa_btn_row.addWidget(self._wa_sync_btn)
-        wa_btn_row.addStretch(1)
-        lwa.addLayout(wa_btn_row)
+        sh_btn_row = QHBoxLayout()
+        sh_btn_row.setSpacing(_sc(8, sc, 6))
+        self._sheets_test_btn = self._btn("TEST", variant="gold", display=True, px=10)
+        self._sheets_test_btn.setFixedHeight(_sc(26, sc, 22))
+        self._sheets_test_btn.clicked.connect(self._on_test_sheets_clicked)
+        sh_btn_row.addWidget(self._sheets_test_btn)
 
-        self._wa_status_lbl = QLabel("Off by default. Syncs active deadlines so your bot reminds you when this PC is off.")
-        self._wa_status_lbl.setObjectName("tip")
-        self._wa_status_lbl.setWordWrap(True)
-        lwa.addWidget(self._wa_status_lbl)
-        cards_lay.addWidget(c_wa)
+        self._sheets_sync_btn = self._btn("SYNC NOW", variant="soft", display=True, px=10)
+        self._sheets_sync_btn.setFixedHeight(_sc(26, sc, 22))
+        self._sheets_sync_btn.clicked.connect(self._on_sync_sheets_now_clicked)
+        sh_btn_row.addWidget(self._sheets_sync_btn)
+        sh_btn_row.addStretch(1)
+        lsh.addLayout(sh_btn_row)
+
+        self._sheets_status_lbl = QLabel(
+            "Off by default. Pushes active deadlines to a Sheet tab so your WhatsApp bot reminds you anywhere."
+        )
+        self._sheets_status_lbl.setObjectName("tip")
+        self._sheets_status_lbl.setWordWrap(True)
+        lsh.addWidget(self._sheets_status_lbl)
+        cards_lay.addWidget(c_sh)
 
         # Card 8: Radial menu tabs (enable/disable individual tabs)
         c4 = _make_card()
@@ -3704,39 +3719,53 @@ class SettingsDialog(P5FluidPanel):
         self._ai_test_lbl.setStyleSheet(f"color: {color}; font-size: {_sc(12, self._ui_scale, 9)}px; font-weight: bold;")
         self._ai_test_lbl.setText(message)
 
-    def _sync_wa_fields(self, enabled: bool) -> None:
+    def _sync_sheets_fields(self, enabled: bool) -> None:
         on = bool(enabled)
-        for w in (self.wa_sync_url_edit, self.wa_sync_token_edit, self._wa_test_btn, self._wa_sync_btn):
+        for w in (self.sheets_id_edit, self.sheets_tab_edit, self.sheets_key_edit,
+                  self._sheets_browse_btn, self._sheets_test_btn, self._sheets_sync_btn):
             w.setEnabled(on)
 
-    def _wa_form_payload(self) -> dict:
+    def _browse_sheets_key(self) -> None:
+        cur = self.sheets_key_edit.text().strip()
+        start_dir = str(Path(cur).parent) if cur and Path(cur).parent.exists() else ""
+        chosen, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Google Service Account JSON",
+            start_dir,
+            "JSON Files (*.json);;All Files (*)",
+        )
+        if chosen:
+            self.sheets_key_edit.setText(chosen)
+
+    def _sheets_form_payload(self) -> dict:
         return {
-            "enabled": self.wa_sync_enabled_check.isChecked(),
-            "url": self.wa_sync_url_edit.text().strip(),
-            "token": self.wa_sync_token_edit.text().strip(),
+            "enabled": self.sheets_sync_enabled_check.isChecked(),
+            "spreadsheet_id": self.sheets_id_edit.text().strip(),
+            "tab_name": self.sheets_tab_edit.text().strip() or SETTINGS_DEFAULTS["sheets_sync_tab"],
+            "key_path": self.sheets_key_edit.text().strip(),
         }
 
-    def _on_test_wa_clicked(self) -> None:
-        self._wa_test_btn.setEnabled(False)
-        self._wa_sync_btn.setEnabled(False)
-        self._wa_status_lbl.setStyleSheet(f"color: #FAD02C; font-size: {_sc(12, self._ui_scale, 9)}px;")
-        self._wa_status_lbl.setText("Testing connection to WhatsApp Bot...")
-        self.test_wa_sync_requested.emit(self._wa_form_payload())
+    def _on_test_sheets_clicked(self) -> None:
+        self._sheets_test_btn.setEnabled(False)
+        self._sheets_sync_btn.setEnabled(False)
+        self._sheets_status_lbl.setStyleSheet(f"color: #FAD02C; font-size: {_sc(12, self._ui_scale, 9)}px;")
+        self._sheets_status_lbl.setText("Testing Google Sheets connection...")
+        self.test_sheets_sync_requested.emit(self._sheets_form_payload())
 
-    def _on_sync_wa_now_clicked(self) -> None:
-        self._wa_test_btn.setEnabled(False)
-        self._wa_sync_btn.setEnabled(False)
-        self._wa_status_lbl.setStyleSheet(f"color: #FAD02C; font-size: {_sc(12, self._ui_scale, 9)}px;")
-        self._wa_status_lbl.setText("Syncing task deadlines with WhatsApp Bot...")
-        self.sync_wa_now_requested.emit(self._wa_form_payload())
+    def _on_sync_sheets_now_clicked(self) -> None:
+        self._sheets_test_btn.setEnabled(False)
+        self._sheets_sync_btn.setEnabled(False)
+        self._sheets_status_lbl.setStyleSheet(f"color: #FAD02C; font-size: {_sc(12, self._ui_scale, 9)}px;")
+        self._sheets_status_lbl.setText("Pushing active task deadlines to Google Sheets...")
+        self.sync_sheets_now_requested.emit(self._sheets_form_payload())
 
-    def set_wa_status(self, ok: bool, message: str) -> None:
-        on = self.wa_sync_enabled_check.isChecked()
-        self._wa_test_btn.setEnabled(on)
-        self._wa_sync_btn.setEnabled(on)
+    def set_sheets_status(self, ok: bool, message: str) -> None:
+        on = self.sheets_sync_enabled_check.isChecked()
+        self._sheets_test_btn.setEnabled(on)
+        self._sheets_sync_btn.setEnabled(on)
         color = "#5CE09A" if ok else "#FF6B78"
-        self._wa_status_lbl.setStyleSheet(f"color: {color}; font-size: {_sc(12, self._ui_scale, 9)}px; font-weight: bold;")
-        self._wa_status_lbl.setText(message)
+        self._sheets_status_lbl.setStyleSheet(f"color: {color}; font-size: {_sc(12, self._ui_scale, 9)}px; font-weight: bold;")
+        self._sheets_status_lbl.setText(message)
 
     def _row(self, layout: QVBoxLayout, text: str, widget: QWidget, wide: bool = False) -> None:
         sc = self._ui_scale
@@ -3882,13 +3911,16 @@ class SettingsDialog(P5FluidPanel):
             self._ai_test_lbl.setStyleSheet("")
             self._ai_test_lbl.setText("Off by default. Free Gemini keys: aistudio.google.com/apikey")
             self._sync_ai_fields(ai_on)
-            wa_on = bool(values.get("wa_sync_enabled", SETTINGS_DEFAULTS["wa_sync_enabled"]))
-            self.wa_sync_enabled_check.setChecked(wa_on)
-            self.wa_sync_url_edit.setText(str(values.get("wa_sync_url", SETTINGS_DEFAULTS["wa_sync_url"])))
-            self.wa_sync_token_edit.setText(str(values.get("wa_sync_token", SETTINGS_DEFAULTS["wa_sync_token"])))
-            self._wa_status_lbl.setStyleSheet("")
-            self._wa_status_lbl.setText("Off by default. Syncs active deadlines so your bot reminds you when this PC is off.")
-            self._sync_wa_fields(wa_on)
+            sh_on = bool(values.get("sheets_sync_enabled", SETTINGS_DEFAULTS["sheets_sync_enabled"]))
+            self.sheets_sync_enabled_check.setChecked(sh_on)
+            self.sheets_id_edit.setText(str(values.get("sheets_sync_id", SETTINGS_DEFAULTS["sheets_sync_id"])))
+            self.sheets_tab_edit.setText(str(values.get("sheets_sync_tab", SETTINGS_DEFAULTS["sheets_sync_tab"])))
+            self.sheets_key_edit.setText(str(values.get("sheets_sync_key_path", SETTINGS_DEFAULTS["sheets_sync_key_path"])))
+            self._sheets_status_lbl.setStyleSheet("")
+            self._sheets_status_lbl.setText(
+                "Off by default. Pushes active deadlines to a Sheet tab so your WhatsApp bot reminds you anywhere."
+            )
+            self._sync_sheets_fields(sh_on)
             enabled = set(values.get("enabled_tabs", RADIAL_TAB_KEYS))
             for key, cb in self.tab_checks.items():
                 cb.setChecked(key in enabled)
@@ -3961,9 +3993,10 @@ class SettingsDialog(P5FluidPanel):
                 ai_api_key=self.ai_key_edit.text().strip(),
                 ai_call_user=self.ai_call_user_edit.text().strip() or "Joker",
                 ai_dialogue_enabled=self.ai_dialogue_check.isChecked(),
-                wa_sync_enabled=self.wa_sync_enabled_check.isChecked(),
-                wa_sync_url=self.wa_sync_url_edit.text().strip(),
-                wa_sync_token=self.wa_sync_token_edit.text().strip(),
+                sheets_sync_enabled=self.sheets_sync_enabled_check.isChecked(),
+                sheets_sync_id=self.sheets_id_edit.text().strip(),
+                sheets_sync_tab=self.sheets_tab_edit.text().strip() or SETTINGS_DEFAULTS["sheets_sync_tab"],
+                sheets_sync_key_path=self.sheets_key_edit.text().strip(),
                 enabled_tabs=chosen_tabs,
             )
             self.saved.emit()
