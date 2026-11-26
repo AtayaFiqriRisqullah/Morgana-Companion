@@ -451,7 +451,7 @@ class P5FluidButton(QPushButton):
 
 
 class P5CheckBox(QCheckBox):
-    """Crisp Persona 5 dark checkbox with crimson fill and painted white checkmark."""
+    """Crisp Persona 5 dark checkbox with crimson fill, painted white checkmark, and auto word-wrap."""
 
     def __init__(self, text: str, scale: float = 1.0, parent: QWidget | None = None) -> None:
         super().__init__(text, parent)
@@ -459,6 +459,9 @@ class P5CheckBox(QCheckBox):
         self._hovered = False
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFont(ui_font(_sc(14, self._scale, 11), bold=True))
+        sp = QSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        sp.setHeightForWidth(True)
+        self.setSizePolicy(sp)
         self.clicked.connect(lambda checked: play_ui("select" if checked else "cancel"))
 
     def enterEvent(self, e) -> None:
@@ -473,9 +476,40 @@ class P5CheckBox(QCheckBox):
         self.update()
         super().leaveEvent(e)
 
+    def hitButton(self, pos: QPoint) -> bool:
+        return self.rect().contains(pos)
+
+    def _text_left(self) -> float:
+        return 18.0 * self._scale + 9.0 * self._scale
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        tx = int(math.ceil(self._text_left()))
+        tw = max(48, int(width) - tx - 2)
+        fm = QFontMetrics(self.font())
+        rect = fm.boundingRect(
+            0, 0, tw, 10000,
+            Qt.AlignmentFlag.AlignLeft.value | Qt.AlignmentFlag.AlignTop.value | Qt.TextFlag.TextWordWrap.value,
+            self.text(),
+        )
+        return max(_sc(26, self._scale, 22), rect.height() + _sc(6, self._scale, 4))
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(_sc(110, self._scale, 80), _sc(26, self._scale, 22))
+
     def sizeHint(self) -> QSize:
         fm = QFontMetrics(self.font())
-        return QSize(_sc(28, self._scale, 22) + fm.horizontalAdvance(self.text()) + 8, _sc(26, self._scale, 22))
+        full_w = _sc(28, self._scale, 22) + fm.horizontalAdvance(self.text()) + 8
+        cur_w = self.width()
+        if cur_w > 60 and cur_w < full_w:
+            return QSize(cur_w, self.heightForWidth(cur_w))
+        return QSize(full_w, _sc(26, self._scale, 22))
+
+    def resizeEvent(self, e) -> None:
+        super().resizeEvent(e)
+        self.updateGeometry()
 
     def paintEvent(self, _event) -> None:
         p = QPainter(self)
@@ -483,7 +517,17 @@ class P5CheckBox(QCheckBox):
         p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
         sc = self._scale
         bs = 18.0 * sc
-        box = QRectF(1.0, (self.height() - bs) / 2.0, bs, bs)
+        tx = self._text_left()
+        fm = QFontMetrics(self.font())
+        single_h = _sc(34, sc, 28)
+        multiline = self.height() > single_h
+        if multiline:
+            top_pad = 3.0
+            box_y = max(2.0, top_pad + (fm.height() - bs) / 2.0)
+        else:
+            top_pad = 0.0
+            box_y = (self.height() - bs) / 2.0
+        box = QRectF(1.0, box_y, bs, bs)
         if self.isChecked():
             grad = QLinearGradient(box.topLeft(), box.bottomLeft())
             grad.setColorAt(0.0, RED_HOVER)
@@ -500,12 +544,15 @@ class P5CheckBox(QCheckBox):
             p.setPen(QPen(RED if self._hovered else QColor("#8E8EA4"), 1.6))
             p.setBrush(P5_HOVER if self._hovered else P5_SURFACE)
             p.drawRoundedRect(box, 4.0, 4.0)
-        tx = bs + 9.0 * sc
         p.setFont(self.font())
         p.setPen(P5_TEXT)
-        p.drawText(QRectF(tx, 0.0, self.width() - tx, self.height()),
-                   Qt.AlignmentFlag.AlignVCenter.value | Qt.AlignmentFlag.AlignLeft.value,
-                   self.text())
+        flags = (
+            (Qt.AlignmentFlag.AlignTop.value if multiline else Qt.AlignmentFlag.AlignVCenter.value)
+            | Qt.AlignmentFlag.AlignLeft.value
+            | Qt.TextFlag.TextWordWrap.value
+        )
+        p.drawText(QRectF(tx, top_pad, max(10.0, self.width() - tx - 2.0), max(10.0, self.height() - top_pad)),
+                   flags, self.text())
 
 
 class P5ComboBox(QComboBox):
@@ -907,7 +954,8 @@ class P5FluidPanel(QWidget):
             flags |= Qt.WindowType.WindowStaysOnTopHint
         self.setWindowFlags(flags)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setFixedSize(_sc(size.width(), sc, 380), _sc(size.height(), sc, 420))
+        self._preferred_size = QSize(_sc(size.width(), sc, 380), _sc(size.height(), sc, 420))
+        self.setFixedSize(self._preferred_size)
         self.setStyleSheet(dialog_qss(sc))
         self._title = title
         self._on_top = bool(on_top)
@@ -1187,28 +1235,44 @@ class P5FluidPanel(QWidget):
         Uses deferred raise+activate so Windows QMenu/Tool transitions never bury the window."""
         screen = QGuiApplication.screenAt(anchor.center()) or QGuiApplication.primaryScreen()
         area = screen.availableGeometry()
-        w = min(self.width(), max(440, area.width() - 28))
-        h = min(self.height(), max(440, area.height() - 28))
+        pad_x = 12 if area.width() >= 480 else 4
+        pad_y = max(12, self.SLIDE) if area.height() >= 480 else 4
+        max_w = max(320, area.width() - pad_x * 2)
+        max_h = max(320, area.height() - pad_y * 2)
+        pref = getattr(self, "_preferred_size", self.size())
+        w = min(pref.width(), max_w)
+        h = min(pref.height(), max_h)
         if w != self.width() or h != self.height():
             self.setFixedSize(w, h)
 
+        min_x = area.left() + pad_x
+        max_x = max(min_x, area.left() + area.width() - w - pad_x)
+        min_y = area.top() + pad_y
+        max_y = max(min_y, area.top() + area.height() - h - pad_y)
+
         if not self.isVisible() or prefer_center:
             if prefer_center:
-                x = max(area.left(), min(anchor.center().x() - w // 2, area.right() - w))
-                y = max(area.top(), min(anchor.center().y() - h // 2, area.bottom() - h))
+                x = anchor.center().x() - w // 2
             else:
                 x = anchor.left() - w - 10
-                if x < area.left():
-                    x = min(anchor.right() + 10, area.right() - w)
-                y = max(area.top(), min(anchor.center().y() - h // 2, area.bottom() - h))
+                if x < min_x:
+                    x = anchor.right() + 10
+            x = max(min_x, min(x, max_x))
+            y = max(min_y, min(anchor.center().y() - h // 2, max_y))
             self._base_pos = QPoint(x, y)
+        else:
+            self._base_pos = QPoint(
+                max(min_x, min(self._base_pos.x(), max_x)),
+                max(min_y, min(self._base_pos.y(), max_y)),
+            )
 
         self._closing = False
         self.setWindowOpacity(1.0)
         if not self.isVisible():
             play_ui("open_window")
             self._open.snap(0.35)
-            self.move(self._base_pos.x(), self._base_pos.y() + int(round(0.65 * self.SLIDE)))
+            start_y = min(self._base_pos.y() + int(round(0.65 * self.SLIDE)), area.top() + area.height() - h)
+            self.move(self._base_pos.x(), max(area.top(), start_y))
             self.show()
         else:
             self.move(self._base_pos)
@@ -3958,7 +4022,7 @@ class SettingsDialog(P5FluidPanel):
 
     def __init__(self, store: SettingsStore, get_on_top=None, get_autostart=None,
                  get_hotkey_status=None, on_top: bool = True, ui_scale: float = 1.0) -> None:
-        super().__init__("SETTINGS", QSize(500, 740), on_top=on_top, ui_scale=ui_scale)
+        super().__init__("SETTINGS", QSize(540, 660), on_top=on_top, ui_scale=ui_scale)
         sc = self._ui_scale
         self.store = store
         self._get_on_top = get_on_top
@@ -3974,8 +4038,9 @@ class SettingsDialog(P5FluidPanel):
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll_body = QWidget()
+        scroll_body.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         cards_lay = QVBoxLayout(scroll_body)
-        cards_lay.setContentsMargins(0, 0, _sc(4, sc, 2), 0)
+        cards_lay.setContentsMargins(0, 0, _sc(6, sc, 4), 0)
         cards_lay.setSpacing(_sc(10, sc, 7))
         pad_x, pad_y = _sc(14, sc, 10), _sc(11, sc, 8)
         row_gap = _sc(7, sc, 5)
@@ -4186,7 +4251,7 @@ class SettingsDialog(P5FluidPanel):
         lsh.addWidget(hsh)
 
         self.sheets_sync_enabled_check = P5CheckBox(
-            "Sync Tasks, Notes, Stats & Events via Google Sheets (2-way Laptop ↔ Android)", scale=sc,
+            "Sync Tasks, Notes, Stats & Events (2-way Laptop ↔ Android)", scale=sc,
         )
         self.sheets_sync_enabled_check.toggled.connect(self._sync_sheets_fields)
         lsh.addWidget(self.sheets_sync_enabled_check)
