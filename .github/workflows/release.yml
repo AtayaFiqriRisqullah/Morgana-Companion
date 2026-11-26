@@ -1,4 +1,4 @@
-name: Build & Release (Windows & Linux)
+name: Build & Release (Windows, Linux & Android)
 
 on:
   push:
@@ -89,8 +89,52 @@ jobs:
           name: release-linux-x64
           path: ${{ env.ARCHIVE }}
 
+  build-android:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Install Flutter dependencies & verify
+        working-directory: mobile
+        run: |
+          flutter pub get
+          flutter analyze
+          flutter test
+
+      - name: Build Android release APK
+        working-directory: mobile
+        run: |
+          flutter build apk --release
+
+      - name: Package Android APK
+        run: |
+          TAG=$([ "${{ github.ref_type }}" = "tag" ] && echo "${{ github.ref_name }}" || echo "${{ inputs.tag }}")
+          mkdir -p dist
+          APK="dist/Morgana-Companion-${TAG}-android.apk"
+          cp mobile/build/app/outputs/flutter-apk/app-release.apk "$APK"
+          echo "ARCHIVE=$APK" >> "$GITHUB_ENV"
+
+      - name: Upload Android APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-android
+          path: ${{ env.ARCHIVE }}
+
   publish-release:
-    needs: [build-windows, build-linux]
+    needs: [build-windows, build-linux, build-android]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository

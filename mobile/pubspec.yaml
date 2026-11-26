@@ -1,0 +1,48 @@
+name: morgana_companion
+description: "Persona 5 Royal themed Android companion featuring Morgana, Finance (bot-wa Google Sheets sync), Tasks, Notes, Events, Social Stats, Timer, Gemini AI, and optional Floating Bubble."
+publish_to: 'none'
+version: 1.5.3+153
+
+environment:
+  sdk: ^3.10.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+  http: ^1.2.2
+  pointycastle: ^3.9.1
+  path_provider: ^2.1.4
+  audioplayers: ^6.1.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/Morgana/
+    - assets/audio/
+  fonts:
+    - family: Anton
+      fonts:
+        - asset: assets/fonts/Anton-Regular.ttf
+    - family: BarlowCondensed
+      fonts:
+        - asset: assets/fonts/BarlowCondensed-Bold.ttf
+          weight: 700
+        - asset: assets/fonts/BarlowCondensed-ExtraBold.ttf
+          weight: 800
+    - family: Arsenal
+      fonts:
+        - asset: assets/fonts/Arsenal-Regular.ttf
+          weight: 400
+        - asset: assets/fonts/Arsenal-Italic.ttf
+          weight: 400
+          style: italic
+        - asset: assets/fonts/Arsenal-Bold.ttf
+          weight: 700
+        - asset: assets/fonts/Arsenal-BoldItalic.ttf
+          weight: 700
+          style: italic
