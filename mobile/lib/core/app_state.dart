@@ -94,12 +94,22 @@ class MorganaAppState extends ChangeNotifier {
   // Alerts deferred silently while user is asleep (Sleep Mode)
   final List<String> _deferredAlerts = [];
 
+  // 2-Way Companion JSON Sync state (Tasks, Notes, Stats, Events, Habits)
+  bool companionSyncBusy = false;
+  String companionSyncError = '';
+  String companionLastSyncedAt = '';
+  DateTime? _lastCompanionSyncTime;
+  bool _companionDirty = false;
+
   Timer? _clockTimer;
   Timer? _sheetPollTimer;
+  Timer? _companionDebounceTimer;
+  Timer? _companionPollTimer;
   Timer? _talkTimer;
   bool _disposed = false;
 
   bool get sleepMode => ready && settings['sleep_mode'] == true;
+  bool get isDataSyncActive => ready && settings.dataSheetsActive;
 
   MorganaAppState({
     MorganaAudioService? audioService,
@@ -128,6 +138,13 @@ class MorganaAppState extends ChangeNotifier {
       habits.load(),
       settings.load(),
     ]);
+
+    // Auto-schedule 2-way Google Sheets sync whenever any companion store is mutated locally
+    tasks.onMutated = scheduleCompanionSync;
+    notes.onMutated = scheduleCompanionSync;
+    events.onMutated = scheduleCompanionSync;
+    stats.onMutated = scheduleCompanionSync;
+    habits.onMutated = scheduleCompanionSync;
 
     audio.applySettings(
       soundEnabled: settings['sound_enabled'] == true,
@@ -166,6 +183,9 @@ class MorganaAppState extends ChangeNotifier {
       if (settings.financeSheetsActive) {
         unawaited(refreshFinanceSheet(silent: true));
       }
+      if (settings.dataSheetsActive) {
+        unawaited(syncCompanionData(silent: true));
+      }
       _startSheetAutoRefresh();
     }
     notifyListeners();
@@ -193,6 +213,11 @@ class MorganaAppState extends ChangeNotifier {
     activeTab = tab;
     if (tab == 'finance' && settings.financeSheetsActive) {
       unawaited(refreshFinanceSheet(silent: sheetData != null));
+    } else if (const {'tasks', 'notes', 'events', 'stats'}.contains(tab) && settings.dataSheetsActive) {
+      final last = _lastCompanionSyncTime;
+      if (last == null || DateTime.now().difference(last).inSeconds >= 15) {
+        unawaited(syncCompanionData(silent: true));
+      }
     }
     _safeNotify();
   }
@@ -352,6 +377,126 @@ class MorganaAppState extends ChangeNotifier {
         unawaited(refreshFinanceSheet(silent: true));
       }
     });
+    _companionPollTimer?.cancel();
+    _companionPollTimer = Timer.periodic(const Duration(seconds: 90), (_) {
+      if (!sleepMode && isDataSyncActive && !companionSyncBusy) {
+        unawaited(syncCompanionData(silent: true));
+      }
+    });
+  }
+
+  void scheduleCompanionSync() {
+    if (!ready || !settings.dataSheetsActive) return;
+    _companionDirty = true;
+    _companionDebounceTimer?.cancel();
+    _companionDebounceTimer = Timer(const Duration(milliseconds: 1800), () {
+      if (!_disposed && isDataSyncActive) {
+        unawaited(syncCompanionData(silent: true));
+      }
+    });
+  }
+
+  Future<CompanionSheetSyncResult> syncCompanionData({
+    bool silent = false,
+    bool forceDeadlines = false,
+    String? sheetIdOverride,
+    String? keyJsonOverride,
+    String? deadlineTabOverride,
+  }) async {
+    final sheetId = (sheetIdOverride ?? settings['sheets_sync_id'] ?? '').toString().trim();
+    final keyJson = (keyJsonOverride ?? settings['sheets_key_json'] ?? '').toString().trim();
+    final deadlineTab = (deadlineTabOverride ?? settings.sheetsSyncTab).trim();
+    if (sheetId.isEmpty || keyJson.isEmpty) {
+      const errRes = CompanionSheetSyncResult(
+        ok: false,
+        error: 'Configure Sheet ID & kunci-google.json in Settings first.',
+      );
+      if (!silent) notify(errRes.error, tone: P5ToastTone.warn, ms: 2800);
+      return errRes;
+    }
+    if (companionSyncBusy) {
+      _companionDirty = true;
+      if (!silent) notify('Sync already in progress...', tone: P5ToastTone.info, ms: 1400);
+      return const CompanionSheetSyncResult(ok: false, error: 'Sync already in progress.');
+    }
+
+    _companionDirty = false;
+    companionSyncBusy = true;
+    companionSyncError = '';
+    if (!silent) {
+      notify('Syncing Tasks, Notes, Stats & Events...', tone: P5ToastTone.info, ms: 1600);
+    }
+    _safeNotify();
+
+    final localStores = <String, ({List<Map<String, dynamic>> items, Map<String, String> tombstones})>{
+      'tasks': (items: tasks.all(), tombstones: tasks.tombstones()),
+      'notes': (items: notes.all(), tombstones: notes.tombstones()),
+      'social_stats': (items: stats.all(), tombstones: stats.tombstones()),
+      'local_events': (items: events.all(), tombstones: events.tombstones()),
+      'habits': (items: habits.all(), tombstones: habits.tombstones()),
+    };
+
+    final res = await sheetsClient.syncCompanionData(
+      rawSheetId: sheetId,
+      keyJson: keyJson,
+      deadlineTab: deadlineTab.isEmpty ? 'Morgana' : deadlineTab,
+      localStores: localStores,
+      pushDeadlines: true,
+      forceDeadlines: forceDeadlines,
+    );
+
+    companionSyncBusy = false;
+    if (res.ok) {
+      _lastCompanionSyncTime = DateTime.now();
+      companionLastSyncedAt = res.syncedAt;
+      companionSyncError = '';
+      Future<void> applyMerged(
+        String key,
+        List<Map<String, dynamic>> Function() getItems,
+        Map<String, String> Function() getTombs,
+        Future<void> Function(List<Map<String, dynamic>>, Map<String, String>) replaceFn,
+      ) async {
+        if (!res.localChanged.contains(key) || res.merged[key] == null) return;
+        final m = res.merged[key]!;
+        if (_companionDirty) {
+          final safe = mergeStorePayload(
+            storeKey: key,
+            localItems: getItems(),
+            localTombstones: getTombs(),
+            remoteItems: m.items,
+            remoteTombstones: m.tombstones,
+          );
+          await replaceFn(safe.items, safe.tombstones);
+        } else {
+          await replaceFn(m.items, m.tombstones);
+        }
+      }
+
+      await applyMerged('tasks', tasks.all, tasks.tombstones, tasks.replaceSynced);
+      await applyMerged('notes', notes.all, notes.tombstones, notes.replaceSynced);
+      await applyMerged('social_stats', stats.all, stats.tombstones, stats.replaceSynced);
+      await applyMerged('local_events', events.all, events.tombstones, events.replaceSynced);
+      await applyMerged('habits', habits.all, habits.tombstones, habits.replaceSynced);
+      if (!silent) {
+        final c = res.counts;
+        notify(
+          "Synced! T:${c['tasks'] ?? 0} · N:${c['notes'] ?? 0} · S:${c['social_stats'] ?? 0} · E:${c['local_events'] ?? 0}",
+          tone: P5ToastTone.ok,
+          ms: 2800,
+        );
+      }
+    } else {
+      companionSyncError = res.error;
+      if (!silent) {
+        notify(res.error, tone: P5ToastTone.err, ms: 3200);
+      }
+    }
+    _safeNotify();
+
+    if (_companionDirty && isDataSyncActive && !_disposed) {
+      scheduleCompanionSync();
+    }
+    return res;
   }
 
   Future<void> refreshFinanceSheet({bool silent = false}) async {
@@ -881,6 +1026,8 @@ class MorganaAppState extends ChangeNotifier {
     _disposed = true;
     _clockTimer?.cancel();
     _sheetPollTimer?.cancel();
+    _companionDebounceTimer?.cancel();
+    _companionPollTimer?.cancel();
     _talkTimer?.cancel();
     unawaited(audio.dispose());
     super.dispose();

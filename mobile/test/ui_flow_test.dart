@@ -127,6 +127,11 @@ void main() {
   testWidgets('Tasks, Notes, Events, Stats, Timer, Ask & Settings render with zero overflow across 3 viewports', (tester) async {
     final app = await _createTestAppState(tester, tmpDir);
     await tester.runAsync(() async {
+      await app.settings.updateAll({
+        'sheets_sync_id': '1AbCdEfGhIjKlMnOpQrStUvWxYz',
+        'sheets_key_json': '{"type":"service_account","client_email":"t@p.iam.gserviceaccount.com","private_key":"x"}',
+        'data_sheets_enabled': true,
+      });
       await app.tasks.add('Build Android Release APK', priority: 'high', stat: 'proficiency');
       await app.notes.add('Release Notes', '## Android\n- Floating Bubble #android');
       await app.events.add('Launch Party', DateTime.now().add(const Duration(hours: 2)));

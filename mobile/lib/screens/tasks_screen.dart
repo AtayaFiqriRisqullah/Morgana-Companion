@@ -111,7 +111,6 @@ class _TasksScreenState extends State<TasksScreen> {
     final app = widget.app;
     final all = app.tasks.all();
     final doneCnt = all.where((t) => t['done'] == true).length;
-    final leftCnt = all.length - doneCnt;
     final q = _searchCtrl.text.trim().toLowerCase();
     final now = DateTime.now();
 
@@ -146,12 +145,25 @@ class _TasksScreenState extends State<TasksScreen> {
           title: 'TASKS',
           onAvatarTap: () => app.navigateTo('home'),
           actions: [
-            Text('$leftCnt LEFT · $doneCnt DONE', style: P5Text.display(12, color: P5Colors.goldFg)),
-            const SizedBox(width: 8),
+            Text('$doneCnt/${all.length} DONE', style: P5Text.display(11.5, color: P5Colors.goldFg)),
+            const SizedBox(width: 6),
+            if (app.isDataSyncActive) ...[
+              P5Button(
+                label: '',
+                icon: Icons.sync,
+                variant: app.companionSyncBusy ? P5BtnVariant.gold : P5BtnVariant.mint,
+                height: 28,
+                fontSize: 13,
+                padding: const EdgeInsets.symmetric(horizontal: 6),
+                onTap: app.companionSyncBusy ? null : () => app.syncCompanionData(silent: false),
+              ),
+              const SizedBox(width: 5),
+            ],
             P5Button(
               label: 'NOTES',
               height: 28,
               fontSize: 10.5,
+              padding: const EdgeInsets.symmetric(horizontal: 8),
               onTap: () => app.navigateTo('notes'),
             ),
           ],

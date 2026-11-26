@@ -193,6 +193,17 @@ class _StatsScreenState extends State<StatsScreen> {
           title: 'Social Stats',
           onAvatarTap: () => app.navigateTo('home'),
           actions: [
+            if (app.isDataSyncActive) ...[
+              P5Button(
+                label: '',
+                icon: Icons.sync,
+                variant: app.companionSyncBusy ? P5BtnVariant.gold : P5BtnVariant.mint,
+                height: 28,
+                fontSize: 13,
+                onTap: app.companionSyncBusy ? null : () => app.syncCompanionData(silent: false),
+              ),
+              const SizedBox(width: 6),
+            ],
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
               decoration: BoxDecoration(

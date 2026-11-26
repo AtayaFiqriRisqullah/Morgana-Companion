@@ -42,6 +42,9 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       widget.app.refreshOverlayStatus();
+      if (widget.app.isDataSyncActive) {
+        widget.app.syncCompanionData(silent: true);
+      }
     }
   }
 

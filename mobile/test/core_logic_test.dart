@@ -546,4 +546,277 @@ void main() {
       }
     });
   });
+
+  group('2-Way Companion Google Sheets Sync (Tasks, Notes, Stats, Events, Habits)', () {
+    test('mergeStorePayload handles concurrent adds, LWW edits, tombstones, undo restore & habit parity', () {
+      // 1. Concurrent adds + LWW edit + delete tombstone
+      final merged = mergeStorePayload(
+        storeKey: 'tasks',
+        localItems: [
+          {'id': 't1', 'title': 'From Android (older)', 'done': false, 'updated_at': '2026-11-26T09:00:00Z'},
+          {'id': 't2', 'title': 'Android Only', 'done': false, 'updated_at': '2026-11-26T09:05:00Z'},
+          {'id': 't3', 'title': 'Deleted On Laptop', 'done': false, 'updated_at': '2026-11-26T08:00:00Z'},
+        ],
+        localTombstones: {'t4': '2026-11-26T10:00:00Z'},
+        remoteItems: [
+          {'id': 't1', 'title': 'From Laptop (newer)', 'done': true, 'updated_at': '2026-11-26T09:30:00Z'},
+          {'id': 't4', 'title': 'Deleted On Android', 'done': false, 'updated_at': '2026-11-26T08:30:00Z'},
+          {'id': 't5', 'title': 'Laptop Only', 'done': false, 'updated_at': '2026-11-26T09:10:00Z'},
+        ],
+        remoteTombstones: {'t3': '2026-11-26T09:40:00Z'},
+        nowMs: DateTime.utc(2026, 11, 26, 12, 0).millisecondsSinceEpoch,
+      );
+      final byId = {for (final it in merged.items) it['id']: it};
+      expect(byId.keys, containsAll(['t1', 't2', 't5']));
+      expect(byId.containsKey('t3'), isFalse, reason: 't3 deleted remotely must not resurrect');
+      expect(byId.containsKey('t4'), isFalse, reason: 't4 deleted locally must not resurrect');
+      expect(byId['t1']?['title'], 'From Laptop (newer)');
+      expect(byId['t1']?['done'], isTrue);
+      expect(merged.tombstones.keys, containsAll(['t3', 't4']));
+      expect(merged.localChanged, isTrue);
+      expect(merged.remoteChanged, isTrue);
+
+      // 2. Undo restore with newer timestamp beats older tombstone
+      final restored = mergeStorePayload(
+        storeKey: 'tasks',
+        localItems: [
+          {'id': 't3', 'title': 'Restored Task', 'done': false, 'updated_at': '2026-11-26T10:15:00Z'},
+        ],
+        localTombstones: const {},
+        remoteItems: const [],
+        remoteTombstones: {'t3': '2026-11-26T09:40:00Z'},
+        nowMs: DateTime.utc(2026, 11, 26, 12, 0).millisecondsSinceEpoch,
+      );
+      expect(restored.items.length, 1);
+      expect(restored.items.first['title'], 'Restored Task');
+      expect(restored.tombstones.containsKey('t3'), isFalse);
+
+      // 3. HabitStore parity: done_dates <-> dates mirrored identically
+      final habitMerged = mergeStorePayload(
+        storeKey: 'habits',
+        localItems: [
+          {'id': 'h1', 'name': 'Read', 'dates': ['2026-11-25'], 'updated': '2026-11-26T08:00:00Z'},
+        ],
+        localTombstones: const {},
+        remoteItems: [
+          {'id': 'h1', 'name': 'Read 20m', 'done_dates': ['2026-11-25', '2026-11-26'], 'updated': '2026-11-26T09:00:00Z'},
+        ],
+        remoteTombstones: const {},
+        nowMs: DateTime.utc(2026, 11, 26, 12, 0).millisecondsSinceEpoch,
+      );
+      expect(habitMerged.items.length, 1);
+      expect(habitMerged.items.first['done_dates'], ['2026-11-25', '2026-11-26']);
+      expect(habitMerged.items.first['dates'], ['2026-11-25', '2026-11-26']);
+
+      // 4. Chunking round-trip across multiple 45k-char cells
+      final hugeBody = List.filled(95000, 'A').join();
+      final row = encodeStoreRow(
+        'notes',
+        [{'id': 'n_big', 'title': 'Huge Note', 'body': hugeBody, 'updated': '2026-11-26T10:00:00Z'}],
+        {'n_old': '2026-11-25T10:00:00Z'},
+        '2026-11-26T10:00:00Z',
+      );
+      // 3 metadata cols + >=3 payload chunks
+      expect(row.length, greaterThanOrEqualTo(6));
+      for (var i = 3; i < row.length; i++) {
+        expect(row[i].toString().length, lessThanOrEqualTo(kSyncChunkSize));
+      }
+      final decoded = decodeStoreRows([
+        ['store', 'updated_at', 'count', 'payload_0'],
+        row,
+      ]);
+      expect(decoded['notes']?.items.length, 1);
+      expect(decoded['notes']?.items.first['body'], hugeBody);
+      expect(decoded['notes']?.tombstones['n_old'], '2026-11-25T10:00:00Z');
+    });
+
+    test('syncCompanionData auto-creates Morgana_Sync, syncs 2-way with Desktop & skips redundant writes', () async {
+      final (pem, _) = _generateTestRsaPkcs8Pem();
+      final saJson = jsonEncode({
+        'type': 'service_account',
+        'client_email': 'morgana-sync@project.iam.gserviceaccount.com',
+        'private_key': pem,
+        'token_uri': 'https://oauth2.googleapis.com/token',
+      });
+
+      final tabs = <String, List<List<dynamic>>>{'Morgana': []};
+      var putCount = 0;
+      var createdSyncTab = false;
+      String? lastValueInputOption;
+
+      final mockHttp = MockClient((req) async {
+        final url = req.url.toString();
+        if (url.contains('oauth2.googleapis.com/token')) {
+          return http.Response(jsonEncode({'access_token': 'sync-token'}), 200);
+        }
+        if (req.method == 'POST' && url.contains(':batchUpdate')) {
+          final body = jsonDecode(req.body) as Map<String, dynamic>;
+          final reqs = body['requests'] as List? ?? const [];
+          for (final r in reqs) {
+            final title = (r as Map)['addSheet']?['properties']?['title']?.toString();
+            if (title != null && title.isNotEmpty) {
+              tabs.putIfAbsent(title, () => []);
+              if (title == kCompanionSyncTab) createdSyncTab = true;
+            }
+          }
+          return http.Response(jsonEncode({'replies': []}), 200);
+        }
+        if (url.contains('/values/')) {
+          final afterValues = url.split('/values/').last.split('?').first;
+          final decodedRange = Uri.decodeComponent(afterValues);
+          final tabName = decodedRange.split('!').first.replaceAll("'", '');
+          if (req.method == 'GET') {
+            if (!tabs.containsKey(tabName)) {
+              return http.Response('Unable to parse range: $decodedRange', 400);
+            }
+            return http.Response(jsonEncode({'values': tabs[tabName]}), 200);
+          }
+          if (req.method == 'POST' && url.endsWith(':clear')) {
+            if (!tabs.containsKey(tabName)) {
+              return http.Response('Unable to parse range: $decodedRange', 400);
+            }
+            tabs[tabName] = [];
+            return http.Response(jsonEncode({}), 200);
+          }
+          if (req.method == 'PUT') {
+            putCount++;
+            lastValueInputOption = req.url.queryParameters['valueInputOption'];
+            final body = jsonDecode(req.body) as Map<String, dynamic>;
+            final vals = (body['values'] as List? ?? const [])
+                .map((r) => List<dynamic>.from(r as List))
+                .toList();
+            tabs[tabName] = vals;
+            return http.Response(jsonEncode({'updatedCells': vals.length}), 200);
+          }
+        }
+        return http.Response('Unhandled ${req.method} $url', 404);
+      });
+
+      final tmp = Directory.systemTemp.createTempSync('morgana_sync_app_');
+      try {
+        final client = GoogleSheetsFinanceClient(client: mockHttp);
+        final app = MorganaAppState(sheets: client);
+        await app.init(storageDirOverride: tmp, enablePlatformHooks: false);
+        app.audio.enabled = false;
+
+        await app.settings.updateAll({
+          'sheets_sync_id': '1AbCdEfGhIjKlMnOpQrStUvWxYz',
+          'sheets_key_json': saJson,
+          'data_sheets_enabled': true,
+          'sheets_sync_tab': 'Morgana',
+        });
+
+        // Create local Android items across all 5 stores
+        final localTask = await app.tasks.add('Android Task', priority: 'high', deadline: DateTime(2026, 12, 1, 10, 0));
+        await app.notes.add('Android Note', 'Sync body #sync');
+        await app.stats.add('knowledge', 'Study', points: 3);
+        await app.events.add('Android Event', DateTime(2026, 12, 2, 14, 0));
+        await app.habits.add('Android Habit', stat: 'guts', points: 2);
+
+        // 1st sync: auto-creates Morgana_Sync tab, writes RAW payload + updates Morgana deadlines
+        final r1 = await app.syncCompanionData(silent: true);
+        expect(r1.ok, isTrue, reason: r1.error);
+        expect(createdSyncTab, isTrue);
+        expect(lastValueInputOption, 'RAW');
+        expect(tabs[kCompanionSyncTab]?.length, 6); // header + 5 stores
+        expect(tabs['Morgana']?.length, 2); // header + 1 active task
+
+        // 2nd sync immediately after: converged -> ZERO PUT calls!
+        final putsAfterFirst = putCount;
+        final r2 = await app.syncCompanionData(silent: true);
+        expect(r2.ok, isTrue, reason: r2.error);
+        expect(r2.remoteChanged, isEmpty);
+        expect(r2.localChanged, isEmpty);
+        expect(putCount, putsAfterFirst, reason: 'Converged poll must perform 0 writes');
+
+        // Simulate Desktop Laptop adding items in all 5 stores & deleting Android's task
+        final curRemote = decodeStoreRows(tabs[kCompanionSyncTab]!);
+        final tsNow = DateTime.now().add(const Duration(minutes: 5)).toUtc().toIso8601String();
+        final newSyncRows = <List<dynamic>>[
+          ['store', 'updated_at', 'count', 'payload_0'],
+          encodeStoreRow(
+            'tasks',
+            [
+              {'id': 'desk_t1', 'title': 'From Laptop', 'done': false, 'priority': 'med', 'updated_at': tsNow},
+            ],
+            {localTask!['id'].toString(): tsNow},
+            tsNow,
+          ),
+          encodeStoreRow(
+            'notes',
+            [
+              ...curRemote['notes']!.items,
+              {'id': 'desk_n1', 'title': 'Laptop Note', 'body': 'Hello from PC', 'updated': tsNow},
+            ],
+            const {},
+            tsNow,
+          ),
+          encodeStoreRow(
+            'social_stats',
+            [
+              ...curRemote['social_stats']!.items,
+              {'id': 'desk_s1', 'stat': 'charm', 'note': 'Laptop Charm', 'points': 4, 'date': '2026-11-26', 'updated': tsNow},
+            ],
+            const {},
+            tsNow,
+          ),
+          encodeStoreRow(
+            'local_events',
+            [
+              ...curRemote['local_events']!.items,
+              {'id': 'desk_e1', 'title': 'Laptop Event', 'start': '2026-12-03T09:00:00', 'end': '2026-12-03T10:00:00', 'updated': tsNow},
+            ],
+            const {},
+            tsNow,
+          ),
+          encodeStoreRow(
+            'habits',
+            [
+              ...curRemote['habits']!.items,
+              {'id': 'desk_h1', 'name': 'Laptop Habit', 'stat': 'proficiency', 'points': 2, 'done_dates': ['2026-11-26'], 'updated': tsNow},
+            ],
+            const {},
+            tsNow,
+          ),
+        ];
+        tabs[kCompanionSyncTab] = newSyncRows;
+
+        // 3rd sync: Android pulls all Laptop changes and removes deleted localTask
+        final r3 = await app.syncCompanionData(silent: true);
+        expect(r3.ok, isTrue, reason: r3.error);
+        expect(r3.localChanged, containsAll(['tasks', 'notes', 'social_stats', 'local_events', 'habits']));
+        expect(app.tasks.all().map((t) => t['id']).toList(), ['desk_t1']);
+        expect(app.notes.all().length, 2);
+        expect(app.stats.totalFor('knowledge'), 3);
+        expect(app.stats.totalFor('charm'), 4);
+        expect(app.events.all().length, 2);
+        expect(app.habits.all().length, 2);
+        final deskHabit = app.habits.all().firstWhere((h) => h['id'] == 'desk_h1');
+        expect(deskHabit['dates'], ['2026-11-26']);
+        expect(deskHabit['done_dates'], ['2026-11-26']);
+
+        // Verify persistence to disk after reload
+        final reloadedTasks = TaskStore(File('${tmp.path}/tasks.json'));
+        await reloadedTasks.load();
+        expect(reloadedTasks.all().map((t) => t['id']).toList(), ['desk_t1']);
+        expect(reloadedTasks.tombstones().containsKey(localTask['id'].toString()), isTrue);
+
+        // Verify one-time settings migration for existing Finance Sheets users
+        final migFile = File('${tmp.path}/legacy_settings.json');
+        await migFile.writeAsString(jsonEncode({
+          'finance_sheets_enabled': true,
+          'sheets_sync_id': '1AbCdEfGhIjKlMnOpQrStUvWxYz',
+          'sheets_key_json': saJson,
+        }));
+        final migSettings = SettingsStore(migFile);
+        await migSettings.load();
+        expect(migSettings['data_sheets_enabled'], isTrue);
+        expect(migSettings['companion_sheets_migrated'], isTrue);
+
+        app.dispose();
+      } finally {
+        if (tmp.existsSync()) tmp.deleteSync(recursive: true);
+      }
+    });
+  });
 }

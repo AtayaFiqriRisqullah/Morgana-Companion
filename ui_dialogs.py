@@ -4181,11 +4181,13 @@ class SettingsDialog(P5FluidPanel):
         lsh = QVBoxLayout(c_sh)
         lsh.setContentsMargins(pad_x, pad_y, pad_x, pad_y)
         lsh.setSpacing(row_gap)
-        hsh = QLabel("GOOGLE SHEETS SYNC (BOT-WA)")
+        hsh = QLabel("GOOGLE SHEETS SYNC (2-WAY + BOT-WA)")
         hsh.setObjectName("section")
         lsh.addWidget(hsh)
 
-        self.sheets_sync_enabled_check = P5CheckBox("Sync task deadlines to Google Sheets (opt-in)", scale=sc)
+        self.sheets_sync_enabled_check = P5CheckBox(
+            "Sync Tasks, Notes, Stats & Events via Google Sheets (2-way Laptop ↔ Android)", scale=sc,
+        )
         self.sheets_sync_enabled_check.toggled.connect(self._sync_sheets_fields)
         lsh.addWidget(self.sheets_sync_enabled_check)
 
@@ -4224,7 +4226,7 @@ class SettingsDialog(P5FluidPanel):
         self._sheets_test_btn.clicked.connect(self._on_test_sheets_clicked)
         sh_btn_row.addWidget(self._sheets_test_btn)
 
-        self._sheets_sync_btn = self._btn("SYNC TASKS", variant="soft", display=True, px=10)
+        self._sheets_sync_btn = self._btn("SYNC ALL NOW", variant="soft", display=True, px=10)
         self._sheets_sync_btn.setFixedHeight(_sc(26, sc, 22))
         self._sheets_sync_btn.clicked.connect(self._on_sync_sheets_now_clicked)
         sh_btn_row.addWidget(self._sheets_sync_btn)
@@ -4232,8 +4234,8 @@ class SettingsDialog(P5FluidPanel):
         lsh.addLayout(sh_btn_row)
 
         self._sheets_status_lbl = QLabel(
-            "Off by default. Shares the exact same Spreadsheet ID & kunci-google.json as bot-wa "
-            "(Januari–Desember budget tabs + optional task deadline relay)."
+            "Off by default. Uses the same Spreadsheet ID & kunci-google.json as bot-wa "
+            "(Januari–Desember budget tabs + Morgana_Sync 2-way Tasks/Notes/Stats/Events + Morgana deadline tab)."
         )
         self._sheets_status_lbl.setObjectName("tip")
         self._sheets_status_lbl.setWordWrap(True)
@@ -4396,8 +4398,8 @@ class SettingsDialog(P5FluidPanel):
         self._sheets_test_btn.setEnabled(False)
         self._sheets_sync_btn.setEnabled(False)
         self._sheets_status_lbl.setStyleSheet(f"color: #FAD02C; font-size: {_sc(12, self._ui_scale, 9)}px;")
-        self._sheets_status_lbl.setText("Pushing active task deadlines to Google Sheets...")
-        self.notify("Syncing task deadlines to Google Sheets...", tone="info", ms=1600)
+        self._sheets_status_lbl.setText("Syncing Tasks, Notes, Stats & Events with Google Sheets...")
+        self.notify("Syncing Tasks, Notes, Stats & Events...", tone="info", ms=1600)
         self.sync_sheets_now_requested.emit(self._sheets_form_payload())
 
     def set_sheets_status(self, ok: bool, message: str) -> None:
@@ -4571,8 +4573,8 @@ class SettingsDialog(P5FluidPanel):
             self.sheets_key_edit.setText(str(values.get("sheets_sync_key_path", SETTINGS_DEFAULTS["sheets_sync_key_path"])))
             self._sheets_status_lbl.setStyleSheet("")
             self._sheets_status_lbl.setText(
-                "Off by default. Shares the exact same Spreadsheet ID & kunci-google.json as bot-wa "
-                "(Januari–Desember budget tabs + optional task deadline relay)."
+                "Off by default. Uses the same Spreadsheet ID & kunci-google.json as bot-wa "
+                "(Januari–Desember budget tabs + Morgana_Sync 2-way Tasks/Notes/Stats/Events + Morgana deadline tab)."
             )
             self._sync_sheets_fields()
             enabled = set(values.get("enabled_tabs", RADIAL_TAB_KEYS))

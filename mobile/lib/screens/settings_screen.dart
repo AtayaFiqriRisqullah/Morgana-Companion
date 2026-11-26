@@ -35,6 +35,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _hideApiKey = true;
 
   late bool _sheetsEnabled;
+  late bool _dataSheetsEnabled;
   late String _sheetsKeyName;
   late String _sheetsKeyJson;
 
@@ -45,9 +46,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
   final _aiKeyCtrl = TextEditingController();
   final _aiEndpointCtrl = TextEditingController();
   final _sheetIdCtrl = TextEditingController();
+  final _sheetsTabCtrl = TextEditingController();
 
   bool _testingAi = false;
   bool _testingSheets = false;
+  bool _syncingData = false;
 
   @override
   void initState() {
@@ -76,7 +79,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _aiEndpointCtrl.text = (s['ai_endpoint'] ?? 'http://localhost:11434/v1/chat/completions').toString();
 
     _sheetsEnabled = s['finance_sheets_enabled'] == true;
+    _dataSheetsEnabled = s['data_sheets_enabled'] == true;
     _sheetIdCtrl.text = (s['sheets_sync_id'] ?? '').toString();
+    _sheetsTabCtrl.text = (s['sheets_sync_tab'] ?? 'Morgana').toString();
     _sheetsKeyName = (s['sheets_key_name'] ?? '').toString();
     _sheetsKeyJson = (s['sheets_key_json'] ?? '').toString();
   }
@@ -90,6 +95,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _aiKeyCtrl.dispose();
     _aiEndpointCtrl.dispose();
     _sheetIdCtrl.dispose();
+    _sheetsTabCtrl.dispose();
     super.dispose();
   }
 
@@ -129,6 +135,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final rawSheet = _sheetIdCtrl.text.trim();
     final extracted = extractSpreadsheetId(rawSheet);
     final storedSheetId = extracted.isNotEmpty ? extracted : rawSheet;
+    final cleanTab = _sheetsTabCtrl.text.trim().isEmpty ? 'Morgana' : _sheetsTabCtrl.text.trim();
 
     await widget.app.settings.updateAll({
       'sound_enabled': _soundEnabled,
@@ -147,7 +154,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
       'ai_endpoint': _aiEndpointCtrl.text.trim(),
       'ai_call_user': _callUserCtrl.text.trim().isEmpty ? 'Joker' : _callUserCtrl.text.trim(),
       'finance_sheets_enabled': _sheetsEnabled,
+      'data_sheets_enabled': _dataSheetsEnabled,
       'sheets_sync_id': storedSheetId,
+      'sheets_sync_tab': cleanTab,
       'sheets_key_name': _sheetsKeyName,
       'sheets_key_json': _sheetsKeyJson,
     });
@@ -161,6 +170,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
     widget.app.notify('Settings saved!', tone: P5ToastTone.ok);
     if (widget.app.settings.financeSheetsActive) {
       widget.app.refreshFinanceSheet(silent: true);
+    }
+    if (widget.app.settings.dataSheetsActive) {
+      widget.app.syncCompanionData(silent: true);
     }
     setState(() {});
   }
@@ -186,10 +198,26 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final (ok, msg) = await widget.app.sheetsClient.testConnection(
       rawSheetId: _sheetIdCtrl.text.trim(),
       keyJson: _sheetsKeyJson,
+      checkFinance: _sheetsEnabled || !_dataSheetsEnabled,
+      checkDataSync: _dataSheetsEnabled || !_sheetsEnabled,
     );
     if (!mounted) return;
     setState(() => _testingSheets = false);
-    widget.app.notify(msg, tone: ok ? P5ToastTone.ok : P5ToastTone.err, ms: 3200);
+    widget.app.notify(msg, tone: ok ? P5ToastTone.ok : P5ToastTone.err, ms: 3400);
+  }
+
+  Future<void> _syncAllDataNow() async {
+    if (_syncingData) return;
+    setState(() => _syncingData = true);
+    await widget.app.syncCompanionData(
+      silent: false,
+      forceDeadlines: true,
+      sheetIdOverride: _sheetIdCtrl.text.trim(),
+      keyJsonOverride: _sheetsKeyJson,
+      deadlineTabOverride: _sheetsTabCtrl.text.trim(),
+    );
+    if (!mounted) return;
+    setState(() => _syncingData = false);
   }
 
   Future<void> _resetDefaults() async {
@@ -468,25 +496,42 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ),
               const SizedBox(height: 10),
 
-              // 4. Google Sheets Finance Sync (bot-wa Monthly_Budget)
+              // 4. Google Sheets Sync (2-Way Tasks/Notes/Stats/Events + bot-wa Finance)
               P5Card(
-                borderColor: _sheetsEnabled ? P5Colors.mintBorder : P5Colors.border,
+                borderColor: (_sheetsEnabled || _dataSheetsEnabled) ? P5Colors.mintBorder : P5Colors.border,
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text('GOOGLE SHEETS FINANCE SYNC', style: P5Text.display(13, color: P5Colors.gold)),
+                    Text('GOOGLE SHEETS SYNC (2-WAY + BOT-WA)', style: P5Text.display(13, color: P5Colors.gold)),
                     SwitchListTile(
                       dense: true,
                       contentPadding: EdgeInsets.zero,
-                      title: Text('Live Monthly_Budget Sync (bot-wa)', style: P5Text.body(13, color: P5Colors.white)),
+                      title: Text('Sync Tasks, Notes, Stats & Events (2-Way)', style: P5Text.body(13, color: P5Colors.white, bold: true)),
+                      subtitle: Text('Laptop ↔ Android via Morgana_Sync + WhatsApp deadline tab', style: P5Text.body(11, color: P5Colors.muted)),
+                      value: _dataSheetsEnabled,
+                      onChanged: (v) => setState(() => _dataSheetsEnabled = v),
+                    ),
+                    SwitchListTile(
+                      dense: true,
+                      contentPadding: EdgeInsets.zero,
+                      title: Text('Live Monthly_Budget Finance Sync (bot-wa)', style: P5Text.body(13, color: P5Colors.white)),
                       value: _sheetsEnabled,
                       onChanged: (v) => setState(() => _sheetsEnabled = v),
                     ),
+                    const SizedBox(height: 4),
                     TextField(
                       controller: _sheetIdCtrl,
                       decoration: const InputDecoration(
                         labelText: 'Spreadsheet URL or ID',
                         hintText: 'https://docs.google.com/spreadsheets/d/...',
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: _sheetsTabCtrl,
+                      decoration: const InputDecoration(
+                        labelText: 'Tasks Deadline Tab (bot-wa)',
+                        hintText: 'Morgana',
                       ),
                     ),
                     const SizedBox(height: 8),
@@ -547,12 +592,31 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       ],
                     ),
                     const SizedBox(height: 8),
-                    P5Button(
-                      label: _testingSheets ? 'TESTING SHEETS...' : 'TEST SHEETS CONNECTION',
-                      variant: P5BtnVariant.mint,
-                      height: 36,
-                      expand: true,
-                      onTap: _testingSheets ? null : _testSheets,
+                    Row(
+                      children: [
+                        Expanded(
+                          child: P5Button(
+                            label: _testingSheets ? 'TESTING...' : 'TEST SHEETS',
+                            variant: P5BtnVariant.soft,
+                            height: 36,
+                            fontSize: 11.5,
+                            expand: true,
+                            onTap: _testingSheets ? null : _testSheets,
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                        Expanded(
+                          child: P5Button(
+                            label: (_syncingData || app.companionSyncBusy) ? 'SYNCING...' : 'SYNC ALL DATA',
+                            icon: Icons.sync,
+                            variant: P5BtnVariant.mint,
+                            height: 36,
+                            fontSize: 11.5,
+                            expand: true,
+                            onTap: (_syncingData || app.companionSyncBusy) ? null : _syncAllDataNow,
+                          ),
+                        ),
+                      ],
                     ),
                   ],
                 ),

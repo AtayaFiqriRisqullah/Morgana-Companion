@@ -652,16 +652,60 @@ class FinanceStore {
 }
 
 // ---------------------------------------------------------------------------
+// Shared 90-day tombstone pruning helper for 2-way Google Sheets sync.
+Map<String, String> _pruneTombstoneMap(Map<String, String> raw) {
+  if (raw.isEmpty) return {};
+  final cutoff = DateTime.now().subtract(const Duration(days: 90));
+  final out = <String, String>{};
+  raw.forEach((k, v) {
+    final key = k.trim();
+    final val = v.trim();
+    if (key.isEmpty || val.isEmpty) return;
+    final dt = DateTime.tryParse(val);
+    if (dt == null || !dt.isBefore(cutoff)) {
+      out[key] = val;
+    }
+  });
+  return out;
+}
+
+Map<String, String> _readTombstonesFromRaw(dynamic raw) {
+  if (raw is Map && raw['tombstones'] is Map) {
+    final map = <String, String>{};
+    (raw['tombstones'] as Map).forEach((k, v) {
+      final ks = k.toString().trim();
+      final vs = (v ?? '').toString().trim();
+      if (ks.isNotEmpty && vs.isNotEmpty) map[ks] = vs;
+    });
+    return _pruneTombstoneMap(map);
+  }
+  return {};
+}
+
+Map<String, dynamic> _normalizeHabitRecord(Map<String, dynamic> raw) {
+  final copy = Map<String, dynamic>.from(raw);
+  final src = copy['done_dates'] is List
+      ? copy['done_dates'] as List
+      : (copy['dates'] is List ? copy['dates'] as List : const []);
+  final cleaned = src.map((e) => e.toString().trim()).where((e) => e.isNotEmpty).toSet().toList()..sort();
+  copy['dates'] = cleaned;
+  copy['done_dates'] = List<String>.from(cleaned);
+  return copy;
+}
+
 // 2. TASK STORE
 // ---------------------------------------------------------------------------
 class TaskStore {
   final File file;
   List<Map<String, dynamic>> _items = [];
+  Map<String, String> _tombstones = {};
+  void Function()? onMutated;
 
   TaskStore(this.file);
 
   Future<void> load() async {
     _items = [];
+    _tombstones = {};
     final raw = await readJsonSafe(file);
     final list = raw is Map ? raw['items'] : raw;
     if (list is List) {
@@ -671,9 +715,28 @@ class TaskStore {
           .where((e) => (e['id'] ?? '').toString().isNotEmpty)
           .toList();
     }
+    _tombstones = _readTombstonesFromRaw(raw);
   }
 
-  Future<bool> save() => writeJsonAtomic(file, {'version': 1, 'items': _items});
+  Future<bool> save({bool emit = true}) async {
+    _tombstones = _pruneTombstoneMap(_tombstones);
+    final payload = <String, dynamic>{'version': 1, 'items': _items};
+    if (_tombstones.isNotEmpty) payload['tombstones'] = _tombstones;
+    final ok = await writeJsonAtomic(file, payload);
+    if (ok && emit) onMutated?.call();
+    return ok;
+  }
+
+  Future<bool> replaceSynced(List<Map<String, dynamic>> items, Map<String, String> tombstones) {
+    _items = items.map((e) => Map<String, dynamic>.from(e)).where((e) => (e['id'] ?? '').toString().isNotEmpty).toList();
+    _tombstones = _pruneTombstoneMap(Map<String, String>.from(tombstones));
+    return save(emit: false);
+  }
+
+  Map<String, String> tombstones() {
+    _tombstones = _pruneTombstoneMap(_tombstones);
+    return Map<String, String>.from(_tombstones);
+  }
 
   List<Map<String, dynamic>> all() => _items.map((e) => Map<String, dynamic>.from(e)).toList();
 
@@ -733,6 +796,7 @@ class TaskStore {
     final idx = _items.indexWhere((t) => t['id'] == id);
     if (idx < 0 || _items[idx]['rewarded'] == true) return false;
     _items[idx]['rewarded'] = true;
+    _items[idx]['updated_at'] = nowIso();
     await save();
     return true;
   }
@@ -780,6 +844,7 @@ class TaskStore {
     final idx = _items.indexWhere((t) => t['id'] == id);
     if (idx < 0) return null;
     final removed = Map<String, dynamic>.from(_items.removeAt(idx));
+    _tombstones[id] = nowIso();
     await save();
     return removed;
   }
@@ -787,6 +852,11 @@ class TaskStore {
   Future<List<Map<String, dynamic>>> clearDone() async {
     final removed = _items.where((t) => t['done'] == true).map((e) => Map<String, dynamic>.from(e)).toList();
     if (removed.isEmpty) return [];
+    final ts = nowIso();
+    for (final t in removed) {
+      final tid = (t['id'] ?? '').toString();
+      if (tid.isNotEmpty) _tombstones[tid] = ts;
+    }
     _items.removeWhere((t) => t['done'] == true);
     await save();
     return removed;
@@ -794,8 +864,16 @@ class TaskStore {
 
   Future<void> restore(List<Map<String, dynamic>> items) async {
     final ids = _items.map((e) => e['id']).toSet();
+    final ts = nowIso();
     for (final it in items) {
-      if (!ids.contains(it['id'])) _items.add(Map<String, dynamic>.from(it));
+      final tid = (it['id'] ?? '').toString();
+      if (tid.isNotEmpty && !ids.contains(tid)) {
+        final copy = Map<String, dynamic>.from(it);
+        copy['updated_at'] = ts;
+        _tombstones.remove(tid);
+        _items.add(copy);
+        ids.add(tid);
+      }
     }
     await save();
   }
@@ -809,11 +887,14 @@ final RegExp _hashTagRe = RegExp(r'(?<![\w/#])#([A-Za-z][A-Za-z0-9_-]{0,23})');
 class NoteStore {
   final File file;
   List<Map<String, dynamic>> _items = [];
+  Map<String, String> _tombstones = {};
+  void Function()? onMutated;
 
   NoteStore(this.file);
 
   Future<void> load() async {
     _items = [];
+    _tombstones = {};
     final raw = await readJsonSafe(file);
     final list = raw is Map ? raw['items'] : raw;
     if (list is List) {
@@ -823,9 +904,28 @@ class NoteStore {
           .where((e) => (e['id'] ?? '').toString().isNotEmpty)
           .toList();
     }
+    _tombstones = _readTombstonesFromRaw(raw);
   }
 
-  Future<bool> save() => writeJsonAtomic(file, {'version': 1, 'items': _items});
+  Future<bool> save({bool emit = true}) async {
+    _tombstones = _pruneTombstoneMap(_tombstones);
+    final payload = <String, dynamic>{'version': 1, 'items': _items};
+    if (_tombstones.isNotEmpty) payload['tombstones'] = _tombstones;
+    final ok = await writeJsonAtomic(file, payload);
+    if (ok && emit) onMutated?.call();
+    return ok;
+  }
+
+  Future<bool> replaceSynced(List<Map<String, dynamic>> items, Map<String, String> tombstones) {
+    _items = items.map((e) => Map<String, dynamic>.from(e)).where((e) => (e['id'] ?? '').toString().isNotEmpty).toList();
+    _tombstones = _pruneTombstoneMap(Map<String, String>.from(tombstones));
+    return save(emit: false);
+  }
+
+  Map<String, String> tombstones() {
+    _tombstones = _pruneTombstoneMap(_tombstones);
+    return Map<String, String>.from(_tombstones);
+  }
 
   static List<String> extractTags(String title, String content) {
     final seen = <String>{};
@@ -901,6 +1001,8 @@ class NoteStore {
     final idx = _items.indexWhere((n) => n['id'] == id);
     if (idx >= 0) {
       _items[idx]['pinned'] = pinned;
+      if (pinned) _items[idx]['archived'] = false;
+      _items[idx]['updated'] = nowIso();
       await save();
     }
   }
@@ -909,6 +1011,8 @@ class NoteStore {
     final idx = _items.indexWhere((n) => n['id'] == id);
     if (idx >= 0) {
       _items[idx]['archived'] = archived;
+      if (archived) _items[idx]['pinned'] = false;
+      _items[idx]['updated'] = nowIso();
       await save();
     }
   }
@@ -917,12 +1021,17 @@ class NoteStore {
     final idx = _items.indexWhere((n) => n['id'] == id);
     if (idx < 0) return null;
     final removed = Map<String, dynamic>.from(_items.removeAt(idx));
+    _tombstones[id] = nowIso();
     await save();
     return removed;
   }
 
   Future<Map<String, dynamic>> restore(Map<String, dynamic> note) async {
     final copy = Map<String, dynamic>.from(note);
+    copy['updated'] = nowIso();
+    final nid = (copy['id'] ?? '').toString();
+    if (nid.isNotEmpty) _tombstones.remove(nid);
+    _items.removeWhere((n) => n['id'] == nid);
     _items.add(copy);
     await save();
     return copy;
@@ -935,11 +1044,14 @@ class NoteStore {
 class LocalEventStore {
   final File file;
   List<Map<String, dynamic>> _items = [];
+  Map<String, String> _tombstones = {};
+  void Function()? onMutated;
 
   LocalEventStore(this.file);
 
   Future<void> load() async {
     _items = [];
+    _tombstones = {};
     final raw = await readJsonSafe(file);
     final list = raw is Map ? raw['items'] : raw;
     if (list is List) {
@@ -949,9 +1061,28 @@ class LocalEventStore {
           .where((e) => (e['id'] ?? '').toString().isNotEmpty)
           .toList();
     }
+    _tombstones = _readTombstonesFromRaw(raw);
   }
 
-  Future<bool> save() => writeJsonAtomic(file, {'version': 1, 'items': _items});
+  Future<bool> save({bool emit = true}) async {
+    _tombstones = _pruneTombstoneMap(_tombstones);
+    final payload = <String, dynamic>{'version': 1, 'items': _items};
+    if (_tombstones.isNotEmpty) payload['tombstones'] = _tombstones;
+    final ok = await writeJsonAtomic(file, payload);
+    if (ok && emit) onMutated?.call();
+    return ok;
+  }
+
+  Future<bool> replaceSynced(List<Map<String, dynamic>> items, Map<String, String> tombstones) {
+    _items = items.map((e) => Map<String, dynamic>.from(e)).where((e) => (e['id'] ?? '').toString().isNotEmpty).toList();
+    _tombstones = _pruneTombstoneMap(Map<String, String>.from(tombstones));
+    return save(emit: false);
+  }
+
+  Map<String, String> tombstones() {
+    _tombstones = _pruneTombstoneMap(_tombstones);
+    return Map<String, String>.from(_tombstones);
+  }
 
   List<Map<String, dynamic>> all() => _items.map((e) => Map<String, dynamic>.from(e)).toList();
 
@@ -964,6 +1095,7 @@ class LocalEventStore {
   }) async {
     final clean = title.trim();
     if (clean.isEmpty) return null;
+    final ts = nowIso();
     final ev = <String, dynamic>{
       'id': _newId(10),
       'title': clean,
@@ -971,7 +1103,8 @@ class LocalEventStore {
       'end': allDay ? null : (end ?? start.add(const Duration(hours: 1))).toIso8601String().substring(0, 16),
       'all_day': allDay,
       'location': location.trim(),
-      'created': nowIso(),
+      'created': ts,
+      'updated': ts,
     };
     _items.add(ev);
     await save();
@@ -994,6 +1127,7 @@ class LocalEventStore {
     _items[idx]['end'] = allDay ? null : (end ?? start.add(const Duration(hours: 1))).toIso8601String().substring(0, 16);
     _items[idx]['all_day'] = allDay;
     _items[idx]['location'] = location.trim();
+    _items[idx]['updated'] = nowIso();
     await save();
     return Map<String, dynamic>.from(_items[idx]);
   }
@@ -1002,12 +1136,18 @@ class LocalEventStore {
     final idx = _items.indexWhere((e) => e['id'] == id);
     if (idx < 0) return null;
     final removed = Map<String, dynamic>.from(_items.removeAt(idx));
+    _tombstones[id] = nowIso();
     await save();
     return removed;
   }
 
   Future<void> restore(Map<String, dynamic> ev) async {
-    _items.add(Map<String, dynamic>.from(ev));
+    final copy = Map<String, dynamic>.from(ev);
+    copy['updated'] = nowIso();
+    final eid = (copy['id'] ?? '').toString();
+    if (eid.isNotEmpty) _tombstones.remove(eid);
+    _items.removeWhere((e) => e['id'] == eid);
+    _items.add(copy);
     await save();
   }
 }
@@ -1018,11 +1158,14 @@ class LocalEventStore {
 class SocialStatsStore {
   final File file;
   List<Map<String, dynamic>> _items = [];
+  Map<String, String> _tombstones = {};
+  void Function()? onMutated;
 
   SocialStatsStore(this.file);
 
   Future<void> load() async {
     _items = [];
+    _tombstones = {};
     final raw = await readJsonSafe(file);
     final list = raw is Map ? raw['items'] : raw;
     if (list is List) {
@@ -1032,9 +1175,30 @@ class SocialStatsStore {
           .where((e) => (e['id'] ?? '').toString().isNotEmpty)
           .toList();
     }
+    _tombstones = _readTombstonesFromRaw(raw);
   }
 
-  Future<bool> save() => writeJsonAtomic(file, {'version': 1, 'items': _items});
+  Future<bool> save({bool emit = true}) async {
+    _tombstones = _pruneTombstoneMap(_tombstones);
+    final payload = <String, dynamic>{'version': 1, 'items': _items};
+    if (_tombstones.isNotEmpty) payload['tombstones'] = _tombstones;
+    final ok = await writeJsonAtomic(file, payload);
+    if (ok && emit) onMutated?.call();
+    return ok;
+  }
+
+  Future<bool> replaceSynced(List<Map<String, dynamic>> items, Map<String, String> tombstones) {
+    _items = items.map((e) => Map<String, dynamic>.from(e)).where((e) => (e['id'] ?? '').toString().isNotEmpty).toList();
+    _tombstones = _pruneTombstoneMap(Map<String, String>.from(tombstones));
+    return save(emit: false);
+  }
+
+  Map<String, String> tombstones() {
+    _tombstones = _pruneTombstoneMap(_tombstones);
+    return Map<String, String>.from(_tombstones);
+  }
+
+  List<Map<String, dynamic>> all() => _items.map((e) => Map<String, dynamic>.from(e)).toList();
 
   Map<String, int> totals() {
     final out = {for (final k in kSocialStatKeys) k: 0};
@@ -1093,6 +1257,7 @@ class SocialStatsStore {
     final pts = points.clamp(1, 500);
     final oldLv = statLevel(totalFor(stat));
     final text = activity.trim().isEmpty ? '${kSocialStats[stat]!.label} block' : activity.trim();
+    final ts = nowIso();
     final entry = <String, dynamic>{
       'id': _newId(12),
       'stat': stat,
@@ -1102,7 +1267,7 @@ class SocialStatsStore {
       'block': (block != null && kTimeBlocks.contains(block)) ? block : defaultTimeBlock(),
       'source': source,
       'ref_id': refId,
-      'created': nowIso(),
+      'created': ts,
     };
     _items.add(entry);
     await save();
@@ -1124,6 +1289,7 @@ class SocialStatsStore {
     _items[idx]['activity'] = activity.trim();
     _items[idx]['points'] = points.clamp(1, 500);
     _items[idx]['block'] = kTimeBlocks.contains(block) ? block : defaultTimeBlock();
+    _items[idx]['updated'] = nowIso();
     await save();
     return (Map<String, dynamic>.from(_items[idx]), prev);
   }
@@ -1132,21 +1298,37 @@ class SocialStatsStore {
     final idx = _items.indexWhere((e) => e['id'] == id);
     if (idx < 0) return null;
     final removed = Map<String, dynamic>.from(_items.removeAt(idx));
+    _tombstones[id] = nowIso();
     await save();
     return removed;
   }
 
   Future<void> deleteByRef(String refId, String dateStr) async {
-    _items.removeWhere((e) => e['ref_id'] == refId && e['date'] == dateStr);
-    await save();
+    final ts = nowIso();
+    var removed = false;
+    for (final e in _items) {
+      if (e['ref_id'] == refId && e['date'] == dateStr) {
+        final eid = (e['id'] ?? '').toString();
+        if (eid.isNotEmpty) _tombstones[eid] = ts;
+        removed = true;
+      }
+    }
+    if (removed) {
+      _items.removeWhere((e) => e['ref_id'] == refId && e['date'] == dateStr);
+      await save();
+    }
   }
 
   Future<void> restore(Map<String, dynamic> entry) async {
-    final idx = _items.indexWhere((e) => e['id'] == entry['id']);
+    final copy = Map<String, dynamic>.from(entry);
+    copy['updated'] = nowIso();
+    final eid = (copy['id'] ?? '').toString();
+    if (eid.isNotEmpty) _tombstones.remove(eid);
+    final idx = _items.indexWhere((e) => e['id'] == eid);
     if (idx >= 0) {
-      _items[idx] = Map<String, dynamic>.from(entry);
+      _items[idx] = copy;
     } else {
-      _items.add(Map<String, dynamic>.from(entry));
+      _items.add(copy);
     }
     await save();
   }
@@ -1155,34 +1337,60 @@ class SocialStatsStore {
 class HabitStore {
   final File file;
   List<Map<String, dynamic>> _items = [];
+  Map<String, String> _tombstones = {};
+  void Function()? onMutated;
 
   HabitStore(this.file);
 
   Future<void> load() async {
     _items = [];
+    _tombstones = {};
     final raw = await readJsonSafe(file);
     final list = raw is Map ? raw['items'] : raw;
     if (list is List) {
       _items = list
           .whereType<Map>()
-          .map((e) => Map<String, dynamic>.from(e))
+          .map((e) => _normalizeHabitRecord(Map<String, dynamic>.from(e)))
           .where((e) => (e['id'] ?? '').toString().isNotEmpty)
           .toList();
     }
+    _tombstones = _readTombstonesFromRaw(raw);
   }
 
-  Future<bool> save() => writeJsonAtomic(file, {'version': 1, 'items': _items});
+  Future<bool> save({bool emit = true}) async {
+    _tombstones = _pruneTombstoneMap(_tombstones);
+    final payload = <String, dynamic>{'version': 1, 'items': _items};
+    if (_tombstones.isNotEmpty) payload['tombstones'] = _tombstones;
+    final ok = await writeJsonAtomic(file, payload);
+    if (ok && emit) onMutated?.call();
+    return ok;
+  }
+
+  Future<bool> replaceSynced(List<Map<String, dynamic>> items, Map<String, String> tombstones) {
+    _items = items
+        .map((e) => _normalizeHabitRecord(Map<String, dynamic>.from(e)))
+        .where((e) => (e['id'] ?? '').toString().isNotEmpty)
+        .toList();
+    _tombstones = _pruneTombstoneMap(Map<String, String>.from(tombstones));
+    return save(emit: false);
+  }
+
+  Map<String, String> tombstones() {
+    _tombstones = _pruneTombstoneMap(_tombstones);
+    return Map<String, String>.from(_tombstones);
+  }
 
   List<Map<String, dynamic>> all() => _items.map((e) => Map<String, dynamic>.from(e)).toList();
 
   static bool isDoneOn(Map<String, dynamic> habit, [String? dayIso]) {
     final target = dayIso ?? todayIso();
-    final dates = habit['dates'] as List? ?? const [];
+    final dates = (habit['dates'] as List?) ?? (habit['done_dates'] as List?) ?? const [];
     return dates.contains(target);
   }
 
   static int streak(Map<String, dynamic> habit) {
-    final dates = (habit['dates'] as List? ?? const []).map((e) => e.toString()).toSet();
+    final raw = (habit['dates'] as List?) ?? (habit['done_dates'] as List?) ?? const [];
+    final dates = raw.map((e) => e.toString()).toSet();
     if (dates.isEmpty) return 0;
     var cur = DateTime.now();
     if (!dates.contains(todayIso(cur))) {
@@ -1207,13 +1415,16 @@ class HabitStore {
     final clean = title.trim();
     if (clean.isEmpty) return null;
     final st = kSocialStats.containsKey(stat) ? stat : 'knowledge';
+    final ts = nowIso();
     final h = <String, dynamic>{
       'id': _newId(10),
       'title': clean,
       'stat': st,
       'points': points.clamp(1, 5),
       'dates': <String>[],
-      'created': nowIso(),
+      'done_dates': <String>[],
+      'created': ts,
+      'updated': ts,
     };
     _items.add(h);
     await save();
@@ -1225,16 +1436,22 @@ class HabitStore {
     if (idx < 0) return (false, null, 1, 1);
     final h = _items[idx];
     final tod = todayIso();
-    final dates = List<String>.from(h['dates'] as List? ?? const []);
+    final rawList = (h['dates'] as List?) ?? (h['done_dates'] as List?) ?? const [];
+    final dates = List<String>.from(rawList.map((e) => e.toString()));
     if (dates.contains(tod)) {
       dates.remove(tod);
       h['dates'] = dates;
+      h['done_dates'] = List<String>.from(dates);
+      h['updated'] = nowIso();
       await save();
       await stats.deleteByRef('habit:$id', tod);
       return (false, null, 1, 1);
     }
     dates.add(tod);
-    h['dates'] = dates.length > 90 ? dates.sublist(dates.length - 90) : dates;
+    final trimmed = dates.length > 90 ? dates.sublist(dates.length - 90) : dates;
+    h['dates'] = trimmed;
+    h['done_dates'] = List<String>.from(trimmed);
+    h['updated'] = nowIso();
     await save();
     final (entry, oldLv, newLv) = await stats.add(
       h['stat'] as String? ?? 'knowledge',
@@ -1250,12 +1467,18 @@ class HabitStore {
     final idx = _items.indexWhere((h) => h['id'] == id);
     if (idx < 0) return null;
     final removed = Map<String, dynamic>.from(_items.removeAt(idx));
+    _tombstones[id] = nowIso();
     await save();
     return removed;
   }
 
   Future<void> restore(Map<String, dynamic> h) async {
-    _items.add(Map<String, dynamic>.from(h));
+    final copy = _normalizeHabitRecord(h);
+    copy['updated'] = nowIso();
+    final hid = (copy['id'] ?? '').toString();
+    if (hid.isNotEmpty) _tombstones.remove(hid);
+    _items.removeWhere((x) => x['id'] == hid);
+    _items.add(copy);
     await save();
   }
 }
@@ -1285,7 +1508,10 @@ Map<String, dynamic> defaultSettings() => {
       'ai_api_key': '',
       'ai_call_user': 'Joker',
       'finance_sheets_enabled': false,
+      'data_sheets_enabled': false,
+      'companion_sheets_migrated': true,
       'sheets_sync_id': '',
+      'sheets_sync_tab': 'Morgana',
       'sheets_key_name': '',
       'sheets_key_json': '',
     };
@@ -1299,10 +1525,19 @@ class SettingsStore {
   Future<void> load() async {
     data = defaultSettings();
     final raw = await readJsonSafe(file);
+    var migrated = false;
     if (raw is Map) {
       raw.forEach((k, v) {
         if (data.containsKey(k)) data[k.toString()] = v;
       });
+      // One-time upgrade: users who already connected Finance Sheets get 2-way Tasks/Notes/Stats/Events sync enabled
+      if (!raw.containsKey('companion_sheets_migrated')) {
+        if (raw['finance_sheets_enabled'] == true && sheetsCredentialsReady) {
+          data['data_sheets_enabled'] = true;
+          migrated = true;
+        }
+        data['companion_sheets_migrated'] = true;
+      }
     }
     final tabs = data['enabled_tabs'];
     if (tabs is! List || tabs.isEmpty) {
@@ -1311,6 +1546,7 @@ class SettingsStore {
       final clean = tabs.map((e) => e.toString()).where((k) => kRadialTabKeys.contains(k)).toList();
       data['enabled_tabs'] = clean.isEmpty ? List<String>.from(kRadialTabKeys) : clean;
     }
+    if (migrated) await save();
   }
 
   Future<bool> save() => writeJsonAtomic(file, data);
@@ -1329,6 +1565,13 @@ class SettingsStore {
       (data['sheets_key_json'] ?? '').toString().trim().isNotEmpty;
 
   bool get financeSheetsActive => data['finance_sheets_enabled'] == true && sheetsCredentialsReady;
+
+  bool get dataSheetsActive => data['data_sheets_enabled'] == true && sheetsCredentialsReady;
+
+  String get sheetsSyncTab {
+    final t = (data['sheets_sync_tab'] ?? 'Morgana').toString().trim();
+    return t.isEmpty ? 'Morgana' : t;
+  }
 
   List<String> get enabledTabs => List<String>.from(data['enabled_tabs'] as List? ?? kRadialTabKeys);
 }

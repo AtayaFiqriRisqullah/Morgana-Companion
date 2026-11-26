@@ -85,11 +85,12 @@ from ui_dialogs import (BriefingDialog, EventsDialog, FinanceDialog, NotesDialog
                         QuickCommandDialog, SettingsDialog, SocialStatsDialog, TasksDialog,
                         TimerDialog, WrapUpDialog)
 from sheets_sync import (FinanceSheetMonthData, FinanceSheetWriteResult,
-                         SheetsPushResult, SheetsSyncConfig,
+                         SheetsCompanionSyncResult, SheetsPushResult, SheetsSyncConfig,
                          clear_finance_cells_in_sheets, fetch_finance_month_from_sheets,
-                         forbidden_bank_word, push_tasks_to_sheets,
-                         serialize_tasks_to_rows, test_sheets_connection,
-                         update_finance_tx_in_sheets, write_finance_tx_to_sheets)
+                         forbidden_bank_word, merge_store_payload, push_tasks_to_sheets,
+                         serialize_tasks_to_rows, sync_companion_data_with_sheets,
+                         test_sheets_connection, update_finance_tx_in_sheets,
+                         write_finance_tx_to_sheets)
 
 try:
     import psutil
@@ -3426,9 +3427,10 @@ class AIFetcher(QObject):
 
 
 class SheetsSyncWorker(QObject):
-    """Non-blocking single-flight background worker for write-only Google Sheets sync."""
+    """Non-blocking single-flight background worker for 2-way Google Sheets sync + WhatsApp relay."""
 
-    push_done = pyqtSignal(object)                # SheetsPushResult
+    push_done = pyqtSignal(object)                # SheetsPushResult (legacy)
+    sync_done = pyqtSignal(object)                # SheetsCompanionSyncResult
     test_done = pyqtSignal(bool, str)             # (ok, status_message)
 
     def __init__(self, base_dir: Path, parent=None) -> None:
@@ -3455,6 +3457,35 @@ class SheetsSyncWorker(QObject):
             self.push_done.emit(res)
 
         threading.Thread(target=_run, daemon=True, name="morgana-sheets-push").start()
+        return True
+
+    def sync_all(
+        self,
+        cfg: SheetsSyncConfig,
+        local_stores: dict[str, tuple[list[dict], dict[str, str]]],
+        *,
+        push_deadlines: bool = True,
+        force_deadlines: bool = False,
+    ) -> bool:
+        if self._sync_busy:
+            return False
+        self._sync_busy = True
+
+        def _run() -> None:
+            try:
+                res = sync_companion_data_with_sheets(
+                    cfg,
+                    self._base_dir,
+                    local_stores,
+                    push_deadlines=push_deadlines,
+                    force_deadlines=force_deadlines,
+                )
+            except Exception as exc:
+                res = SheetsCompanionSyncResult(ok=False, error=f"Google Sheets sync failed ({type(exc).__name__}).")
+            self._sync_busy = False
+            self.sync_done.emit(res)
+
+        threading.Thread(target=_run, daemon=True, name="morgana-sheets-sync").start()
         return True
 
     def test_connection(
@@ -3764,10 +3795,16 @@ class PetController(QObject):
         self.ai_fetcher.ambient_done.connect(self._on_ai_ambient_reply)
         self.ai_fetcher.test_done.connect(self._on_ai_test_done)
         self.sheets_sync.push_done.connect(self._on_sheets_push_done)
+        self.sheets_sync.sync_done.connect(self._on_sheets_sync_done)
         self.sheets_sync.test_done.connect(self._on_sheets_test_done)
         self.finance_sheets.month_loaded.connect(self._on_finance_sheet_month_loaded)
         self.finance_sheets.op_done.connect(self._on_finance_sheet_op_done)
         self.hotkeys.activated.connect(lambda: self._open_quick_command(toggle=True))
+
+        # Auto-sync Tasks, Notes, Social Stats, Local Events & Habits on any local mutation
+        self._last_sheets_sync_t = 0.0
+        for _st in (self.tasks, self.notes, self.social_stats, self.local_events, self.habits):
+            _st.add_mutation_listener(self._schedule_sheets_sync)
 
         self._curfew_timer = QTimer(self)
         self._curfew_timer.setInterval(5_000)      # 5s precision check for 30s bedtime cadence
@@ -3787,12 +3824,15 @@ class PetController(QObject):
         self._sleep_zzz_timer = QTimer(self)       # gentle Zzz particles during sleep/curfew
         self._sleep_zzz_timer.setInterval(6_500)
         self._sleep_zzz_timer.timeout.connect(self._sleep_zzz_tick)
-        self._sheets_debounce_timer = QTimer(self) # debounce rapid task edits (write-only output)
+        self._sheets_debounce_timer = QTimer(self) # debounce rapid store edits (2-way Sheets sync)
         self._sheets_debounce_timer.setSingleShot(True)
         self._sheets_debounce_timer.timeout.connect(self._trigger_sheets_sync)
-        self._sheets_retry_timer = QTimer(self)    # single-shot startup push / offline retry backoff
+        self._sheets_retry_timer = QTimer(self)    # single-shot startup sync / offline retry backoff
         self._sheets_retry_timer.setSingleShot(True)
         self._sheets_retry_timer.timeout.connect(self._trigger_sheets_sync)
+        self._sheets_poll_timer = QTimer(self)     # 90s silent 2-way pull from Android edits
+        self._sheets_poll_timer.setInterval(90_000)
+        self._sheets_poll_timer.timeout.connect(self._poll_sheets_sync)
         self._finance_auto_sync_timer = QTimer(self)  # 60s silent pull while Finance window is open
         self._finance_auto_sync_timer.setInterval(60_000)
         self._finance_auto_sync_timer.timeout.connect(self._auto_sync_finance_sheets)
@@ -3820,6 +3860,7 @@ class PetController(QObject):
     def quit(self) -> None:
         self._sheets_debounce_timer.stop()
         self._sheets_retry_timer.stop()
+        self._sheets_poll_timer.stop()
         self._finance_auto_sync_timer.stop()
         self.hotkeys.unregister()
         self.screen_time.save()
@@ -5009,10 +5050,13 @@ class PetController(QObject):
         if not cfg.is_ready(APP_DIR):
             self._sheets_debounce_timer.stop()
             self._sheets_retry_timer.stop()
+            self._sheets_poll_timer.stop()
             self._sheets_dirty = False
             self._sheets_fail_streak = 0
             self._sheets_last_pushed_rows = None
             return
+        if not self._sheets_poll_timer.isActive():
+            self._sheets_poll_timer.start()
         if trigger_initial:
             self._sheets_dirty = True
             self._sheets_retry_timer.start(SHEETS_SYNC_STARTUP_DELAY_MS)
@@ -5022,6 +5066,27 @@ class PetController(QObject):
             return
         self._sheets_dirty = True
         self._sheets_debounce_timer.start(SHEETS_SYNC_DEBOUNCE_MS)
+
+    def _poll_sheets_sync(self) -> None:
+        if self.sleep_mode or not self._sheets_sync_config().is_ready(APP_DIR):
+            return
+        if not self.sheets_sync.busy:
+            self._trigger_sheets_sync(manual=False)
+
+    def _sync_sheets_on_window_open(self) -> None:
+        if self.sleep_mode or not self._sheets_sync_config().is_ready(APP_DIR):
+            return
+        if not self.sheets_sync.busy and (time.monotonic() - self._last_sheets_sync_t) >= 15.0:
+            self._trigger_sheets_sync(manual=False)
+
+    def _snapshot_companion_stores(self) -> dict[str, tuple[list[dict], dict[str, str]]]:
+        return {
+            "tasks": (self.tasks.all(), self.tasks.tombstones()),
+            "notes": (self.notes.all(), self.notes.tombstones()),
+            "social_stats": (self.social_stats.all(), self.social_stats.tombstones()),
+            "local_events": (self.local_events.all(), self.local_events.tombstones()),
+            "habits": (self.habits.all(), self.habits.tombstones()),
+        }
 
     def _trigger_sheets_sync(self, cfg_override: SheetsSyncConfig | None = None,
                              manual: bool = False) -> None:
@@ -5040,17 +5105,10 @@ class PetController(QObject):
                 self.settings_dialog.set_sheets_status(False, "Sync already in progress — please wait a moment.")
             return
 
-        rows = serialize_tasks_to_rows(self.tasks.all())
-        push_key = (cfg.normalized_sheet_id(), cfg.normalized_tab(), rows)
-        if not manual and self._sheets_last_pushed_rows is not None and push_key == self._sheets_last_pushed_rows:
-            self._sheets_dirty = False
-            self._sheets_fail_streak = 0
-            return
-
         self._sheets_dirty = False
         self._sheets_manual_sync = bool(manual)
-        self._sheets_inflight_rows = push_key
-        self.sheets_sync.push(cfg, rows)
+        local_stores = self._snapshot_companion_stores()
+        self.sheets_sync.sync_all(cfg, local_stores, push_deadlines=True, force_deadlines=manual)
 
     def _on_test_sheets_sync_requested(self, data: dict) -> None:
         cfg = self._sheets_sync_config(override=data)
@@ -5068,6 +5126,66 @@ class PetController(QObject):
     def _on_sheets_test_done(self, ok: bool, msg: str) -> None:
         if self.settings_dialog is not None:
             self.settings_dialog.set_sheets_status(ok, msg)
+
+    def _on_sheets_sync_done(self, res: SheetsCompanionSyncResult) -> None:
+        manual = self._sheets_manual_sync
+        self._sheets_manual_sync = False
+        if not res.ok:
+            log.debug("Google Sheets 2-way sync failed: %s", res.error)
+            self._sheets_dirty = True
+            if manual and self.settings_dialog is not None:
+                self.settings_dialog.set_sheets_status(False, res.error or "Google Sheets sync failed.")
+            if self._sheets_sync_config().is_ready(APP_DIR):
+                idx = self._sheets_fail_streak
+                self._sheets_fail_streak += 1
+                if idx < len(SHEETS_SYNC_RETRY_DELAYS_MS):
+                    self._sheets_retry_timer.start(SHEETS_SYNC_RETRY_DELAYS_MS[idx])
+            return
+
+        self._last_sheets_sync_t = time.monotonic()
+        self._sheets_fail_streak = 0
+        self._sheets_retry_timer.stop()
+
+        store_map = {
+            "tasks": self.tasks,
+            "notes": self.notes,
+            "social_stats": self.social_stats,
+            "local_events": self.local_events,
+            "habits": self.habits,
+        }
+        changed = set(res.local_changed or ())
+        for key in changed:
+            st = store_map.get(key)
+            if st is not None and key in res.merged:
+                items, tomb = res.merged[key]
+                if self._sheets_dirty:
+                    items, tomb, _, _ = merge_store_payload(
+                        key, st.all(), st.tombstones(), items, tomb,
+                    )
+                st.replace_synced(items, tomb)
+
+        if changed:
+            if "tasks" in changed and self.tasks_dialog is not None:
+                self.tasks_dialog.refresh()
+            if "notes" in changed and self.notes_dialog is not None:
+                self.notes_dialog.refresh()
+            if changed & {"tasks", "notes", "local_events"}:
+                self._sync_events_view()
+            if (changed & {"social_stats", "habits"}) and self.stats_dialog is not None:
+                self.stats_dialog.refresh()
+            self._sync_briefing_view()
+            self._sync_wrapup_view()
+
+        if manual and self.settings_dialog is not None:
+            c = res.counts or {}
+            msg = (
+                f"Synced! Tasks: {c.get('tasks', 0)} · Notes: {c.get('notes', 0)} · "
+                f"Stats: {c.get('social_stats', 0)} · Events: {c.get('local_events', 0)}"
+            )
+            self.settings_dialog.set_sheets_status(True, msg)
+
+        if self._sheets_dirty and self._sheets_sync_config().is_ready(APP_DIR):
+            self._sheets_debounce_timer.start(SHEETS_SYNC_DEBOUNCE_MS)
 
     def _on_sheets_push_done(self, res: SheetsPushResult) -> None:
         manual = self._sheets_manual_sync
@@ -5478,6 +5596,7 @@ class PetController(QObject):
             self.tasks_dialog.closed.connect(lambda: self._on_dialog_closed("tasks"))
         self._sync_dialog_links()
         self.tasks_dialog.show_near(self.pet.geometry())
+        self._sync_sheets_on_window_open()
         if announce and not was_open and not self._rebuilding_ui:
             self._say_tuple(self.dialogue.window_open("tasks", self._ctx()), ms=4800)
 
@@ -5494,6 +5613,7 @@ class PetController(QObject):
             self.notes_dialog.closed.connect(lambda: self._on_dialog_closed("notes"))
         self._sync_dialog_links()
         self.notes_dialog.show_near(self.pet.geometry())
+        self._sync_sheets_on_window_open()
         if announce and not was_open and not self._rebuilding_ui:
             self._say_tuple(self.dialogue.window_open("notes", self._ctx()), ms=4800)
 
@@ -5528,6 +5648,7 @@ class PetController(QObject):
         if has_local_or_due:
             self.events_dialog.set_result(self._combined_events_result())
         self.events_dialog.show_near(self.pet.geometry())
+        self._sync_sheets_on_window_open()
         if not was_open and not self._rebuilding_ui:
             self._say_tuple(self.dialogue.window_open("events", self._ctx()), ms=5000)
         self._refresh_events(interactive=not self.calendar.has_token())
@@ -5536,6 +5657,7 @@ class PetController(QObject):
         was_open = self.stats_dialog is not None and self.stats_dialog.isVisible()
         self._ensure_stats_dialog()
         self.stats_dialog.show_near(self.pet.geometry())
+        self._sync_sheets_on_window_open()
         if announce and not was_open and not self._rebuilding_ui:
             self._say_tuple(self.dialogue.window_open("stats", self._ctx()), ms=4800)
 

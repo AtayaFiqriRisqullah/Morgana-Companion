@@ -215,6 +215,17 @@ class _EventsScreenState extends State<EventsScreen> {
           title: 'Events',
           onAvatarTap: () => app.navigateTo('home'),
           actions: [
+            if (app.isDataSyncActive) ...[
+              P5Button(
+                label: '',
+                icon: Icons.sync,
+                variant: app.companionSyncBusy ? P5BtnVariant.gold : P5BtnVariant.mint,
+                height: 32,
+                fontSize: 14,
+                onTap: app.companionSyncBusy ? null : () => app.syncCompanionData(silent: false),
+              ),
+              const SizedBox(width: 6),
+            ],
             P5Button(
               label: _formOpen ? 'CLOSE' : '+ EVENT',
               variant: _formOpen ? P5BtnVariant.soft : P5BtnVariant.primary,

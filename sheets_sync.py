@@ -25,6 +25,11 @@ from pathlib import Path
 
 SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 DEFAULT_SHEETS_TAB = "Morgana"
+COMPANION_SYNC_TAB = "Morgana_Sync"
+COMPANION_SYNC_STORES: tuple[str, ...] = ("tasks", "notes", "social_stats", "local_events", "habits")
+COMPANION_SYNC_HEADERS: tuple[str, ...] = ("store", "updated_at", "count", "payload_0")
+SYNC_CHUNK_SIZE = 45000
+SYNC_TOMBSTONE_MAX_AGE_MS = 90 * 24 * 60 * 60 * 1000
 SHEET_HEADERS: tuple[str, ...] = ("id", "title", "deadline", "priority", "stat", "updated_at")
 MAX_SYNC_TASKS = 500
 PIP_HINT = "pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib"
@@ -320,7 +325,17 @@ def test_sheets_connection(
                     body={"values": [list(SHEET_HEADERS)]},
                 ).execute()
                 created_note = " (created)"
-            notes.append(f"Tasks tab '{tab}' ready{created_note}")
+            sync_created = ""
+            if COMPANION_SYNC_TAB not in existing_tabs:
+                _create_tab(service, sheet_id, COMPANION_SYNC_TAB, HttpError)
+                service.spreadsheets().values().update(
+                    spreadsheetId=sheet_id,
+                    range=_a1_range(COMPANION_SYNC_TAB, "A1"),
+                    valueInputOption="RAW",
+                    body={"values": [list(COMPANION_SYNC_HEADERS)]},
+                ).execute()
+                sync_created = " (created)"
+            notes.append(f"Sync '{COMPANION_SYNC_TAB}' ready{sync_created} · Deadlines '{tab}' ready{created_note}")
         if check_finance:
             cur_month = date.today().month
             matched = _match_month_tab(existing_list, cur_month)
@@ -1584,3 +1599,351 @@ def update_finance_tx_in_sheets(
         finally:
             _close_service(service)
 
+
+# ---------------------------------------------------------------------------
+# 2-Way Companion JSON Sync (`Morgana_Sync` tab — Tasks, Notes, Stats, Events, Habits)
+# ---------------------------------------------------------------------------
+_COMPANION_SYNC_LOCK = threading.RLock()
+
+
+@dataclass
+class SheetsCompanionSyncResult:
+    ok: bool
+    merged: dict[str, tuple[list[dict], dict[str, str]]] = field(default_factory=dict)
+    local_changed: set[str] = field(default_factory=set)
+    remote_changed: set[str] = field(default_factory=set)
+    counts: dict[str, int] = field(default_factory=dict)
+    deadlines_pushed: int = 0
+    synced_at: str = ""
+    error: str = ""
+
+
+def parse_sync_ts_ms(value: str | None) -> int:
+    """Parse naive local or timezone-aware ISO-8601 string into UTC epoch milliseconds (0 if invalid)."""
+    raw = str(value or "").strip()
+    if not raw:
+        return 0
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.astimezone()
+        return int(round(dt.timestamp() * 1000))
+    except (TypeError, ValueError, OSError):
+        return 0
+
+
+def item_timestamp_ms(item: dict) -> int:
+    """Return latest modification timestamp (epoch ms) across common Morgana JSON timestamp fields."""
+    if not isinstance(item, dict):
+        return 0
+    best = 0
+    for key in ("updated_at", "updated", "done_at", "created"):
+        ts = parse_sync_ts_ms(item.get(key))
+        if ts > best:
+            best = ts
+    return best
+
+
+def normalize_sync_item(store_key: str, item: dict) -> dict:
+    """Normalize store item for seamless Desktop <-> Android JSON parity."""
+    copy = dict(item)
+    if store_key == "habits":
+        raw_dates = copy.get("done_dates")
+        if not isinstance(raw_dates, list):
+            raw_dates = copy.get("dates") if isinstance(copy.get("dates"), list) else []
+        cleaned = sorted({str(d).strip() for d in raw_dates if str(d).strip()})
+        copy["done_dates"] = cleaned
+        copy["dates"] = list(cleaned)
+        if not isinstance(copy.get("log_ids"), dict):
+            copy["log_ids"] = {}
+    elif store_key == "notes":
+        if not isinstance(copy.get("tags"), list):
+            copy["tags"] = []
+    return copy
+
+
+def _canonical_json(obj) -> str:
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def merge_store_payload(
+    store_key: str,
+    local_items: list[dict],
+    local_tombstones: dict[str, str],
+    remote_items: list[dict],
+    remote_tombstones: dict[str, str],
+    *,
+    now_ms: int | None = None,
+) -> tuple[list[dict], dict[str, str], bool, bool]:
+    """Deterministic Last-Write-Wins (LWW) + Tombstone 2-way merge for a single Morgana JSON store.
+
+    Returns `(merged_items, merged_tombstones, local_changed, remote_changed)`.
+    """
+    ref_ms = int(now_ms if now_ms is not None else round(datetime.now().astimezone().timestamp() * 1000))
+    cutoff_ms = ref_ms - SYNC_TOMBSTONE_MAX_AGE_MS
+
+    norm_local = [normalize_sync_item(store_key, i) for i in (local_items or ()) if isinstance(i, dict) and i.get("id")]
+    norm_remote = [normalize_sync_item(store_key, i) for i in (remote_items or ()) if isinstance(i, dict) and i.get("id")]
+
+    loc_tomb = {str(k).strip(): str(v).strip() for k, v in (local_tombstones or {}).items() if str(k).strip() and str(v).strip()}
+    rem_tomb = {str(k).strip(): str(v).strip() for k, v in (remote_tombstones or {}).items() if str(k).strip() and str(v).strip()}
+
+    # 1. Merge tombstones (keep newest deletion per ID, prune >90d expired entries)
+    merged_tomb: dict[str, str] = {}
+    for tid in set(loc_tomb.keys()) | set(rem_tomb.keys()):
+        lt = loc_tomb.get(tid, "")
+        rt = rem_tomb.get(tid, "")
+        lms = parse_sync_ts_ms(lt)
+        rms = parse_sync_ts_ms(rt)
+        best_str, best_ms = (rt, rms) if rms >= lms and rt else (lt, lms)
+        if best_str and (best_ms == 0 or best_ms >= cutoff_ms):
+            merged_tomb[tid] = best_str
+
+    # 2. Index items preserving order (local order first, then newly arrived remote items)
+    loc_by_id: dict[str, dict] = {str(i["id"]): i for i in norm_local}
+    rem_by_id: dict[str, dict] = {str(i["id"]): i for i in norm_remote}
+    ordered_ids: list[str] = []
+    seen_ids: set[str] = set()
+    for src in (norm_local, norm_remote):
+        for it in src:
+            iid = str(it["id"])
+            if iid not in seen_ids:
+                seen_ids.add(iid)
+                ordered_ids.append(iid)
+
+    # 3. Resolve each item by LWW timestamp vs tombstone timestamp
+    merged_items: list[dict] = []
+    for iid in ordered_ids:
+        loc_it = loc_by_id.get(iid)
+        rem_it = rem_by_id.get(iid)
+        if loc_it is not None and rem_it is not None:
+            l_ms = item_timestamp_ms(loc_it)
+            r_ms = item_timestamp_ms(rem_it)
+            if r_ms > l_ms:
+                winner = rem_it
+                win_ms = r_ms
+            elif l_ms > r_ms:
+                winner = loc_it
+                win_ms = l_ms
+            else:
+                # Deterministic tie-breaker so Laptop & Android always converge identically
+                winner = rem_it if _canonical_json(rem_it) >= _canonical_json(loc_it) else loc_it
+                win_ms = l_ms
+        elif loc_it is not None:
+            winner = loc_it
+            win_ms = item_timestamp_ms(loc_it)
+        else:
+            winner = rem_it  # type: ignore[assignment]
+            win_ms = item_timestamp_ms(winner)
+
+        tomb_str = merged_tomb.get(iid)
+        if tomb_str:
+            tomb_ms = parse_sync_ts_ms(tomb_str)
+            if tomb_ms >= win_ms:
+                # Deletion is newer than or equal to item -> keep deleted
+                continue
+            # Item was restored/updated after deletion -> clear stale tombstone
+            merged_tomb.pop(iid, None)
+        merged_items.append(normalize_sync_item(store_key, winner))
+
+    local_changed = (
+        _canonical_json(merged_items) != _canonical_json(norm_local)
+        or _canonical_json(merged_tomb) != _canonical_json(loc_tomb)
+    )
+    remote_changed = (
+        _canonical_json(merged_items) != _canonical_json(norm_remote)
+        or _canonical_json(merged_tomb) != _canonical_json(rem_tomb)
+    )
+    return merged_items, merged_tomb, local_changed, remote_changed
+
+
+def encode_store_row(
+    store_key: str,
+    items: list[dict],
+    tombstones: dict[str, str],
+    updated_iso: str,
+) -> list[str]:
+    """Encode a store snapshot into a Google Sheets row split into <=45,000-char cell chunks."""
+    blob = json.dumps(
+        {"v": 2, "items": items, "tombstones": tombstones},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    chunks = [blob[i:i + SYNC_CHUNK_SIZE] for i in range(0, len(blob), SYNC_CHUNK_SIZE)] or ["{}"]
+    return [store_key, updated_iso, str(len(items)), *chunks]
+
+
+def decode_store_rows(rows: list[list]) -> dict[str, tuple[list[dict], dict[str, str]]]:
+    """Decode `Morgana_Sync` sheet rows -> `{store_key: (items, tombstones)}`."""
+    parsed: dict[str, tuple[list[dict], dict[str, str]]] = {}
+    for row in rows or ():
+        if not row or len(row) < 4:
+            continue
+        key = str(row[0] or "").strip().lower()
+        if key not in COMPANION_SYNC_STORES:
+            continue
+        blob = "".join(str(cell) for cell in row[3:] if cell is not None and str(cell) != "")
+        if not blob.strip():
+            continue
+        try:
+            obj = json.loads(blob)
+        except ValueError:
+            continue
+        if isinstance(obj, dict):
+            raw_items = obj.get("items") or []
+            raw_tomb = obj.get("tombstones") or {}
+            items = [i for i in raw_items if isinstance(i, dict) and i.get("id")]
+            tomb = {
+                str(k).strip(): str(v).strip()
+                for k, v in raw_tomb.items()
+                if str(k).strip() and str(v).strip()
+            } if isinstance(raw_tomb, dict) else {}
+            parsed[key] = (items, tomb)
+        elif isinstance(obj, list):
+            parsed[key] = ([i for i in obj if isinstance(i, dict) and i.get("id")], {})
+    return parsed
+
+
+def _write_deadlines_with_service(service, sheet_id: str, tab: str, tasks: list[dict], HttpError) -> int:
+    rows = serialize_tasks_to_rows(tasks)
+    clear_rng = _a1_range(tab, f"A1:F{MAX_SYNC_TASKS + 20}")
+    write_rng = _a1_range(tab, "A1")
+
+    def _do_write() -> None:
+        service.spreadsheets().values().clear(
+            spreadsheetId=sheet_id,
+            range=clear_rng,
+            body={},
+        ).execute()
+        service.spreadsheets().values().update(
+            spreadsheetId=sheet_id,
+            range=write_rng,
+            valueInputOption="RAW",
+            body={"values": rows},
+        ).execute()
+
+    try:
+        _do_write()
+    except HttpError as exc:
+        if _is_missing_tab_error(exc):
+            _create_tab(service, sheet_id, tab, HttpError)
+            _do_write()
+        else:
+            raise
+    return max(0, len(rows) - 1)
+
+
+def sync_companion_data_with_sheets(
+    cfg: SheetsSyncConfig,
+    base_dir: Path,
+    local_stores: dict[str, tuple[list[dict], dict[str, str]]],
+    *,
+    push_deadlines: bool = True,
+    force_deadlines: bool = False,
+    timeout: float = 15.0,
+) -> SheetsCompanionSyncResult:
+    """2-way Google Sheets sync for Tasks, Notes, Social Stats, Local Events, and Habits.
+
+    Uses a single dedicated `Morgana_Sync` tab (1 read when idle, 1 write only when changed)
+    while keeping the `Morgana` WhatsApp deadline relay tab up to date automatically.
+    """
+    sheet_id = cfg.normalized_sheet_id()
+    if not sheet_id:
+        return SheetsCompanionSyncResult(ok=False, error="Spreadsheet ID is not configured.")
+    key_file = cfg.resolve_key_file(base_dir)
+    if key_file is None:
+        return SheetsCompanionSyncResult(ok=False, error="Service Account JSON key file not found.")
+    service, client_email, HttpError, err = _build_service(key_file, timeout=timeout)
+    if err or service is None:
+        return SheetsCompanionSyncResult(ok=False, error=err)
+
+    sync_rng = _a1_range(COMPANION_SYNC_TAB, "A1:Z20")
+    now_dt = datetime.now().astimezone()
+    now_iso_str = now_dt.isoformat(timespec="seconds")
+    now_ms = int(round(now_dt.timestamp() * 1000))
+
+    with _COMPANION_SYNC_LOCK:
+        try:
+            remote_missing = False
+            try:
+                resp = service.spreadsheets().values().get(
+                    spreadsheetId=sheet_id,
+                    range=sync_rng,
+                    valueRenderOption="UNFORMATTED_VALUE",
+                ).execute()
+                remote_rows = resp.get("values") or []
+            except HttpError as exc:
+                if _is_missing_tab_error(exc):
+                    _create_tab(service, sheet_id, COMPANION_SYNC_TAB, HttpError)
+                    remote_rows = []
+                    remote_missing = True
+                else:
+                    raise
+
+            remote_map = decode_store_rows(remote_rows)
+            merged_map: dict[str, tuple[list[dict], dict[str, str]]] = {}
+            local_changed: set[str] = set()
+            remote_changed: set[str] = set()
+            counts: dict[str, int] = {}
+
+            for store_key in COMPANION_SYNC_STORES:
+                loc_items, loc_tomb = local_stores.get(store_key, ([], {}))
+                has_remote = store_key in remote_map
+                rem_items, rem_tomb = remote_map.get(store_key, ([], {}))
+                m_items, m_tomb, l_chg, r_chg = merge_store_payload(
+                    store_key, loc_items, loc_tomb, rem_items, rem_tomb, now_ms=now_ms,
+                )
+                merged_map[store_key] = (m_items, m_tomb)
+                counts[store_key] = len(m_items)
+                if l_chg:
+                    local_changed.add(store_key)
+                if r_chg or not has_remote:
+                    remote_changed.add(store_key)
+
+            if remote_missing or remote_changed:
+                max_chunks = 1
+                encoded_rows: list[list[str]] = []
+                for store_key in COMPANION_SYNC_STORES:
+                    m_items, m_tomb = merged_map[store_key]
+                    row = encode_store_row(store_key, m_items, m_tomb, now_iso_str)
+                    max_chunks = max(max_chunks, len(row) - 3)
+                    encoded_rows.append(row)
+                header = ["store", "updated_at", "count", *[f"payload_{i}" for i in range(max_chunks)]]
+                service.spreadsheets().values().clear(
+                    spreadsheetId=sheet_id,
+                    range=sync_rng,
+                    body={},
+                ).execute()
+                service.spreadsheets().values().update(
+                    spreadsheetId=sheet_id,
+                    range=_a1_range(COMPANION_SYNC_TAB, "A1"),
+                    valueInputOption="RAW",
+                    body={"values": [header, *encoded_rows]},
+                ).execute()
+
+            deadlines_pushed = 0
+            if push_deadlines and ("tasks" in remote_changed or "tasks" in local_changed or remote_missing or force_deadlines):
+                merged_tasks = merged_map["tasks"][0]
+                deadlines_pushed = _write_deadlines_with_service(
+                    service, sheet_id, cfg.normalized_tab(), merged_tasks, HttpError,
+                )
+
+            return SheetsCompanionSyncResult(
+                ok=True,
+                merged=merged_map,
+                local_changed=local_changed,
+                remote_changed=remote_changed,
+                counts=counts,
+                deadlines_pushed=deadlines_pushed,
+                synced_at=now_iso_str,
+            )
+        except HttpError as exc:
+            return SheetsCompanionSyncResult(ok=False, error=_friendly_http_error(exc, client_email))
+        except TimeoutError:
+            return SheetsCompanionSyncResult(ok=False, error="Google Sheets sync timed out.")
+        except Exception as exc:
+            return SheetsCompanionSyncResult(ok=False, error=f"Google Sheets sync failed ({type(exc).__name__}).")
+        finally:
+            _close_service(service)

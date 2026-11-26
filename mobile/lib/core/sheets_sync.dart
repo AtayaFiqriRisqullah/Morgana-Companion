@@ -1283,10 +1283,490 @@ class GoogleSheetsFinanceClient {
     }
   }
 
-  Future<(bool, String)> testConnection({required String rawSheetId, required String keyJson}) async {
-    final now = DateTime.now();
-    final res = await fetchMonth(rawSheetId: rawSheetId, keyJson: keyJson, year: now.year, month: now.month);
-    if (!res.ok) return (false, res.error);
-    return (true, "Connected! Tab '${res.tab}' ready (${formatRupiah(res.balances['Total'] ?? 0)})");
+  Future<http.Response> _valuesUpdateRaw(String token, String sheetId, String a1Range, List<List<dynamic>> values) {
+    final uri = Uri.parse(
+      'https://sheets.googleapis.com/v4/spreadsheets/$sheetId/values/${Uri.encodeComponent(a1Range)}?valueInputOption=RAW',
+    );
+    return _http
+        .put(
+          uri,
+          headers: {'Authorization': 'Bearer $token', 'Content-Type': 'application/json'},
+          body: jsonEncode({'values': values}),
+        )
+        .timeout(const Duration(seconds: 14));
   }
+
+  Future<bool> _createTab(String token, String sheetId, String tabName) async {
+    final uri = Uri.parse('https://sheets.googleapis.com/v4/spreadsheets/$sheetId:batchUpdate');
+    final resp = await _http
+        .post(
+          uri,
+          headers: {'Authorization': 'Bearer $token', 'Content-Type': 'application/json'},
+          body: jsonEncode({
+            'requests': [
+              {
+                'addSheet': {
+                  'properties': {'title': tabName}
+                }
+              }
+            ]
+          }),
+        )
+        .timeout(const Duration(seconds: 12));
+    return resp.statusCode == 200 || resp.body.toLowerCase().contains('already exists');
+  }
+
+  Future<int> _pushDeadlinesWithToken(
+    String token,
+    String sheetId,
+    String tab,
+    List<Map<String, dynamic>> tasks,
+  ) async {
+    final rows = serializeTasksToRows(tasks);
+    final clearRng = _a1(tab, 'A1:F520');
+    final writeRng = _a1(tab, 'A1');
+    var clearResp = await _valuesClear(token, sheetId, clearRng);
+    if (clearResp.statusCode == 400 && clearResp.body.toLowerCase().contains('unable to parse range')) {
+      await _createTab(token, sheetId, tab);
+      clearResp = await _valuesClear(token, sheetId, clearRng);
+    }
+    await _valuesUpdateRaw(token, sheetId, writeRng, rows);
+    return rows.length > 1 ? rows.length - 1 : 0;
+  }
+
+  /// 2-way Google Sheets sync for Tasks, Notes, Social Stats, Local Events, and Habits.
+  /// Shares exact `Morgana_Sync` schema & LWW+tombstone merge with desktop `sheets_sync.py`.
+  Future<CompanionSheetSyncResult> syncCompanionData({
+    required String rawSheetId,
+    required String keyJson,
+    String deadlineTab = 'Morgana',
+    required Map<String, ({List<Map<String, dynamic>> items, Map<String, String> tombstones})> localStores,
+    bool pushDeadlines = true,
+    bool forceDeadlines = false,
+  }) async {
+    final sheetId = extractSpreadsheetId(rawSheetId);
+    if (sheetId.isEmpty) {
+      return const CompanionSheetSyncResult(ok: false, error: 'Spreadsheet ID is not configured.');
+    }
+    final (token, email, err) = await _getAccessToken(keyJson);
+    if (token == null) {
+      return CompanionSheetSyncResult(ok: false, error: err);
+    }
+
+    final syncRng = _a1(kCompanionSyncTab, 'A1:Z20');
+    final now = DateTime.now();
+    final nowIsoStr = '${now.toUtc().toIso8601String().split('.').first}Z';
+    final nowMs = now.millisecondsSinceEpoch;
+
+    try {
+      var remoteMissing = false;
+      var remoteRows = <List<dynamic>>[];
+      final getResp = await _valuesGet(token, sheetId, syncRng);
+      if (getResp.statusCode == 200) {
+        final body = jsonDecode(getResp.body) as Map<String, dynamic>;
+        final rawVals = (body['values'] as List? ?? const []);
+        remoteRows = rawVals.map((r) => List<dynamic>.from(r as List)).toList();
+      } else if (getResp.statusCode == 400 &&
+          (getResp.body.toLowerCase().contains('unable to parse range') ||
+              getResp.body.toLowerCase().contains('not found'))) {
+        await _createTab(token, sheetId, kCompanionSyncTab);
+        remoteMissing = true;
+      } else {
+        return CompanionSheetSyncResult(
+          ok: false,
+          error: _friendlyError(getResp.statusCode, email, kCompanionSyncTab),
+        );
+      }
+
+      final remoteMap = decodeStoreRows(remoteRows);
+      final mergedMap = <String, ({List<Map<String, dynamic>> items, Map<String, String> tombstones})>{};
+      final localChanged = <String>{};
+      final remoteChanged = <String>{};
+      final counts = <String, int>{};
+
+      for (final storeKey in kCompanionSyncStores) {
+        final loc = localStores[storeKey] ?? (items: const <Map<String, dynamic>>[], tombstones: const <String, String>{});
+        final hasRemote = remoteMap.containsKey(storeKey);
+        final rem = remoteMap[storeKey] ?? (items: const <Map<String, dynamic>>[], tombstones: const <String, String>{});
+        final m = mergeStorePayload(
+          storeKey: storeKey,
+          localItems: loc.items,
+          localTombstones: loc.tombstones,
+          remoteItems: rem.items,
+          remoteTombstones: rem.tombstones,
+          nowMs: nowMs,
+        );
+        mergedMap[storeKey] = (items: m.items, tombstones: m.tombstones);
+        counts[storeKey] = m.items.length;
+        if (m.localChanged) localChanged.add(storeKey);
+        if (m.remoteChanged || !hasRemote) remoteChanged.add(storeKey);
+      }
+
+      if (remoteMissing || remoteChanged.isNotEmpty) {
+        var maxChunks = 1;
+        final encodedRows = <List<String>>[];
+        for (final storeKey in kCompanionSyncStores) {
+          final m = mergedMap[storeKey]!;
+          final row = encodeStoreRow(storeKey, m.items, m.tombstones, nowIsoStr);
+          if (row.length - 3 > maxChunks) maxChunks = row.length - 3;
+          encodedRows.add(row);
+        }
+        final header = ['store', 'updated_at', 'count', for (var i = 0; i < maxChunks; i++) 'payload_$i'];
+        await _valuesClear(token, sheetId, syncRng);
+        final upResp = await _valuesUpdateRaw(token, sheetId, _a1(kCompanionSyncTab, 'A1'), [header, ...encodedRows]);
+        if (upResp.statusCode != 200) {
+          return CompanionSheetSyncResult(
+            ok: false,
+            error: _friendlyError(upResp.statusCode, email, kCompanionSyncTab),
+          );
+        }
+      }
+
+      var deadlinesPushed = 0;
+      if (pushDeadlines &&
+          (remoteChanged.contains('tasks') || localChanged.contains('tasks') || remoteMissing || forceDeadlines)) {
+        final cleanTab = deadlineTab.trim().isEmpty ? 'Morgana' : deadlineTab.trim();
+        deadlinesPushed = await _pushDeadlinesWithToken(token, sheetId, cleanTab, mergedMap['tasks']!.items);
+      }
+
+      return CompanionSheetSyncResult(
+        ok: true,
+        merged: mergedMap,
+        localChanged: localChanged,
+        remoteChanged: remoteChanged,
+        counts: counts,
+        deadlinesPushed: deadlinesPushed,
+        syncedAt: nowIsoStr,
+      );
+    } catch (e) {
+      return CompanionSheetSyncResult(ok: false, error: 'Sheets companion sync failed (${e.runtimeType}).');
+    }
+  }
+
+  Future<(bool, String)> testConnection({
+    required String rawSheetId,
+    required String keyJson,
+    bool checkFinance = true,
+    bool checkDataSync = true,
+  }) async {
+    final sheetId = extractSpreadsheetId(rawSheetId);
+    if (sheetId.isEmpty) return (false, 'Enter a valid Google Spreadsheet ID or URL.');
+    final (token, email, err) = await _getAccessToken(keyJson);
+    if (token == null) return (false, err);
+
+    final notes = <String>[];
+    if (checkDataSync) {
+      final getResp = await _valuesGet(token, sheetId, _a1(kCompanionSyncTab, 'A1:D1'));
+      if (getResp.statusCode == 200) {
+        notes.add("Sync '$kCompanionSyncTab' ready");
+      } else if (getResp.statusCode == 400) {
+        final created = await _createTab(token, sheetId, kCompanionSyncTab);
+        if (created) {
+          await _valuesUpdateRaw(token, sheetId, _a1(kCompanionSyncTab, 'A1'), [
+            ['store', 'updated_at', 'count', 'payload_0']
+          ]);
+          notes.add("Sync '$kCompanionSyncTab' created");
+        } else {
+          return (false, _friendlyError(getResp.statusCode, email, kCompanionSyncTab));
+        }
+      } else {
+        return (false, _friendlyError(getResp.statusCode, email, kCompanionSyncTab));
+      }
+    }
+    if (checkFinance) {
+      final now = DateTime.now();
+      final res = await fetchMonth(rawSheetId: rawSheetId, keyJson: keyJson, year: now.year, month: now.month);
+      if (!res.ok) {
+        if (!checkDataSync) return (false, res.error);
+        notes.add('Finance: ${res.error}');
+      } else {
+        notes.add("Finance '${res.tab}' (${formatRupiah(res.balances['Total'] ?? 0)})");
+      }
+    }
+    return (true, 'Connected! ${notes.join(' · ')}');
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 2-Way Companion JSON Sync Pure Helpers (100% parity with desktop sheets_sync.py)
+// ---------------------------------------------------------------------------
+const String kCompanionSyncTab = 'Morgana_Sync';
+const List<String> kCompanionSyncStores = ['tasks', 'notes', 'social_stats', 'local_events', 'habits'];
+const int kSyncChunkSize = 45000;
+const int kSyncTombstoneMaxAgeMs = 90 * 24 * 60 * 60 * 1000;
+
+class CompanionSheetSyncResult {
+  final bool ok;
+  final Map<String, ({List<Map<String, dynamic>> items, Map<String, String> tombstones})> merged;
+  final Set<String> localChanged;
+  final Set<String> remoteChanged;
+  final Map<String, int> counts;
+  final int deadlinesPushed;
+  final String syncedAt;
+  final String error;
+
+  const CompanionSheetSyncResult({
+    required this.ok,
+    this.merged = const {},
+    this.localChanged = const {},
+    this.remoteChanged = const {},
+    this.counts = const {},
+    this.deadlinesPushed = 0,
+    this.syncedAt = '',
+    this.error = '',
+  });
+}
+
+int parseSyncTsMs(Object? raw) {
+  final s = (raw ?? '').toString().trim();
+  if (s.isEmpty) return 0;
+  final dt = DateTime.tryParse(s);
+  return dt == null ? 0 : dt.millisecondsSinceEpoch;
+}
+
+int itemTimestampMs(Map<String, dynamic> item) {
+  var best = 0;
+  for (final k in const ['updated_at', 'updated', 'done_at', 'created']) {
+    final ts = parseSyncTsMs(item[k]);
+    if (ts > best) best = ts;
+  }
+  return best;
+}
+
+Map<String, dynamic> normalizeSyncItem(String storeKey, Map<String, dynamic> item) {
+  final copy = Map<String, dynamic>.from(item);
+  if (storeKey == 'habits') {
+    final src = copy['done_dates'] is List
+        ? copy['done_dates'] as List
+        : (copy['dates'] is List ? copy['dates'] as List : const []);
+    final cleaned = src.map((e) => e.toString().trim()).where((e) => e.isNotEmpty).toSet().toList()..sort();
+    copy['done_dates'] = cleaned;
+    copy['dates'] = List<String>.from(cleaned);
+    if (copy['log_ids'] is! Map) copy['log_ids'] = <String, dynamic>{};
+  } else if (storeKey == 'notes') {
+    if (copy['tags'] is! List) copy['tags'] = <String>[];
+  }
+  return copy;
+}
+
+Object? _canonicalizeValue(Object? v) {
+  if (v is Map) {
+    final keys = v.keys.map((k) => k.toString()).toList()..sort();
+    return {for (final k in keys) k: _canonicalizeValue(v[k])};
+  }
+  if (v is List) {
+    return v.map(_canonicalizeValue).toList();
+  }
+  return v;
+}
+
+String _canonicalJson(Object? obj) => jsonEncode(_canonicalizeValue(obj));
+
+({
+  List<Map<String, dynamic>> items,
+  Map<String, String> tombstones,
+  bool localChanged,
+  bool remoteChanged,
+}) mergeStorePayload({
+  required String storeKey,
+  required List<Map<String, dynamic>> localItems,
+  required Map<String, String> localTombstones,
+  required List<Map<String, dynamic>> remoteItems,
+  required Map<String, String> remoteTombstones,
+  int? nowMs,
+}) {
+  final refMs = nowMs ?? DateTime.now().millisecondsSinceEpoch;
+  final cutoffMs = refMs - kSyncTombstoneMaxAgeMs;
+
+  final normLocal = localItems
+      .where((i) => (i['id'] ?? '').toString().trim().isNotEmpty)
+      .map((i) => normalizeSyncItem(storeKey, i))
+      .toList();
+  final normRemote = remoteItems
+      .where((i) => (i['id'] ?? '').toString().trim().isNotEmpty)
+      .map((i) => normalizeSyncItem(storeKey, i))
+      .toList();
+
+  final locTomb = <String, String>{};
+  localTombstones.forEach((k, v) {
+    if (k.trim().isNotEmpty && v.trim().isNotEmpty) locTomb[k.trim()] = v.trim();
+  });
+  final remTomb = <String, String>{};
+  remoteTombstones.forEach((k, v) {
+    if (k.trim().isNotEmpty && v.trim().isNotEmpty) remTomb[k.trim()] = v.trim();
+  });
+
+  // 1. Merge tombstones (keep newest deletion per ID, prune >90d expired)
+  final mergedTomb = <String, String>{};
+  final allTombIds = <String>{...locTomb.keys, ...remTomb.keys};
+  for (final tid in allTombIds) {
+    final lt = locTomb[tid] ?? '';
+    final rt = remTomb[tid] ?? '';
+    final lms = parseSyncTsMs(lt);
+    final rms = parseSyncTsMs(rt);
+    final bestStr = (rms >= lms && rt.isNotEmpty) ? rt : lt;
+    final bestMs = (rms >= lms && rt.isNotEmpty) ? rms : lms;
+    if (bestStr.isNotEmpty && (bestMs == 0 || bestMs >= cutoffMs)) {
+      mergedTomb[tid] = bestStr;
+    }
+  }
+
+  // 2. Index items preserving order (local first, then remote additions)
+  final locById = {for (final i in normLocal) i['id'].toString(): i};
+  final remById = {for (final i in normRemote) i['id'].toString(): i};
+  final orderedIds = <String>[];
+  final seen = <String>{};
+  for (final src in [normLocal, normRemote]) {
+    for (final it in src) {
+      final iid = it['id'].toString();
+      if (seen.add(iid)) orderedIds.add(iid);
+    }
+  }
+
+  // 3. LWW vs Tombstone resolution
+  final mergedItems = <Map<String, dynamic>>[];
+  for (final iid in orderedIds) {
+    final locIt = locById[iid];
+    final remIt = remById[iid];
+    late Map<String, dynamic> winner;
+    late int winMs;
+    if (locIt != null && remIt != null) {
+      final lMs = itemTimestampMs(locIt);
+      final rMs = itemTimestampMs(remIt);
+      if (rMs > lMs) {
+        winner = remIt;
+        winMs = rMs;
+      } else if (lMs > rMs) {
+        winner = locIt;
+        winMs = lMs;
+      } else {
+        winner = _canonicalJson(remIt).compareTo(_canonicalJson(locIt)) >= 0 ? remIt : locIt;
+        winMs = lMs;
+      }
+    } else if (locIt != null) {
+      winner = locIt;
+      winMs = itemTimestampMs(locIt);
+    } else {
+      winner = remIt!;
+      winMs = itemTimestampMs(remIt);
+    }
+
+    final tombStr = mergedTomb[iid];
+    if (tombStr != null) {
+      final tombMs = parseSyncTsMs(tombStr);
+      if (tombMs >= winMs) continue;
+      mergedTomb.remove(iid);
+    }
+    mergedItems.add(normalizeSyncItem(storeKey, winner));
+  }
+
+  final localChanged =
+      _canonicalJson(mergedItems) != _canonicalJson(normLocal) || _canonicalJson(mergedTomb) != _canonicalJson(locTomb);
+  final remoteChanged =
+      _canonicalJson(mergedItems) != _canonicalJson(normRemote) || _canonicalJson(mergedTomb) != _canonicalJson(remTomb);
+
+  return (
+    items: mergedItems,
+    tombstones: mergedTomb,
+    localChanged: localChanged,
+    remoteChanged: remoteChanged,
+  );
+}
+
+List<String> encodeStoreRow(
+  String storeKey,
+  List<Map<String, dynamic>> items,
+  Map<String, String> tombstones,
+  String updatedIso,
+) {
+  final blob = jsonEncode({'v': 2, 'items': items, 'tombstones': tombstones});
+  final chunks = <String>[];
+  for (var i = 0; i < blob.length; i += kSyncChunkSize) {
+    final end = (i + kSyncChunkSize) > blob.length ? blob.length : (i + kSyncChunkSize);
+    chunks.add(blob.substring(i, end));
+  }
+  if (chunks.isEmpty) chunks.add('{}');
+  return [storeKey, updatedIso, '${items.length}', ...chunks];
+}
+
+Map<String, ({List<Map<String, dynamic>> items, Map<String, String> tombstones})> decodeStoreRows(
+  List<List<dynamic>> rows,
+) {
+  final parsed = <String, ({List<Map<String, dynamic>> items, Map<String, String> tombstones})>{};
+  for (final row in rows) {
+    if (row.length < 4) continue;
+    final key = row[0].toString().trim().toLowerCase();
+    if (!kCompanionSyncStores.contains(key)) continue;
+    final buf = StringBuffer();
+    for (var i = 3; i < row.length; i++) {
+      final cell = row[i];
+      if (cell != null) buf.write(cell.toString());
+    }
+    final blob = buf.toString().trim();
+    if (blob.isEmpty) continue;
+    try {
+      final obj = jsonDecode(blob);
+      if (obj is Map) {
+        final rawItems = obj['items'];
+        final items = rawItems is List
+            ? rawItems
+                .whereType<Map>()
+                .map((e) => Map<String, dynamic>.from(e))
+                .where((e) => (e['id'] ?? '').toString().isNotEmpty)
+                .toList()
+            : <Map<String, dynamic>>[];
+        final tomb = <String, String>{};
+        if (obj['tombstones'] is Map) {
+          (obj['tombstones'] as Map).forEach((k, v) {
+            final ks = k.toString().trim();
+            final vs = (v ?? '').toString().trim();
+            if (ks.isNotEmpty && vs.isNotEmpty) tomb[ks] = vs;
+          });
+        }
+        parsed[key] = (items: items, tombstones: tomb);
+      } else if (obj is List) {
+        final items = obj
+            .whereType<Map>()
+            .map((e) => Map<String, dynamic>.from(e))
+            .where((e) => (e['id'] ?? '').toString().isNotEmpty)
+            .toList();
+        parsed[key] = (items: items, tombstones: const {});
+      }
+    } catch (_) {}
+  }
+  return parsed;
+}
+
+/// Active deadline rows compatible with desktop `serialize_tasks_to_rows` & `bot-wa` Morgana tab.
+List<List<String>> serializeTasksToRows(List<Map<String, dynamic>> tasks) {
+  final entries = <(DateTime, List<String>)>[];
+  for (final t in tasks) {
+    if (t['done'] == true) continue;
+    final tid = (t['id'] ?? '').toString().trim();
+    final title = (t['title'] ?? '').toString().trim();
+    final dlRaw = (t['deadline'] ?? '').toString().trim();
+    if (tid.isEmpty || title.isEmpty || dlRaw.isEmpty) continue;
+    final dlDt = DateTime.tryParse(dlRaw);
+    if (dlDt == null) continue;
+    final updRaw = (t['updated_at'] ?? t['created'] ?? '').toString().trim();
+    entries.add((
+      dlDt,
+      [
+        tid,
+        title.length > 160 ? title.substring(0, 160) : title,
+        dlDt.toIso8601String().split('.').first,
+        t['priority'] == 'high' ? 'high' : 'normal',
+        (t['stat'] ?? 'proficiency').toString(),
+        updRaw,
+      ],
+    ));
+  }
+  entries.sort((a, b) => a.$1.compareTo(b.$1));
+  final rows = <List<String>>[
+    ['id', 'title', 'deadline', 'priority', 'stat', 'updated_at']
+  ];
+  for (final pair in entries.take(500)) {
+    rows.add(pair.$2);
+  }
+  return rows;
 }

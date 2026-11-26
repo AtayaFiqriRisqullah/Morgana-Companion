@@ -31,8 +31,14 @@ def parse_dt(value: str | None) -> datetime | None:
     """ISO string -> datetime naif (waktu lokal); None jika kosong/rusak."""
     if not value:
         return None
+    raw = str(value).strip()
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
     try:
-        return datetime.fromisoformat(value)
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone().replace(tzinfo=None)
+        return dt
     except (TypeError, ValueError):
         return None
 
@@ -65,32 +71,112 @@ def backup_corrupt(path: Path) -> None:
 
 
 class JsonListStore:
-    """Daftar dict (masing-masing punya "id") yang disimpan sebagai {"version": 1, "items": [...]}."""
+    """Daftar dict (masing-masing punya "id") yang disimpan sebagai {"version": 1, "items": [...], "tombstones": {...}}."""
+
+    TOMBSTONE_MAX_AGE_DAYS = 90
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
         self._items: list[dict] = []
+        self._tombstones: dict[str, str] = {}
+        self._mutation_listeners: list = []
         self.last_error = ""
         self.load()
+
+    def add_mutation_listener(self, callback) -> None:
+        if callback not in self._mutation_listeners:
+            self._mutation_listeners.append(callback)
+
+    def _normalize_loaded_item(self, item: dict) -> dict:
+        return dict(item)
+
+    def _prune_tombstones(self) -> None:
+        if not self._tombstones:
+            return
+        cutoff = datetime.now() - timedelta(days=self.TOMBSTONE_MAX_AGE_DAYS)
+        cleaned: dict[str, str] = {}
+        for tid, ts in self._tombstones.items():
+            key = str(tid or "").strip()
+            val = str(ts or "").strip()
+            if not key or not val:
+                continue
+            dt = parse_dt(val)
+            if dt is None or dt >= cutoff:
+                cleaned[key] = val
+        self._tombstones = cleaned
+
+    def _record_tombstone(self, item_id: str) -> None:
+        key = str(item_id or "").strip()
+        if key:
+            self._tombstones[key] = now_iso()
+
+    def _clear_tombstone(self, item_id: str) -> None:
+        key = str(item_id or "").strip()
+        if key:
+            self._tombstones.pop(key, None)
+
+    def tombstones(self) -> dict[str, str]:
+        self._prune_tombstones()
+        return dict(self._tombstones)
 
     # -- baca / tulis -----------------------------------------------------------
     def load(self) -> None:
         self._items = []
+        self._tombstones = {}
         if not self.path.is_file():
             return
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
-            raw = data["items"] if isinstance(data, dict) else data
-            self._items = [i for i in raw if isinstance(i, dict) and i.get("id")]
+            if isinstance(data, dict):
+                raw = data.get("items") or []
+                raw_tomb = data.get("tombstones")
+                if isinstance(raw_tomb, dict):
+                    self._tombstones = {
+                        str(k).strip(): str(v).strip()
+                        for k, v in raw_tomb.items()
+                        if str(k).strip() and str(v).strip()
+                    }
+            else:
+                raw = data
+            self._items = [
+                self._normalize_loaded_item(i)
+                for i in raw
+                if isinstance(i, dict) and i.get("id")
+            ]
+            self._prune_tombstones()
         except (OSError, ValueError, KeyError, TypeError) as exc:
             log.warning("Gagal membaca %s: %s", self.path.name, exc)
             backup_corrupt(self.path)
 
-    def save(self) -> bool:
+    def save(self, *, emit: bool = True) -> bool:
         """Simpan ke disk. Mengembalikan False (dan mengisi last_error) bila gagal."""
-        ok, err = write_json_atomic(self.path, {"version": 1, "items": self._items})
+        self._prune_tombstones()
+        payload: dict = {"version": 1, "items": self._items}
+        if self._tombstones:
+            payload["tombstones"] = self._tombstones
+        ok, err = write_json_atomic(self.path, payload)
         self.last_error = err
+        if ok and emit:
+            for cb in list(self._mutation_listeners):
+                try:
+                    cb()
+                except Exception as exc:
+                    log.debug("Mutation listener error on %s: %s", self.path.name, exc)
         return ok
+
+    def replace_synced(self, items: list[dict], tombstones: dict[str, str] | None = None) -> bool:
+        """Apply merged 2-way sync payload atomically without re-triggering sync listeners."""
+        self._items = [
+            self._normalize_loaded_item(i)
+            for i in (items or ())
+            if isinstance(i, dict) and i.get("id")
+        ]
+        self._tombstones = {
+            str(k).strip(): str(v).strip()
+            for k, v in (tombstones or {}).items()
+            if str(k).strip() and str(v).strip()
+        }
+        return self.save(emit=False)
 
     # -- util -----------------------------------------------------------------
     def all(self) -> list[dict]:
@@ -103,6 +189,7 @@ class JsonListStore:
         before = len(self._items)
         self._items = [i for i in self._items if i["id"] != item_id]
         if len(self._items) != before:
+            self._record_tombstone(item_id)
             self.save()
             return True
         return False
@@ -180,6 +267,7 @@ class TaskStore(JsonListStore):
         task = self.get(task_id)
         if task is not None and not task.get("rewarded"):
             task["rewarded"] = True
+            task["updated_at"] = now_iso()
             self.save()
 
     def with_deadline(self) -> list[dict]:
@@ -200,7 +288,7 @@ class TaskStore(JsonListStore):
         task = self.get(task_id)
         if task is not None and not task.get("notified"):
             task["notified"] = True
-            self.save()
+            self.save(emit=False)
 
     def restore(self, items: list[dict]) -> None:
         existing = {i.get("id") for i in self._items}
@@ -209,6 +297,7 @@ class TaskStore(JsonListStore):
             if isinstance(item, dict) and item.get("id") and item["id"] not in existing:
                 copy = dict(item)
                 copy["updated_at"] = now_iso()
+                self._clear_tombstone(str(copy["id"]))
                 self._items.append(copy)
                 existing.add(item["id"])
                 added = True
@@ -273,9 +362,15 @@ class TaskStore(JsonListStore):
         return moved
 
     def clear_done(self) -> int:
-        before = len(self._items)
-        self._items = [t for t in self._items if not t.get("done")]
-        removed = before - len(self._items)
+        kept: list[dict] = []
+        removed = 0
+        for t in self._items:
+            if t.get("done"):
+                self._record_tombstone(str(t.get("id") or ""))
+                removed += 1
+            else:
+                kept.append(t)
+        self._items = kept
         if removed:
             self.save()
         return removed
@@ -417,6 +512,7 @@ class NoteStore(JsonListStore):
         note["pinned"] = bool(pinned)
         if pinned:
             note["archived"] = False
+        note["updated"] = now_iso()
         self.save()
         return True
 
@@ -459,6 +555,8 @@ class NoteStore(JsonListStore):
             return None
         if self.get(note["id"]) is None:
             copy = dict(note)
+            copy["updated"] = now_iso()
+            self._clear_tombstone(str(copy["id"]))
             self._items.append(copy)
             self.save()
             return copy
@@ -482,7 +580,7 @@ class NoteStore(JsonListStore):
         note = self.get(note_id)
         if note is not None and not note.get("notified"):
             note["notified"] = True
-            self.save()
+            self.save(emit=False)
 
 
 class LocalEventStore(JsonListStore):
@@ -562,6 +660,8 @@ class LocalEventStore(JsonListStore):
             return None
         if self.get(event["id"]) is None:
             copy = dict(event)
+            copy["updated"] = now_iso()
+            self._clear_tombstone(str(copy["id"]))
             self._items.append(copy)
             self.save()
             return copy
@@ -761,20 +861,24 @@ class SocialStatsStore(JsonListStore):
         entry["points"] = new_pts
         entry["activity"] = new_act
         entry["block"] = new_blk
+        entry["updated"] = now_iso()
         self.save()
         return entry, prev
 
     def restore(self, entry: dict) -> dict | None:
         if not isinstance(entry, dict) or not entry.get("id"):
             return None
+        self._clear_tombstone(str(entry["id"]))
         existing = self.get(entry["id"])
         if existing is None:
             copy = dict(entry)
+            copy["updated"] = now_iso()
             self._items.append(copy)
             self.save()
             return copy
         existing.clear()
         existing.update(dict(entry))
+        existing["updated"] = now_iso()
         self.save()
         return existing
 
@@ -832,9 +936,21 @@ class SocialStatsStore(JsonListStore):
 class HabitStore(JsonListStore):
     """User-customizable daily habits linked to Social Stats.
 
-    Schema: {"id", "title", "stat", "points", "done_dates": [YYYY-MM-DD], "log_ids": {date: entry_id}, "created"}.
+    Schema: {"id", "title", "stat", "points", "done_dates": [YYYY-MM-DD], "log_ids": {date: entry_id}, "created", "updated"}.
     Completion resets automatically each new day while tracking consecutive streaks.
     """
+
+    def _normalize_loaded_item(self, item: dict) -> dict:
+        copy = dict(item)
+        raw_dates = copy.get("done_dates")
+        if not isinstance(raw_dates, list):
+            raw_dates = copy.get("dates") if isinstance(copy.get("dates"), list) else []
+        cleaned = sorted({str(d).strip() for d in raw_dates if str(d).strip()})
+        copy["done_dates"] = cleaned
+        copy["dates"] = list(cleaned)
+        if not isinstance(copy.get("log_ids"), dict):
+            copy["log_ids"] = {}
+        return copy
 
     def add(self, title: str, stat: str = "knowledge", points: int = 2) -> dict | None:
         title = (title or "").strip()
@@ -842,14 +958,17 @@ class HabitStore(JsonListStore):
             return None
         st = stat if stat in SOCIAL_STATS else "knowledge"
         pts = max(1, min(10, int(points)))
+        stamp = now_iso()
         habit = {
             "id": uuid.uuid4().hex[:12],
             "title": title,
             "stat": st,
             "points": pts,
             "done_dates": [],
+            "dates": [],
             "log_ids": {},
-            "created": now_iso(),
+            "created": stamp,
+            "updated": stamp,
         }
         self._items.append(habit)
         self.save()
@@ -863,6 +982,7 @@ class HabitStore(JsonListStore):
         h["title"] = title
         h["stat"] = stat if stat in SOCIAL_STATS else h.get("stat", "knowledge")
         h["points"] = max(1, min(10, int(points)))
+        h["updated"] = now_iso()
         self.save()
         return h
 
@@ -870,9 +990,9 @@ class HabitStore(JsonListStore):
         if not isinstance(habit, dict) or not habit.get("id"):
             return None
         if self.get(habit["id"]) is None:
-            copy = dict(habit)
-            copy["done_dates"] = list(habit.get("done_dates") or [])
-            copy["log_ids"] = dict(habit.get("log_ids") or {})
+            copy = self._normalize_loaded_item(habit)
+            copy["updated"] = now_iso()
+            self._clear_tombstone(str(copy["id"]))
             self._items.append(copy)
             self.save()
             return copy
@@ -885,7 +1005,7 @@ class HabitStore(JsonListStore):
             key = day
         else:
             key = date.today().isoformat()
-        return key in (habit.get("done_dates") or [])
+        return key in (habit.get("done_dates") or habit.get("dates") or [])
 
     def toggle_today(self, habit_id: str, stats_store: SocialStatsStore | None = None,
                      today: date | None = None) -> tuple[bool, dict | None, int, int]:
@@ -900,14 +1020,16 @@ class HabitStore(JsonListStore):
             return False, None, 1, 1
         ref = today or date.today()
         day_str = ref.isoformat()
-        dates = list(habit.get("done_dates") or [])
+        dates = list(habit.get("done_dates") or habit.get("dates") or [])
         log_ids = dict(habit.get("log_ids") or {})
 
         if day_str in dates:
             dates = [d for d in dates if d != day_str]
             old_entry_id = log_ids.pop(day_str, None)
             habit["done_dates"] = dates
+            habit["dates"] = list(dates)
             habit["log_ids"] = log_ids
+            habit["updated"] = now_iso()
             self.save()
             if stats_store is not None and old_entry_id:
                 stats_store.delete(old_entry_id)
@@ -915,7 +1037,9 @@ class HabitStore(JsonListStore):
 
         dates.append(day_str)
         # Keep unique sorted dates
-        habit["done_dates"] = sorted(set(dates))
+        cleaned = sorted(set(dates))
+        habit["done_dates"] = cleaned
+        habit["dates"] = list(cleaned)
         entry, old_lv, new_lv = None, 1, 1
         if stats_store is not None:
             stat = habit.get("stat", "knowledge")
@@ -931,6 +1055,7 @@ class HabitStore(JsonListStore):
             if entry is not None:
                 log_ids[day_str] = entry["id"]
         habit["log_ids"] = log_ids
+        habit["updated"] = now_iso()
         self.save()
         return True, entry, old_lv, new_lv
 
@@ -1661,9 +1786,10 @@ SETTINGS_DEFAULTS = {
     "ai_api_key": "",
     "ai_call_user": "Joker",            # How Morgana addresses you in AI conversations
     "ai_dialogue_enabled": True,        # Use AI for Talk / Choice Prompts & live app reactions
-    "sheets_sync_enabled": False,       # Opt-in write-only Google Sheets task deadline sync (WhatsApp relay)
+    "sheets_sync_enabled": False,       # Opt-in 2-way Google Sheets sync (Tasks, Notes, Stats, Events + WhatsApp tab)
     "finance_sheets_enabled": False,    # Opt-in Google Sheets Finance sync (bot-wa Monthly Budget tabs)
     "finance_sheets_migrated": True,    # Tracks one-time upgrade for existing Google Sheets users
+    "companion_sheets_migrated": True,  # Tracks one-time 2-way companion JSON sync upgrade for Finance Sheets users
     "sheets_sync_id": "",               # Google Spreadsheet ID or URL shared with Service Account
     "sheets_sync_tab": "Morgana",       # Dedicated worksheet tab name for synced deadlines
     "sheets_sync_key_path": "",         # Path to Service Account JSON (optional if placed beside app)
@@ -1703,6 +1829,7 @@ _BOOL_KEYS = (
     "sheets_sync_enabled",
     "finance_sheets_enabled",
     "finance_sheets_migrated",
+    "companion_sheets_migrated",
     "finance_tab_migrated",
 )
 _STR_KEYS = (
@@ -1789,12 +1916,17 @@ class SettingsStore:
             if set(str(x).lower() for x in patch["enabled_tabs"]) == _LEGACY_7_TABS:
                 patch["enabled_tabs"] = list(RADIAL_TAB_KEYS)
         # Upgrade existing Google Sheets users (who already connected Monthly Budget) to Finance Sheets sync once
-        migrated_finance_sheets = False
+        migrated_sheets = False
         if "finance_sheets_migrated" not in raw:
             if bool(raw.get("sheets_sync_enabled")) and str(raw.get("sheets_sync_id") or "").strip():
                 patch["finance_sheets_enabled"] = True
-                migrated_finance_sheets = True
+                migrated_sheets = True
             patch["finance_sheets_migrated"] = True
+        if "companion_sheets_migrated" not in raw:
+            if bool(raw.get("finance_sheets_enabled")) and str(raw.get("sheets_sync_id") or "").strip():
+                patch["sheets_sync_enabled"] = True
+                migrated_sheets = True
+            patch["companion_sheets_migrated"] = True
         # Smooth upgrade from v1.4.0/v1.4.1 -> current Gemini 3.5 Flash-Lite
         if "ai_provider" not in raw:
             if bool(raw.get("ai_enabled")):
@@ -1805,7 +1937,7 @@ class SettingsStore:
         elif str(patch.get("ai_provider") or raw.get("ai_provider") or "gemini").strip().lower() == "gemini":
             if str(patch.get("ai_model") or "").strip().lower() in ("gemini-2.5-flash", "gemini-2.0-flash"):
                 patch["ai_model"] = "gemini-3.5-flash-lite"
-        self.set(save=migrated_finance_sheets, **patch)
+        self.set(save=migrated_sheets, **patch)
 
     def set(self, save: bool = True, **values) -> None:
         # Accept legacy curfew_interval_min keyword cleanly
