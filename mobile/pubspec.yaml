@@ -1,7 +1,7 @@
 name: morgana_companion
 description: "Persona 5 Royal themed Android companion featuring Morgana, Finance (bot-wa Google Sheets sync), Tasks, Notes, Events, Social Stats, Timer, Gemini AI, and optional Floating Bubble."
 publish_to: 'none'
-version: 1.6.0+160
+version: 1.6.1+161
 
 environment:
   sdk: ^3.10.0
