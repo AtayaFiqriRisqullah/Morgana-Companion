@@ -46,15 +46,15 @@ STATS_SOUNDS: dict[str, str] = {
 }
 
 VOICE_SOUNDS: dict[str, str] = {
-    # Original 8 Japanese Morgana clips
-    "dousuru": "dousuru morgana.mp3",
-    "hmm": "hmm approve morgana.mp3",
-    "hoi": "hoi morgana .mp3",
-    "naa": "naa naa morgana.mp3",
-    "oh_asking": "oh asking morgana.mp3",
-    "oh_excited": "oh excited morgana.mp3",
-    "uwooh": "uwooh morgana.mp3",
-    "yareyare": "yareyare morgana .mp3",
+    # Original 8 Japanese Morgana clips (amplified to match P5R WAV loudness)
+    "dousuru": "dousuru.mp3",
+    "hmm": "hmm.mp3",
+    "hoi": "oi.mp3",
+    "naa": "naa naa .mp3",
+    "oh_asking": "ooh asking.mp3",
+    "oh_excited": "ooh excited.mp3",
+    "uwooh": "uwoooh.mp3",
+    "yareyare": "yareyare.mp3",
     # Curated 36 Persona 5 Royal Japanese Morgana reaction clips
     "ohayou": "morgana_ohayou.wav",           # "Ohayou~" (Good morning!)
     "choushi": "morgana_choushi.wav",         # "Choushi wa dou da?" (How's it going?)

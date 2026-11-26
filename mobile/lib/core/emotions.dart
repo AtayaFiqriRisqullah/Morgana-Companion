@@ -48,15 +48,15 @@ const Map<String, ExpressionMeta> kMorganaExpressions = {
 };
 
 const Map<String, String> kVoiceAssets = {
-  // Original 8 Japanese Morgana clips
-  'dousuru': 'audio/dousuru morgana.mp3',
-  'hmm': 'audio/hmm approve morgana.mp3',
-  'hoi': 'audio/hoi morgana .mp3',
-  'naa': 'audio/naa naa morgana.mp3',
-  'oh_asking': 'audio/oh asking morgana.mp3',
-  'oh_excited': 'audio/oh excited morgana.mp3',
-  'uwooh': 'audio/uwooh morgana.mp3',
-  'yareyare': 'audio/yareyare morgana .mp3',
+  // Original 8 Japanese Morgana clips (amplified to match P5R WAV loudness)
+  'dousuru': 'audio/dousuru.mp3',
+  'hmm': 'audio/hmm.mp3',
+  'hoi': 'audio/oi.mp3',
+  'naa': 'audio/naa naa .mp3',
+  'oh_asking': 'audio/ooh asking.mp3',
+  'oh_excited': 'audio/ooh excited.mp3',
+  'uwooh': 'audio/uwoooh.mp3',
+  'yareyare': 'audio/yareyare.mp3',
   // Curated 36 Persona 5 Royal Japanese Morgana reaction clips
   'ohayou': 'audio/morgana_ohayou.wav',
   'choushi': 'audio/morgana_choushi.wav',
