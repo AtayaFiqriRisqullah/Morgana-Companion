@@ -61,7 +61,8 @@ from calendar_service import (CalendarEvent, CalendarResult, CalendarService, ev
                               merge_companion_items, note_deadline_events, task_deadline_events)
 from command_engine import CommandResult, parse_and_plan
 from dialogue_engine import DialogueEngine, DialogueMemoryStore
-from emotions import EXPRESSIONS, STATE_EXPRESSION, emotion_for_text, voice_for_dialogue
+from emotions import (EXPRESSIONS, STATE_EXPRESSION, emotion_for_text,
+                      normalize_expression, resolve_reaction, voice_for_dialogue)
 from gemini_ai import (ACTION_LABELS, AIConfig, AIReply, AITalkScene, ConversationBuffer,
                        ask_morgana_chat, continue_joker_talk_choice, generate_ambient_reaction,
                        generate_joker_talk_scene, test_ai_connection)
@@ -436,6 +437,7 @@ class PetWindow(QWidget):
         self._expr = "neutral"                     # ekspresi wajah (kunci emotions.EXPRESSIONS)
         self._prev_expr = "neutral"
         self._speaking = False                     # mulut bergerak selama teks diketik
+        self._asleep_eyes = False                  # True saat Sleep Mode: mata tertutup tenang
         self._eye = EYE_OPEN                       # bingkai mata/mulut yang sedang tampil
         self._mouth = MOUTH_BASE
         self._blink_in = random.uniform(1.5, 3.5)  # detik sampai kedipan berikutnya
@@ -512,6 +514,14 @@ class PetWindow(QWidget):
         self._fade.configure(150.0)
         self.bump(0.7)
 
+    def set_asleep_eyes(self, on: bool) -> None:
+        """Keep Morgana's eyes gently closed when the user is asleep (Sleep Mode)."""
+        on = bool(on)
+        if on != self._asleep_eyes:
+            self._asleep_eyes = on
+            self._ticker.start()
+            self.update()
+
     def set_speaking(self, on: bool) -> None:
         """Gerakkan mulut (m1-m3) selama `on`; kembali ke mulut gambar dasar saat dimatikan."""
         self._speaking = on
@@ -573,6 +583,10 @@ class PetWindow(QWidget):
     def _animate_face(self, dt: float) -> None:
         """Kedip (e2 -> e1 -> e2) dan gerak mulut (acak m1/m2/m3) selama berbicara."""
         sleepy = self._state == "sleepy"
+        if sleepy and self._asleep_eyes and not self._speaking:
+            # User is asleep (Sleep Mode): peaceful closed eyes without sad frown
+            self._eye = EYE_CLOSED
+            return
         sequence = self.BLINK_SLEEPY if sleepy else self.BLINK
         eye = EYE_HALF if sleepy else EYE_OPEN      # mengantuk: kelopak setengah turun
         if self._blink_t < 0:
@@ -3689,6 +3703,7 @@ class PetController(QObject):
         self.forced_state: str | None = None   # override manual dari menu klik kanan
         self.forced_expression: str | None = None
         self.sleep_mode = False
+        self._sleep_started_at: float | None = None
         self.manual_dnd = bool(self.settings["manual_dnd"])
         self._auto_dnd_reason = ""             # "", "meeting", or "fullscreen"
         self._auto_dnd_since: float | None = None
@@ -3821,8 +3836,19 @@ class PetController(QObject):
             return self.forced_state
         return "sleepy" if (self.sleep_mode or self.curfew_active) else "idle"
 
+    def _base_expression(self, state: str) -> str:
+        if self.forced_expression:
+            return self.forced_expression
+        if state == "sleepy":
+            # Sleep Mode = user is asleep -> calm neutral face with closed eyes;
+            # Curfew while still awake -> tired droopy face reminding user to sleep.
+            return "neutral" if self.sleep_mode else "sad"
+        return STATE_EXPRESSION.get(state, "neutral")
+
     def _restore_state(self) -> None:
-        self.pet.set_state(self.base_state(), self.forced_expression)
+        st = self.base_state()
+        self.pet.set_asleep_eyes(self.sleep_mode and not self.forced_state)
+        self.pet.set_state(st, self._base_expression(st))
         self.pet.set_talking(False)
         self.pet.set_speaking(False)
 
@@ -3834,7 +3860,7 @@ class PetController(QObject):
             if self.dialogue_engine.is_active:
                 self.dialogue_engine.cancel()
             want_state = self.base_state()
-            want_expr = self.forced_expression or STATE_EXPRESSION[want_state]
+            want_expr = self._base_expression(want_state)
             if (self.pet._state != want_state or self.pet._expr != want_expr
                     or self.pet._speaking or self.pet._talk.target > 0.01):
                 self._restore_state()
@@ -3860,24 +3886,31 @@ class PetController(QObject):
             emotion: str | None = None, voice: str | bool | None = None,
             context: str = "", *, hold: bool = False, keep_choices: bool = False,
             particle: str = "") -> None:
-        """Ucapkan `text`. Ekspresi & voiceline dipilih dari isi kalimat (atau parameter eksplisit);
-        mulut bergerak selama balon mengetik."""
+        """Ucapkan `text`. Ekspresi & voiceline disinkronkan lewat `resolve_reaction()`
+        agar ekspresi wajah, teks, dan audio selalu selaras."""
         if not keep_choices:
             self._pending_choices = []
             if self.choices.is_open:
                 self.choices.close_choices(silent=True)
             self.dialogue_engine.cancel()
-        if emotion is None:
-            emotion = emotion_for_text(text, default=STATE_EXPRESSION.get(state, "neutral"))
+        if state not in STATES:
+            state = "talking"
+        resolved_emo, resolved_voice = resolve_reaction(
+            text,
+            emotion=emotion,
+            voice=voice,
+            state=state,
+            context=context,
+            hour=datetime.now().hour,
+        )
         if self.forced_state:
             self.pet.set_state(self.forced_state, self.forced_expression)
         else:
-            self.pet.set_state(state, self.forced_expression or emotion)
+            self.pet.set_state(state, self.forced_expression or resolved_emo)
         self.pet.set_talking(True)
         self.pet.set_speaking(True)
-        if voice is not False:
-            vkey = voice if isinstance(voice, str) else voice_for_dialogue(text, emotion, context)
-            self.audio.play_voice(vkey)
+        if resolved_voice is not False and isinstance(resolved_voice, str):
+            self.audio.play_voice(resolved_voice)
         if particle:
             self.particles.emit_by_name(particle)
         self.bubble.show_message(text, ms or max(4000, 2500 + 55 * len(text)), hold=hold)
@@ -4037,9 +4070,10 @@ class PetController(QObject):
         elif changed and announce:
             if on:
                 self.say("Do Not Disturb is ON. I'll stay completely quiet until you turn it back off.",
-                         "neutral", ms=4200, voice=False)
+                         "talking", ms=4200, emotion="wink", voice=False)
             else:
-                self.say("Do Not Disturb is OFF—I'm back online!", "talking", ms=3600, particle="sparkle")
+                self.say("Do Not Disturb is OFF—I'm back online!", "talking", ms=3600,
+                         emotion="wink", voice="choushi", particle="sparkle")
 
     def _update_auto_dnd(self, info, now_mono: float) -> None:
         want_meet = bool(self.settings["auto_dnd_meetings"])
@@ -4089,17 +4123,23 @@ class PetController(QObject):
             self._sync_quick_cmd_badge()
 
     def _flush_deferred_reminders(self, prev_reason: str = "", elapsed_s: float = 0.0) -> None:
-        if not self._deferred_reminders or self.is_dnd_active():
+        if not self._deferred_reminders or self.is_dnd_active() or self.sleep_mode:
             return
         queued = list(self._deferred_reminders)
         self._deferred_reminders.clear()
-        if prev_reason:
+        if prev_reason == "sleep":
+            hour = datetime.now().hour
+            greet = "Good morning!" if 4 <= hour < 12 else "Welcome back!"
+            vkey = "ohayou" if 4 <= hour < 12 else "choushi"
+            body = f"{greet} While you were asleep:\n\n" + "\n\n".join(queued[:4])
+            self.say(body, "talking", ms=12000, emotion="wink", voice=vkey, particle="sparkle")
+        elif prev_reason:
             head, emo, voice = dnd_recovery_line(prev_reason, format_duration(max(60.0, elapsed_s)), len(queued))
             body = head + "\n\n" + "\n\n".join(queued[:4])
             self.say(body, "talking", ms=12000, emotion=emo, voice=voice, context="reminder", particle="alert")
         else:
             body = "While Do Not Disturb was on:\n\n" + "\n\n".join(queued[:4])
-            self.say(body, "talking", ms=12000, context="reminder", particle="alert")
+            self.say(body, "talking", ms=12000, emotion="wink", voice="anosaa", context="reminder", particle="alert")
         if self.pet.isVisible():
             self.pet.bump(1.2)
 
@@ -4108,7 +4148,9 @@ class PetController(QObject):
             return
         hk = str(self.settings["quick_hotkey"])
         hk_s = f" · {hk}" if hk and hk != "Off" else ""
-        if self.manual_dnd:
+        if self.sleep_mode:
+            state = "Sleep Mode (User Asleep)"
+        elif self.manual_dnd:
             state = "Do Not Disturb (Manual)"
         elif self._auto_dnd_reason == "meeting":
             state = "Auto-DND (Meeting)"
@@ -4123,7 +4165,9 @@ class PetController(QObject):
     def _sync_quick_cmd_badge(self) -> None:
         if self.quick_cmd_dialog is None:
             return
-        if self.manual_dnd:
+        if self.sleep_mode:
+            self.quick_cmd_dialog.set_header_badge("SLEEP · ASLEEP", alert=False)
+        elif self.manual_dnd:
             self.quick_cmd_dialog.set_header_badge("DND · MANUAL", alert=True)
         elif self._auto_dnd_reason == "meeting":
             self.quick_cmd_dialog.set_header_badge("AUTO-DND · CALL", alert=True)
@@ -4171,6 +4215,10 @@ class PetController(QObject):
         now_mono = time.monotonic()
         dt_s = max(0.0, min(30.0, now_mono - self._last_awareness_tick))
         self._last_awareness_tick = now_mono
+
+        if self.sleep_mode:
+            # User is asleep while laptop stays running -> pause screen-time counting & ambient nudges
+            return
 
         want_app = bool(self.settings["app_awareness_enabled"])
         want_scr = bool(self.settings["screen_time_enabled"])
@@ -4463,9 +4511,7 @@ class PetController(QObject):
             QTimer.singleShot(140, lambda: self._open_briefing(announce=False))
         elif kind == "sleep_mode":
             want = bool(action.get("enabled", True))
-            if want != self.sleep_mode:
-                self.sleep_mode = want
-                self._restore_state()
+            self.set_sleep_mode(want, announce=False)
 
     # -- Daily Morning Briefing & Confidant Summary ---------------------------
     def _build_briefing_payload(self) -> dict:
@@ -4646,7 +4692,7 @@ class PetController(QObject):
             word = "task" if moved == 1 else "tasks"
             if self.pet.isVisible() and not self.is_dnd_active():
                 self.say(f"Moved {moved} {word} cleanly to tomorrow—sleep guilt-free tonight!",
-                         "talking", ms=4800, particle="sparkle")
+                         "talking", ms=4800, emotion="wink", voice="gokurou", particle="sparkle")
 
     def _on_wrapup_reflection(self, text: str, mood: str) -> None:
         note = self.notes.append_journal_reflection(text, mood=mood)
@@ -4867,9 +4913,7 @@ class PetController(QObject):
             self.set_sound_enabled(bool(res.payload.get("state", True)))
         elif res.kind == "toggle_sleep":
             want = bool(res.payload.get("state", True))
-            if want != self.sleep_mode:
-                self.sleep_mode = want
-                self._restore_state()
+            self.set_sleep_mode(want, announce=False)
         elif res.kind == "toggle_visibility":
             self._set_pet_visible(bool(res.payload.get("visible", True)))
         elif res.kind == "open_panel":
@@ -5121,7 +5165,7 @@ class PetController(QObject):
 
     # -- startup: Daily Morning Briefing (once/day) atau ringkasan singkat ----
     def _startup_report(self) -> None:
-        if self.curfew_active or self.is_dnd_active():
+        if self.sleep_mode or self.curfew_active or self.is_dnd_active():
             return
         today_str = datetime.now().strftime("%Y-%m-%d")
         if bool(self.settings["morning_briefing"]) and self.settings["last_briefing_date"] != today_str:
@@ -5165,6 +5209,15 @@ class PetController(QObject):
         gold star expanding, and fire Rank Up golden starburst + music notes on level up."""
         leveled_up = new_lv > old_lv
         label = SOCIAL_STATS.get(stat, {}).get("label", stat.title())
+        if self.sleep_mode:
+            self._sync_briefing_view()
+            if leveled_up:
+                rank = stat_rank_title(stat, new_lv)
+                msg = f"RANK UP! Your {label} leveled up to Lv {new_lv} ({rank})!"
+                if msg not in self._deferred_reminders:
+                    self._deferred_reminders.append(msg)
+                    self._deferred_reminders = self._deferred_reminders[-8:]
+            return
 
         # Stage 1 (immediate): golden music notes + sparkles around Morgana!
         self.particles.emit_stat_gain(points=points, leveled_up=leveled_up)
@@ -5197,7 +5250,8 @@ class PetController(QObject):
             self.particles.emit_rank_up()
             self.pet.bump(1.35)
             self.say(f"RANK UP! Your {label} leveled up to Lv {new_lv} ({rank})! "
-                     "All that consistency is really paying off!", "action", ms=7500, context="rank_up")
+                     "All that consistency is really paying off!",
+                     "action", ms=7500, emotion="excited", context="rank_up")
 
         self.audio.play_stats_sequence(
             points=points,
@@ -5942,8 +5996,8 @@ class PetController(QObject):
             messages.append(f"{head} " + " · ".join(countdown) + "\n" + self._bag_agenda.next())
 
         if messages:
-            if self.is_dnd_active():
-                # Queue important due/starting alerts cleanly until DND ends
+            if self.is_dnd_active() or self.sleep_mode:
+                # Queue important due/starting alerts cleanly until DND / Sleep Mode ends
                 for m in messages:
                     if m not in self._deferred_reminders:
                         self._deferred_reminders.append(m)
@@ -5959,7 +6013,7 @@ class PetController(QObject):
                 play_beep()
 
     def _notify_tray(self, title: str, message: str) -> None:
-        if self.tray is not None and not self.is_dnd_active():
+        if self.tray is not None and not self.is_dnd_active() and not self.sleep_mode:
             try:
                 self.tray.showMessage(title, message[:240], QSystemTrayIcon.MessageIcon.Information, 6000)
             except Exception:
@@ -6009,11 +6063,13 @@ class PetController(QObject):
             self.act_sys_dnd.setText(f"DO NOT DISTURB  (Auto: {self._auto_dnd_reason.title()})")
         else:
             self.act_sys_dnd.setText("DO NOT DISTURB")
-        self.act_sys_sleep.setText("WAKE UP  (Disable Sleep Mode)" if self.sleep_mode
-                                   else "SLEEP MODE  (Take a Break)")
+        self.act_sys_sleep.setText("I'M AWAKE!  (Exit Sleep Mode)" if self.sleep_mode
+                                   else "SLEEP MODE  (I'm Going to Sleep)")
         self.act_sys_bed.setText(self._bedtime_text())
 
     def _bedtime_text(self) -> str:
+        if self.sleep_mode:
+            return "BEDTIME: Paused (You're Asleep)"
         if not self.curfew_enabled:
             return "BEDTIME: Off"
         bed = self.settings.bedtime
@@ -6139,19 +6195,86 @@ class PetController(QObject):
         self._last_curfew_msg = None
         self._check_curfew()
 
-    def _toggle_sleep_mode(self) -> None:
-        self.sleep_mode = not self.sleep_mode
-        if self.sleep_mode:
-            self.say("Sleep Mode is on. Reminders will still run—open SYSTEM again "
-                     "whenever you want to wake me up.", "sleepy", 6000, particle="zzz")
+    def set_sleep_mode(self, enabled: bool, *, announce: bool = True) -> None:
+        """Toggle Sleep Mode = treat the user as already asleep while the laptop stays on.
+
+        While Sleep Mode is ON:
+          - Curfew/bedtime nagging, evening wrap-up, chatter, app awareness, and active
+            screen-time tracking pause so the laptop can run undisturbed overnight.
+          - Reminders & finished timers queue silently until wake-up instead of popping up.
+          - Morgana settles into peaceful closed eyes (`neutral` + `EYE_CLOSED`) with a `SLEEP` HUD pill.
+        When turned OFF ("I'm awake!"):
+          - Queued reminders/alerts are delivered together in a warm wake-up recap.
+        """
+        want = bool(enabled)
+        if want == self.sleep_mode:
+            return
+        self.sleep_mode = want
+        if want:
+            self._sleep_started_at = time.monotonic()
+            self.curfew_active = False
+            self._last_curfew_msg = None
+            if self.choices.is_open:
+                self.choices.close_choices(silent=True)
+            if self.menu.is_open:
+                self.menu.close_menu(silent=True, emit_user_close=False)
+            self._sync_timer_ui()
+            self._update_tray_tooltip()
+            self._sync_quick_cmd_badge()
+            if announce and self.pet.isVisible():
+                # Show warm goodnight smile (`wink` + cozy sleep meow) first; when the bubble
+                # dismisses, `_on_bubble_dismissed()` -> `_restore_state()` closes Morgana's eyes.
+                self.pet.set_asleep_eyes(True)
+                self.say(
+                    "Sleep Mode is on—I'll assume you're already asleep and keep everything quiet "
+                    "while your laptop stays on. Good night! Click 'I'm Awake' when you're back.",
+                    "talking",
+                    ms=6500,
+                    emotion="wink",
+                    voice="sleep_on",
+                    context="sleep_on",
+                    particle="zzz",
+                )
+            else:
+                if self.bubble.isVisible():
+                    self.bubble.dismiss()
+                self._restore_state()
         else:
-            self.say("I'm awake! Sleep Mode is off.", "talking", 3000, particle="sparkle")
-        self._restore_state()
+            self.pet.set_asleep_eyes(False)
+            started = self._sleep_started_at
+            elapsed_s = (time.monotonic() - started) if started else 0.0
+            self._sleep_started_at = None
+            # Give a full curfew interval of grace right after waking up in early morning hours
+            self._last_curfew_msg = datetime.now()
+            self._sync_timer_ui()
+            self._update_tray_tooltip()
+            self._sync_quick_cmd_badge()
+            if self._deferred_reminders and not self.is_dnd_active():
+                self._flush_deferred_reminders(prev_reason="sleep", elapsed_s=elapsed_s)
+            elif announce and self.pet.isVisible():
+                hour = datetime.now().hour
+                greet = "Good morning!" if 4 <= hour < 12 else "Welcome back!"
+                vkey = "ohayou" if 4 <= hour < 12 else "choushi"
+                self.say(
+                    f"{greet} Sleep Mode is off—I'm wide awake and ready whenever you are!",
+                    "talking",
+                    ms=4500,
+                    emotion="wink",
+                    voice=vkey,
+                    context="wake_up",
+                    particle="sparkle",
+                )
+            else:
+                self._restore_state()
+
+    def _toggle_sleep_mode(self) -> None:
+        self.set_sleep_mode(not self.sleep_mode, announce=True)
 
     def _act_item(self) -> None:
         snap = self.monitor.snapshot()
         if snap is None:
-            self.say("The psutil package isn't installed yet. Run: pip install psutil")
+            self.say("The psutil package isn't installed yet. Run: pip install psutil",
+                     emotion="uneasy", voice="acchaa")
             return
         scr = self.screen_time.today_summary()
         text = (f"SYSTEM STATUS\nCPU : {snap.cpu:.0f}%\n"
@@ -6160,9 +6283,15 @@ class PetController(QObject):
         heavy = snap.cpu >= 85 or snap.ram_percent >= 90
         if heavy:
             text += "\nCPU/RAM usage is high. Try closing apps you don't need."
-        self.say(text, "action" if heavy else "talking", ms=7000)
+        self.say(
+            text,
+            "action" if heavy else "talking",
+            ms=7000,
+            emotion="angry" if heavy else "smug",
+            voice="kangaero" if heavy else "fumu",
+        )
 
-    # -- Pomodoro & Manual Timers (Persona 5 Timer + HUD + DND badge) ------------
+    # -- Pomodoro & Manual Timers (Persona 5 Timer + HUD + Sleep/DND badge) ------
     def _sync_timer_ui(self) -> None:
         had_hud = self.pet._hud is not None
         manual = self.manual_timers.snapshot()
@@ -6188,6 +6317,8 @@ class PetController(QObject):
                 accent="gold",
                 extra=extra,
             )
+        elif self.sleep_mode:
+            self.pet.set_hud("SLEEP", "ASLEEP", progress=1.0, accent="gold")
         elif self.is_dnd_active():
             reason = self.dnd_reason()
             sub = "CALL" if reason == "meeting" else ("FULL" if reason == "fullscreen" else "QUIET")
@@ -6238,21 +6369,39 @@ class PetController(QObject):
         self.pet.bump(0.85)
         self.particles.emit_hearts(3)
         if not silent_say:
-            self.say(f"{mins}-minute break timer started! Step away, stretch, and hydrate!", "talking", ms=4800)
+            self.say(
+                f"{mins}-minute break timer started! Step away, stretch, and hydrate!",
+                "talking",
+                ms=4800,
+                emotion="wink",
+                voice="gokurou",
+            )
 
     def _add_manual_timer(self, total_s: int, label: str) -> None:
         item = self.manual_timers.add(total_s, label)
         self.pet.bump(0.8)
-        self.say(f"Timer set: {clip(item.label, 38)} ({fmt_hms(item.total_s)}). "
-                 "I'll remind you as soon as time's up!", "talking", ms=4500, particle="sparkle")
+        self.say(
+            f"Timer set: {clip(item.label, 38)} ({fmt_hms(item.total_s)}). "
+            "I'll remind you as soon as time's up!",
+            "talking",
+            ms=4500,
+            emotion="smug",
+            voice="kettei",
+            particle="sparkle",
+        )
 
     def _cancel_manual_timer(self, timer_id: str) -> None:
         self.manual_timers.cancel(timer_id)
 
     def _on_manual_timer_fired(self, label: str, total_s: int) -> None:
         msg = f"Time's up! Your timer '{clip(label, 42)}' ({fmt_hms(total_s)}) just finished!"
+        if self.sleep_mode:
+            if msg not in self._deferred_reminders:
+                self._deferred_reminders.append(msg)
+                self._deferred_reminders = self._deferred_reminders[-8:]
+            return
         if self.pet.isVisible():
-            self.say(msg, "action", ms=11000, context="timer_up", particle="alert")
+            self.say(msg, "action", ms=11000, emotion="shout", context="timer_up", particle="alert")
             self.pet.bump(1.4)
         else:
             self._notify_tray("Timer Finished", msg)
@@ -6267,17 +6416,20 @@ class PetController(QObject):
             if getattr(self, "_suppress_focus_start_say", False):
                 return
             t = fmt_mmss(self.pomodoro.focus_s)
-            if self.pet.isVisible():
-                self.say(random.choice(_FOCUS_START).format(t=t), "action", particle="sparkle")
+            if self.pet.isVisible() and not self.sleep_mode:
+                self.say(
+                    random.choice(_FOCUS_START).format(t=t),
+                    "action",
+                    emotion="smug",
+                    context="focus_start",
+                    particle="sparkle",
+                )
         else:
             t = fmt_mmss(self.pomodoro.rest_s)
             self.screen_time.record_break()
             if self.timer_dialog is not None:
                 self.timer_dialog.update_screen_time(self.screen_time.today_summary())
             self._sync_wrapup_view()
-            if self.pet.isVisible():
-                self.pet.bump(1.2)
-            play_beep()
             focus_mins = max(1, int(round(self.pomodoro.focus_s / 60.0)))
             pts = 3 if focus_mins >= 45 else 2
             fstat = str(self.settings["focus_stat"] or "knowledge")
@@ -6295,48 +6447,73 @@ class PetController(QObject):
             msg = random.choice(_FOCUS_REST).format(t=t)
             if awarded > 0 and fstat in SOCIAL_STATS:
                 msg += f" (+{awarded} {SOCIAL_STATS[fstat]['label']}!)"
+            if self.sleep_mode:
+                if msg not in self._deferred_reminders:
+                    self._deferred_reminders.append(msg)
+                    self._deferred_reminders = self._deferred_reminders[-8:]
+                return
             if self.pet.isVisible():
-                self.say(msg, particle="music")
+                self.pet.bump(1.2)
+                self.say(msg, emotion="excited", voice="gokurou", particle="music")
             else:
                 self._notify_tray("Focus Complete", msg)
+            play_beep()
 
     def _on_pomo_finished(self) -> None:
         self._sync_timer_ui()
         self._sync_wrapup_view()
-        if self.pet.isVisible():
-            self.pet.bump(1.3)
-        play_beep()
         n = self.pomodoro.completed
         word = "session" if n == 1 else "sessions"
         msg = (f"Break's over! That's {n} focus {word} completed today—you're doing awesome! "
                "Open TIMER whenever you're ready for another round.")
+        if self.sleep_mode:
+            if msg not in self._deferred_reminders:
+                self._deferred_reminders.append(msg)
+                self._deferred_reminders = self._deferred_reminders[-8:]
+            return
         if self.pet.isVisible():
-            self.say(msg, "action")
+            self.pet.bump(1.3)
+            self.say(msg, "action", emotion="excited", voice="oh_excited")
         else:
             self._notify_tray("Break Finished", msg)
+        play_beep()
 
     def _stop_pomodoro(self) -> None:
         self.pomodoro.stop()
-        self.say("Timer paused! Rest up if you need to—start a new session from TIMER whenever you're ready.")
+        self.say(
+            "Timer paused! Take a breather if you need to—start a new session from TIMER whenever you're ready.",
+            emotion="wink",
+            voice="maana",
+        )
 
     # -- launchers ---------------------------------------------------------------
     def _launch_vscode(self) -> None:
         cmd = find_vscode()
         if cmd and launch_detached(cmd):
-            self.say("VS Code is open! Let's get some good work done.", "action")
+            self.say("VS Code is open! Let's get some good work done.", "action",
+                     emotion="smug", voice="shigoto")
         else:
-            self.say("Couldn't find VS Code. Make sure the 'code' command is on your PATH.")
+            self.say("Couldn't find VS Code. Make sure the 'code' command is on your PATH.",
+                     emotion="uneasy", voice="acchaa")
 
     def _launch_terminal(self) -> None:
         cmd = find_terminal()
         if cmd and launch_detached(cmd):
-            self.say("Terminal is open!", "action")
+            self.say("Terminal is open!", "action", emotion="wink", voice="yoshi")
         else:
-            self.say("Couldn't find a terminal. Set the TERMINAL environment variable or edit find_terminal().")
+            self.say("Couldn't find a terminal. Set the TERMINAL environment variable or edit find_terminal().",
+                     emotion="uneasy", voice="acchaa")
 
     # -- curfew & Evening Wrap-up auto-trigger -----------------------------------
     def _check_curfew(self) -> None:
         self._ensure_state_healthy()
+        if self.sleep_mode:
+            # User is already asleep while the laptop stays on: suppress bedtime curfew nagging
+            # and Evening Wrap-up completely so the computer runs undisturbed.
+            if self.curfew_active:
+                self.curfew_active = False
+                self._last_curfew_msg = None
+            return
         now = datetime.now()
         active = self.curfew_enabled and in_window(now.time(), self.settings.bedtime, self.settings.wake)
         if active:
@@ -6466,6 +6643,11 @@ class PetController(QObject):
         self.act_dnd.setChecked(self.manual_dnd)
         self.act_dnd.toggled.connect(self.set_manual_dnd)
 
+        self.act_ctx_sleep = m.addAction("SLEEP MODE  (I'm Going to Sleep)")
+        self.act_ctx_sleep.setCheckable(True)
+        self.act_ctx_sleep.setChecked(self.sleep_mode)
+        self.act_ctx_sleep.toggled.connect(lambda on: self.set_sleep_mode(on, announce=True))
+
         self.act_top = m.addAction("ALWAYS ON TOP")
         self.act_top.setCheckable(True)
         self.act_top.setChecked(True)
@@ -6504,6 +6686,11 @@ class PetController(QObject):
             self.act_dnd.setText(f"DO NOT DISTURB  (Auto: {self._auto_dnd_reason.title()})")
         else:
             self.act_dnd.setText("DO NOT DISTURB")
+        self.act_ctx_sleep.blockSignals(True)
+        self.act_ctx_sleep.setChecked(self.sleep_mode)
+        self.act_ctx_sleep.setText("I'M AWAKE!  (Exit Sleep Mode)" if self.sleep_mode
+                                   else "SLEEP MODE  (I'm Going to Sleep)")
+        self.act_ctx_sleep.blockSignals(False)
         self.act_stop_pomo.setEnabled(self.pomodoro.running)
         self.act_autostart.setChecked(autostart.is_enabled())    # sinkron bila diubah dari luar
 
@@ -6513,6 +6700,7 @@ class PetController(QObject):
         self.act_tray_cmd: QAction | None = None
         self.act_tray_toggle: QAction | None = None
         self.act_tray_dnd: QAction | None = None
+        self.act_tray_sleep: QAction | None = None
         self.act_tray_sound: QAction | None = None
         if not QSystemTrayIcon.isSystemTrayAvailable():
             return
@@ -6528,6 +6716,10 @@ class PetController(QObject):
         self.act_tray_dnd.setCheckable(True)
         self.act_tray_dnd.setChecked(self.manual_dnd)
         self.act_tray_dnd.toggled.connect(self.set_manual_dnd)
+        self.act_tray_sleep = tm.addAction("SLEEP MODE  (I'm Going to Sleep)")
+        self.act_tray_sleep.setCheckable(True)
+        self.act_tray_sleep.setChecked(self.sleep_mode)
+        self.act_tray_sleep.toggled.connect(lambda on: self.set_sleep_mode(on, announce=True))
         tm.addSeparator()
 
         tm.addAction("DAILY BRIEFING...", lambda: self._open_briefing(announce=True))
@@ -6571,6 +6763,12 @@ class PetController(QObject):
                 self.act_tray_dnd.setText(f"DO NOT DISTURB  (Auto: {self._auto_dnd_reason.title()})")
             else:
                 self.act_tray_dnd.setText("DO NOT DISTURB")
+        if self.act_tray_sleep is not None:
+            self.act_tray_sleep.blockSignals(True)
+            self.act_tray_sleep.setChecked(self.sleep_mode)
+            self.act_tray_sleep.setText("I'M AWAKE!  (Exit Sleep Mode)" if self.sleep_mode
+                                        else "SLEEP MODE  (I'm Going to Sleep)")
+            self.act_tray_sleep.blockSignals(False)
         if self.act_tray_sound is not None:
             self.act_tray_sound.blockSignals(True)
             self.act_tray_sound.setChecked(bool(self.settings["sound_enabled"]))

@@ -1239,7 +1239,7 @@ def _build_trees() -> list[ConversationTree]:
                         "Yawn... It's getting seriously late{app_clause}! What's still keeping you at the desk?",
                         "Whoa, late-night session{app_clause}! Wrapping up one last thing, or losing track of the clock?",
                     ),
-                    emotion="sad", voice="yareyare", particle="zzz",
+                    emotion="sad", voice="yawn", particle="zzz",
                     choices=(
                         DialogueChoice("Finishing one last thing—give me 15m!", "fifteen_more"),
                         DialogueChoice("Brain-dumping thoughts so I can sleep.", "night_journal"),
@@ -1263,7 +1263,7 @@ def _build_trees() -> list[ConversationTree]:
                         "15-minute Lights Out timer set! Finish strong, save your work, then straight to bed!",
                         "Final-lap countdown rolling! Save everything cleanly when the bell rings!",
                     ),
-                    emotion="smug", voice="hmm", particle="sparkle",
+                    emotion="smug", voice="kettei", particle="sparkle",
                 ),
                 "wrap_promise": DialogueNode(
                     texts=(
@@ -1289,12 +1289,12 @@ def _build_trees() -> list[ConversationTree]:
                         "Opening a fresh Journal note! Jot down 3 quick lines, close the screen, and rest easy.",
                         "Journal ready! Put tomorrow on paper so tonight belongs to sleep.",
                     ),
-                    emotion="wink", voice="hmm", particle="music",
+                    emotion="wink", voice="kaketa", particle="music",
                 ),
                 "wind_down": DialogueNode(
                     texts=(
                         "Now THAT'S a wise call! Want me to switch into Sleep Mode while you head to bed?",
-                        "Good night! Should I curl up in Sleep Mode too?",
+                        "Good night! Should I switch to Sleep Mode while your laptop stays on?",
                     ),
                     emotion="wink", voice="hmm", particle="heart",
                     choices=(
@@ -1305,10 +1305,10 @@ def _build_trees() -> list[ConversationTree]:
                 ),
                 "go_sleep": DialogueNode(
                     texts=(
-                        "Sweet dreams! Entering Sleep Mode—see you bright and sharp tomorrow!",
-                        "Sleep Mode on! Rest up well—we'll hit tomorrow running!",
+                        "Sweet dreams! Sleep Mode is on—I'll keep everything quiet while your laptop stays on!",
+                        "Sleep Mode on! Rest up well—I'll stay quiet and catch you bright and sharp tomorrow!",
                     ),
-                    emotion="sad", voice="yareyare", particle="zzz",
+                    emotion="wink", voice="sleep_on", particle="zzz",
                 ),
                 "good_night": DialogueNode(
                     texts=(

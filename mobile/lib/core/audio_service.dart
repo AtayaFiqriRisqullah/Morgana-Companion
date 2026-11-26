@@ -1,3 +1,5 @@
+import 'dart:math';
+
 import 'package:audioplayers/audioplayers.dart';
 
 import 'emotions.dart';
@@ -6,6 +8,8 @@ import 'emotions.dart';
 class MorganaAudioService {
   AudioPlayer? _voicePlayer;
   AudioPlayer? _sfxPlayer;
+  final Random _rng = Random();
+  final Map<String, String> _lastPoolChoice = {};
 
   bool enabled = true;
   int voiceVolume = 80;
@@ -18,9 +22,28 @@ class MorganaAudioService {
     sfxVolume = sfxVol.clamp(0, 100);
   }
 
+  /// Resolve a voice key or semantic pool name with anti-repeat rotation.
+  String resolveVoiceKey(String key) {
+    final pool = kVoicePools[key];
+    if (pool != null && pool.isNotEmpty) {
+      final valid = pool.where(kVoiceAssets.containsKey).toList();
+      if (valid.isNotEmpty) {
+        final prev = _lastPoolChoice[key];
+        final choices = (valid.length > 1 && prev != null)
+            ? valid.where((k) => k != prev).toList()
+            : valid;
+        final picked = choices[_rng.nextInt(choices.length)];
+        _lastPoolChoice[key] = picked;
+        return picked;
+      }
+    }
+    return key;
+  }
+
   Future<void> playVoice(String key) async {
     if (_disposed || !enabled || voiceVolume <= 0) return;
-    final asset = kVoiceAssets[key];
+    final resolved = resolveVoiceKey(key);
+    final asset = kVoiceAssets[resolved];
     if (asset == null) return;
     try {
       final p = _voicePlayer ??= AudioPlayer();

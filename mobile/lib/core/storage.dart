@@ -1276,6 +1276,7 @@ Map<String, dynamic> defaultSettings() => {
       'auto_stat_rewards': true,
       'floating_bubble_enabled': false,
       'manual_dnd': false,
+      'sleep_mode': false,
       'enabled_tabs': List<String>.from(kRadialTabKeys),
       'ai_enabled': false,
       'ai_provider': 'gemini',

@@ -14,6 +14,7 @@ import '../theme/p5_theme.dart';
 class MorganaStageWidget extends StatefulWidget {
   final String emotion;
   final bool talking;
+  final bool asleep;
   final bool menuOpen;
   final List<String> enabledTabs;
   final VoidCallback onTapMorgana;
@@ -24,6 +25,7 @@ class MorganaStageWidget extends StatefulWidget {
     super.key,
     required this.emotion,
     required this.talking,
+    this.asleep = false,
     required this.menuOpen,
     required this.enabledTabs,
     required this.onTapMorgana,
@@ -124,6 +126,9 @@ class _MorganaStageWidgetState extends State<MorganaStageWidget> with TickerProv
     final half = (tabs.length + 1) ~/ 2;
     final leftTabs = tabs.sublist(0, half);
     final rightTabs = tabs.sublist(half);
+    final restingAsleep = widget.asleep && !widget.talking;
+    final displayEmotion = restingAsleep ? 'neutral' : widget.emotion;
+    final displayEyeState = restingAsleep ? 2 : _eyeState;
 
     return LayoutBuilder(
       builder: (context, constraints) {
@@ -157,7 +162,7 @@ class _MorganaStageWidgetState extends State<MorganaStageWidget> with TickerProv
               AnimatedBuilder(
                 animation: Listenable.merge([_bobCtrl, _burstCtrl]),
                 builder: (_, _) {
-                  final dy = sin(_bobCtrl.value * pi) * -5.0;
+                  final dy = sin(_bobCtrl.value * pi) * (restingAsleep ? -2.2 : -5.0);
                   final burst = _burstCtrl.value;
                   return Transform.translate(
                     offset: Offset(0, dy),
@@ -186,7 +191,7 @@ class _MorganaStageWidgetState extends State<MorganaStageWidget> with TickerProv
                                   child: ColorFiltered(
                                     colorFilter: const ColorFilter.mode(P5Colors.red, BlendMode.srcATop),
                                     child: _MorganaSpriteLayer(
-                                      emotion: widget.emotion,
+                                      emotion: displayEmotion,
                                       eyeState: 0,
                                       mouthState: 0,
                                       size: spriteSize,
@@ -195,8 +200,8 @@ class _MorganaStageWidgetState extends State<MorganaStageWidget> with TickerProv
                                 ),
                               ),
                             _MorganaSpriteLayer(
-                              emotion: widget.emotion,
-                              eyeState: _eyeState,
+                              emotion: displayEmotion,
+                              eyeState: displayEyeState,
                               mouthState: _mouthState,
                               size: spriteSize,
                             ),

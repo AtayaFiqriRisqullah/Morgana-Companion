@@ -26,13 +26,13 @@ DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
 DEFAULT_OPENAI_ENDPOINT = "http://localhost:11434/v1/chat/completions"
 DEFAULT_CALL_USER = "Joker"
 
+from emotions import VOICES as _ALL_VOICES, emotion_for_text, resolve_reaction
+
 VALID_EXPRESSIONS: tuple[str, ...] = (
     "neutral", "wink", "serious", "worried", "angry",
     "sad", "uneasy", "excited", "shout", "smug",
 )
-VALID_VOICES: tuple[str, ...] = (
-    "dousuru", "hmm", "hoi", "naa", "oh_asking", "oh_excited", "uwooh", "yareyare",
-)
+VALID_VOICES: tuple[str, ...] = _ALL_VOICES
 VALID_PARTICLES: tuple[str, ...] = (
     "", "sparkle", "music", "heart", "alert", "question", "anger", "zzz",
 )
@@ -56,7 +56,7 @@ _EXPR_ALIAS: dict[str, str] = {
     "happy": "wink",
     "sparkle": "excited",
     "cheerful": "wink",
-    "sleepy": "sad",
+    "sleepy": "neutral",
     "tired": "sad",
     "surprised": "shout",
     "curious": "neutral",
@@ -67,13 +67,14 @@ _EXPR_ALIAS: dict[str, str] = {
 
 _VOICE_ALIAS: dict[str, str] = {
     "nice": "oh_excited",
-    "lets_go": "uwooh",
+    "lets_go": "ikuzo",
     "care": "naa",
-    "not_a_cat": "hoi",
-    "hello": "hoi",
+    "not_a_cat": "chigau",
+    "hello": "choushi",
+    "morning": "ohayou",
     "happy": "oh_excited",
-    "sleepy": "yareyare",
-    "oi": "hoi",
+    "sleepy": "sleepy_nyaa",
+    "oi": "oi",
     "ask": "oh_asking",
 }
 
@@ -562,18 +563,25 @@ def ask_morgana_chat(
 
     obj = _extract_json_object(raw)
     if obj and isinstance(obj.get("reply"), str) and obj["reply"].strip():
+        reply_txt = _clean_dialogue_text(obj["reply"])
+        raw_emo = normalize_expression(str(obj.get("emotion") or ""), "wink")
+        raw_voice = normalize_voice(str(obj.get("voice") or ""), "hmm")
+        if raw_emo == "sad" and emotion_for_text(reply_txt) in ("excited", "wink", "smug"):
+            raw_emo = emotion_for_text(reply_txt)
+        emo, vkey = resolve_reaction(reply_txt, emotion=raw_emo, voice=raw_voice)
         return AIReply(
             ok=True,
-            text=_clean_dialogue_text(obj["reply"]),
-            emotion=normalize_expression(str(obj.get("emotion") or ""), "wink"),
-            voice=normalize_voice(str(obj.get("voice") or ""), "hmm"),
+            text=reply_txt,
+            emotion=emo,
+            voice=str(vkey) if isinstance(vkey, str) else "hmm",
             particle=normalize_particle(str(obj.get("particle") or "")),
             suggested_action=normalize_action(str(obj.get("suggested_action") or "")),
         )
     # Graceful plain-text fallback if a custom local model ignored JSON instructions
     cleaned = _clean_dialogue_text(raw)
     if cleaned:
-        return AIReply(ok=True, text=cleaned, emotion="wink", voice="hmm", particle="")
+        emo, vkey = resolve_reaction(cleaned)
+        return AIReply(ok=True, text=cleaned, emotion=emo, voice=str(vkey) if isinstance(vkey, str) else "hmm", particle="")
     return AIReply(ok=False, text="", error="Empty AI reply")
 
 
@@ -637,11 +645,18 @@ def generate_joker_talk_scene(
     if len(parsed_choices) < 2:
         return AITalkScene(ok=False, line="", error="Too few choices returned")
 
+    line_txt = _clean_dialogue_text(obj["line"], limit=260)
+    raw_emo = normalize_expression(str(obj.get("emotion") or ""), "wink")
+    raw_voice = normalize_voice(str(obj.get("voice") or ""), "naa")
+    if raw_emo == "sad" and emotion_for_text(line_txt) in ("excited", "wink", "smug"):
+        raw_emo = emotion_for_text(line_txt)
+    emo, vkey = resolve_reaction(line_txt, emotion=raw_emo, voice=raw_voice)
+
     return AITalkScene(
         ok=True,
-        line=_clean_dialogue_text(obj["line"], limit=260),
-        emotion=normalize_expression(str(obj.get("emotion") or ""), "wink"),
-        voice=normalize_voice(str(obj.get("voice") or ""), "naa"),
+        line=line_txt,
+        emotion=emo,
+        voice=str(vkey) if isinstance(vkey, str) else "naa",
         particle=normalize_particle(str(obj.get("particle") or "")),
         choices=tuple(parsed_choices),
     )

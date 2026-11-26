@@ -328,8 +328,8 @@ def _status_reply(ctx: dict) -> CommandResult:
     return CommandResult(
         kind="status_query",
         reply=reply,
-        emotion="smug" if pending == 0 else ("worried" if overdue else "happy"),
-        voice="hmm",
+        emotion="smug" if pending == 0 else ("worried" if overdue else "wink"),
+        voice="taihen" if overdue else "hmm",
         badge="LIVE STATUS",
         action_label="OPEN BRIEFING",
         action_target="briefing",
@@ -356,7 +356,7 @@ def _local_chat_reply(raw: str, ctx: dict) -> CommandResult:
                 "Did you just call me a cat?! Watch it! I'm a dignified partner who keeps your whole schedule running!",
             ]),
             emotion="angry",
-            voice="hoi",
+            voice="chigau",
             particle="anger",
             badge="NOT A CAT",
         )
@@ -799,10 +799,26 @@ def parse_and_plan(raw_text: str, ctx: dict | None = None,
         return CommandResult(kind="toggle_sound", reply="Sounds muted!", badge="MUTED", payload={"state": False})
     if low in ("unmute", "sound on"):
         return CommandResult(kind="toggle_sound", reply="Sounds back on!", emotion="wink", badge="SOUND ON", payload={"state": True})
-    if low in ("sleep", "sleep mode", "nap"):
-        return CommandResult(kind="toggle_sleep", reply="Toggling Sleep Mode.", emotion="sad", badge="SLEEP", payload={"state": True})
-    if low in ("wake", "wake up"):
-        return CommandResult(kind="toggle_sleep", reply="I'm wide awake!", emotion="excited", badge="AWAKE", payload={"state": False})
+    if low in ("sleep", "sleep mode", "sleep on", "nap", "tidur", "mau tidur", "good night", "goodnight", "selamat tidur"):
+        return CommandResult(
+            kind="toggle_sleep",
+            reply="Good night! Sleep Mode is ON—I'll assume you're asleep and stay completely quiet while your laptop stays on.",
+            emotion="wink",
+            voice="sleep_on",
+            particle="zzz",
+            badge="ASLEEP",
+            payload={"state": True},
+        )
+    if low in ("wake", "wake up", "sleep off", "bangun", "aku bangun", "i'm awake", "im awake"):
+        return CommandResult(
+            kind="toggle_sleep",
+            reply="Welcome back! Sleep Mode is OFF—hope you got some great rest!",
+            emotion="wink",
+            voice="ohayou" if 4 <= int(ctx.get("hour", 12)) < 12 else "choushi",
+            particle="sparkle",
+            badge="AWAKE",
+            payload={"state": False},
+        )
     if low in ("hide", "hide morgana", "tray"):
         return CommandResult(kind="toggle_visibility", reply="Hiding to the system tray—summon me anytime!", badge="IN TRAY", payload={"visible": False})
     if low in ("show", "show morgana", "summon"):

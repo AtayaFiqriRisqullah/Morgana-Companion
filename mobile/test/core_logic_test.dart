@@ -5,7 +5,10 @@ import 'dart:typed_data';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
+import 'package:morgana_companion/core/app_state.dart';
+import 'package:morgana_companion/core/audio_service.dart';
 import 'package:morgana_companion/core/command_engine.dart';
+import 'package:morgana_companion/core/emotions.dart';
 import 'package:morgana_companion/core/gemini_ai.dart';
 import 'package:morgana_companion/core/rupiah.dart';
 import 'package:morgana_companion/core/sheets_sync.dart';
@@ -456,6 +459,91 @@ void main() {
       expect(res.emotion, 'smug');
       expect(res.action, 'open_finance');
       expect(res.text, contains('Joker'));
+    });
+  });
+
+  group('Curated Morgana Audio, Reaction Coherence & Sleep Mode', () {
+    test('all 44 kVoiceAssets exist on disk and kVoicePools resolve validly with anti-repeat', () {
+      expect(kVoiceAssets.length, 44);
+      for (final entry in kVoiceAssets.entries) {
+        final f = File('assets/${entry.value}');
+        expect(f.existsSync(), isTrue, reason: 'Missing audio asset for ${entry.key}: ${f.path}');
+      }
+      final audio = MorganaAudioService();
+      for (final poolEntry in kVoicePools.entries) {
+        final picked1 = audio.resolveVoiceKey(poolEntry.key);
+        final picked2 = audio.resolveVoiceKey(poolEntry.key);
+        expect(kVoiceAssets.containsKey(picked1), isTrue);
+        expect(kVoiceAssets.containsKey(picked2), isTrue);
+        if (poolEntry.value.length > 1) {
+          expect(picked2, isNot(equals(picked1)), reason: 'Pool ${poolEntry.key} repeated consecutive clip');
+        }
+      }
+    });
+
+    test('resolveReaction keeps sprite, text, and audio coherent (never sad on excited/upbeat lines)', () {
+      // Alias normalization
+      expect(normalizeExpression('happy'), 'wink');
+      expect(normalizeExpression('sleepy'), 'neutral');
+
+      // Upbeat text mentioning sleep/rest never turns sad
+      final r1 = resolveReaction('Moved 3 tasks to tomorrow—sleep guilt-free tonight!');
+      expect(r1.emotion, isNot('sad'));
+      expect(r1.emotion, 'wink');
+
+      // Contradictory sad emotion paired with excited voice upgrades to excited
+      final r2 = resolveReaction('Awesome work!', emotion: 'sad', voice: 'oh_excited');
+      expect(r2.emotion, 'excited');
+      expect(r2.voice, 'oh_excited');
+
+      // Multi-line startup greeting ignores scary/sleepy task titles below first line
+      final r3 = resolveReaction(
+        'Good morning, Joker!\n\nYou have 2 pending tasks:\n1. Fix sleep error\n2. Overdue failed build',
+        context: 'startup',
+        hour: 8,
+      );
+      expect(r3.emotion, 'wink');
+      expect(r3.voice, 'ohayou');
+
+      // Not-a-cat tease picks angry + chigau
+      final r4 = resolveReaction("Hey! I am NOT a cat! I'm Morgana!");
+      expect(r4.emotion, 'angry');
+      expect(r4.voice, 'chigau');
+    });
+
+    test('Sleep Mode quick commands and state persistence work end-to-end', () async {
+      for (final phrase in ['sleep', 'sleep on', 'tidur', 'mau tidur', 'good night']) {
+        final c = parseQuickCommand(phrase);
+        expect(c.kind, CommandKind.toggleSleep, reason: phrase);
+        expect(c.boolFlag, isTrue, reason: phrase);
+      }
+      for (final phrase in ['sleep off', 'wake', 'wake up', 'bangun', 'aku bangun']) {
+        final c = parseQuickCommand(phrase);
+        expect(c.kind, CommandKind.toggleSleep, reason: phrase);
+        expect(c.boolFlag, isFalse, reason: phrase);
+      }
+
+      final tmp = Directory.systemTemp.createTempSync('morgana_sleep_test_');
+      try {
+        final app = MorganaAppState();
+        await app.init(storageDirOverride: tmp, enablePlatformHooks: false);
+        app.audio.enabled = false;
+        expect(app.sleepMode, isFalse);
+
+        final resOn = await app.runQuickCommand('mau tidur');
+        expect(resOn.badge, 'SLEEP ON');
+        expect(app.sleepMode, isTrue);
+        expect(app.morganaEmotion, 'wink'); // warm goodnight smile, never sad
+
+        final resOff = await app.runQuickCommand('bangun');
+        expect(resOff.badge, 'AWAKE');
+        expect(app.sleepMode, isFalse);
+        expect(app.morganaEmotion, 'wink');
+
+        app.dispose();
+      } finally {
+        if (tmp.existsSync()) tmp.deleteSync(recursive: true);
+      }
     });
   });
 }

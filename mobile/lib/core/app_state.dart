@@ -91,10 +91,15 @@ class MorganaAppState extends ChangeNotifier {
   bool overlayPermission = false;
   bool overlayRunning = false;
 
+  // Alerts deferred silently while user is asleep (Sleep Mode)
+  final List<String> _deferredAlerts = [];
+
   Timer? _clockTimer;
   Timer? _sheetPollTimer;
   Timer? _talkTimer;
   bool _disposed = false;
+
+  bool get sleepMode => ready && settings['sleep_mode'] == true;
 
   MorganaAppState({
     MorganaAudioService? audioService,
@@ -132,8 +137,18 @@ class MorganaAppState extends ChangeNotifier {
     focusLeftSec = ((settings['focus_min'] as num?)?.toInt() ?? 25) * 60;
     focusTotalSec = focusLeftSec;
 
-    morganaSpeech = greetingForHour(DateTime.now().hour, (settings['ai_call_user'] ?? 'Joker').toString());
-    morganaEmotion = emotionForText(morganaSpeech, fallback: 'wink');
+    if (settings['sleep_mode'] == true) {
+      morganaSpeech = "Sleep Mode is on—I'll assume you're asleep and keep everything quiet. Tap AWAKE when you're back!";
+      morganaEmotion = 'neutral';
+    } else {
+      morganaSpeech = greetingForHour(DateTime.now().hour, (settings['ai_call_user'] ?? 'Joker').toString());
+      morganaEmotion = resolveReaction(
+        morganaSpeech,
+        fallback: 'wink',
+        context: 'startup',
+        hour: DateTime.now().hour,
+      ).emotion;
+    }
     ready = true;
     notifyListeners();
 
@@ -182,23 +197,93 @@ class MorganaAppState extends ChangeNotifier {
     _safeNotify();
   }
 
-  void morganaSay(String line, {String? emotion, String? voice, bool playVoice = true}) {
+  void morganaSay(
+    String line, {
+    String? emotion,
+    String? voice,
+    String context = '',
+    bool playVoice = true,
+  }) {
     morganaSpeech = line;
-    final emo = emotion ?? emotionForText(line);
-    morganaEmotion = kMorganaExpressions.containsKey(emo) ? emo : 'neutral';
+    final resolved = resolveReaction(
+      line,
+      emotion: emotion,
+      voice: voice,
+      context: context,
+      hour: DateTime.now().hour,
+    );
+    morganaEmotion = resolved.emotion;
     morganaTalking = true;
     _talkTimer?.cancel();
     _talkTimer = Timer(const Duration(milliseconds: 1650), () {
       morganaTalking = false;
+      if (sleepMode) {
+        morganaEmotion = 'neutral';
+      }
       _safeNotify();
     });
-    if (playVoice && settings['manual_dnd'] != true) {
-      audio.playVoice(voice ?? voiceForDialogue(line, emotion: morganaEmotion));
+    final allowSleepVoice = context == 'sleep_on' || context == 'wake_up';
+    if (playVoice && settings['manual_dnd'] != true && (!sleepMode || allowSleepVoice)) {
+      audio.playVoice(resolved.voice);
+    }
+    _safeNotify();
+  }
+
+  Future<void> setSleepMode(bool enable, {bool announce = true}) async {
+    final want = enable;
+    if (sleepMode == want) return;
+    await settings.updateAll({'sleep_mode': want});
+    if (want) {
+      if (announce) {
+        morganaSay(
+          "Sleep Mode is on—I'll assume you're already asleep and keep alerts quiet. Good night!",
+          emotion: 'wink',
+          voice: 'sleep_on',
+          context: 'sleep_on',
+        );
+      } else {
+        morganaTalking = false;
+        morganaEmotion = 'neutral';
+        morganaSpeech = "Sleep Mode is on—I'll assume you're asleep and keep everything quiet. Tap AWAKE when you're back!";
+      }
+      notify('Sleep Mode ON (Quiet while you sleep)', tone: P5ToastTone.gold);
+    } else {
+      final hour = DateTime.now().hour;
+      final greet = (hour >= 4 && hour < 12) ? 'Good morning!' : 'Welcome back!';
+      final vkey = (hour >= 4 && hour < 12) ? 'ohayou' : 'choushi';
+      if (_deferredAlerts.isNotEmpty) {
+        final queued = List<String>.from(_deferredAlerts);
+        _deferredAlerts.clear();
+        morganaSay(
+          '$greet While you were asleep: ${queued.take(3).join(' · ')}',
+          emotion: 'wink',
+          voice: vkey,
+          context: 'wake_up',
+        );
+      } else if (announce) {
+        morganaSay(
+          "$greet Sleep Mode is off—I'm wide awake and ready whenever you are!",
+          emotion: 'wink',
+          voice: vkey,
+          context: 'wake_up',
+        );
+      } else {
+        morganaEmotion = 'wink';
+      }
+      notify("Sleep Mode OFF — I'm awake!", tone: P5ToastTone.ok);
     }
     _safeNotify();
   }
 
   void tapMorgana() {
+    if (sleepMode) {
+      morganaSay(
+        "Shh... Sleep Mode is on (assuming you're asleep). Tap AWAKE or type 'bangun' whenever you're up!",
+        emotion: 'wink',
+        playVoice: false,
+      );
+      return;
+    }
     final line = kMorganaTapQuips[_quipIdx % kMorganaTapQuips.length];
     _quipIdx++;
     morganaSay(line);
@@ -414,7 +499,9 @@ class MorganaAppState extends ChangeNotifier {
         msg = "Completed! +${task['priority'] == 'high' ? 3 : 2} $sShort";
         if (newLv > oldLv) {
           audio.playSfx('rank_up');
-          morganaSay('Rank up! ${kSocialStats[sk]!.label} reached Lv $newLv!', emotion: 'excited', voice: 'oh_excited');
+          morganaSay('Rank up! ${kSocialStats[sk]!.label} reached Lv $newLv!', emotion: 'excited', context: 'rank_up');
+        } else {
+          morganaSay("Checked off '${task['title']}'!", emotion: 'excited', context: 'task_done');
         }
       }
       notify(msg, tone: P5ToastTone.ok);
@@ -453,25 +540,33 @@ class MorganaAppState extends ChangeNotifier {
           focusPhase = 'rest';
           focusTotalSec = ((settings['rest_min'] as num?)?.toInt() ?? 5) * 60;
           focusLeftSec = focusTotalSec;
-          morganaSay("Focus complete! Take a ${focusTotalSec ~/ 60}-minute breather!", emotion: 'excited', voice: 'oh_excited');
-          notify('Focus session complete! Time for a break.', tone: P5ToastTone.ok, ms: 3200);
-          unawaited(NativeBridge.showNotification(
-            title: 'Focus Complete!',
-            body: 'Great work! Take a ${focusTotalSec ~/ 60}-minute break and stretch.',
-            tab: 'timer',
-          ));
+          if (sleepMode) {
+            _deferredAlerts.add('Focus session complete!');
+          } else {
+            morganaSay("Focus complete! Take a ${focusTotalSec ~/ 60}-minute breather!", emotion: 'excited', voice: 'gokurou');
+            notify('Focus session complete! Time for a break.', tone: P5ToastTone.ok, ms: 3200);
+            unawaited(NativeBridge.showNotification(
+              title: 'Focus Complete!',
+              body: 'Great work! Take a ${focusTotalSec ~/ 60}-minute break and stretch.',
+              tab: 'timer',
+            ));
+          }
         } else {
           focusRunning = false;
           focusPhase = 'focus';
           focusTotalSec = ((settings['focus_min'] as num?)?.toInt() ?? 25) * 60;
           focusLeftSec = focusTotalSec;
-          morganaSay("Break's over! Ready for another Focus sprint?", emotion: 'smug', voice: 'hmm');
-          notify('Break finished — ready for next Focus!', tone: P5ToastTone.gold, ms: 3000);
-          unawaited(NativeBridge.showNotification(
-            title: 'Break Over!',
-            body: "Morgana says: Ready for another Focus sprint?",
-            tab: 'timer',
-          ));
+          if (sleepMode) {
+            _deferredAlerts.add('Break finished!');
+          } else {
+            morganaSay("Break's over! Ready for another Focus sprint?", emotion: 'excited', voice: 'oh_excited');
+            notify('Break finished — ready for next Focus!', tone: P5ToastTone.gold, ms: 3000);
+            unawaited(NativeBridge.showNotification(
+              title: 'Break Over!',
+              body: "Morgana says: Ready for another Focus sprint?",
+              tab: 'timer',
+            ));
+          }
         }
       }
     }
@@ -485,13 +580,17 @@ class MorganaAppState extends ChangeNotifier {
       changed = true;
       for (final tm in finished) {
         manualTimers.remove(tm);
-        morganaSay("Time's up for '${tm.label}'!", emotion: 'shout', voice: 'hoi');
-        notify("Time's up: ${tm.label}!", tone: P5ToastTone.gold, ms: 3500);
-        unawaited(NativeBridge.showNotification(
-          title: "Time's Up!",
-          body: "Timer finished: ${tm.label}",
-          tab: 'timer',
-        ));
+        if (sleepMode) {
+          _deferredAlerts.add("Timer '${tm.label}' finished!");
+        } else {
+          morganaSay("Time's up for '${tm.label}'!", emotion: 'shout', context: 'timer_up');
+          notify("Time's up: ${tm.label}!", tone: P5ToastTone.gold, ms: 3500);
+          unawaited(NativeBridge.showNotification(
+            title: "Time's Up!",
+            body: "Timer finished: ${tm.label}",
+            tab: 'timer',
+          ));
+        }
       }
     }
 
@@ -509,7 +608,7 @@ class MorganaAppState extends ChangeNotifier {
     focusLeftSec = focusTotalSec;
     _ensureClockRunning();
     audio.playSfx('select');
-    morganaSay("Locked in for ${fm}m! I'll watch the clock!", emotion: 'smug', voice: 'hmm');
+    morganaSay("Locked in for ${fm}m! I'll watch the clock!", emotion: 'smug', context: 'focus_start');
     notify('Focus started: ${fm}m focus / ${rm}m break!', tone: P5ToastTone.ok);
     _safeNotify();
   }
@@ -567,7 +666,7 @@ class MorganaAppState extends ChangeNotifier {
       case CommandKind.addTask:
         final t = await tasks.add(cmd.text);
         notify("Added task: ${cmd.text}", tone: P5ToastTone.ok);
-        morganaSay("Got it! Added '${cmd.text}' to your Tasks!", emotion: 'smug');
+        morganaSay("Got it! Added '${cmd.text}' to your Tasks!", emotion: 'smug', voice: 'kettei');
         _safeNotify();
         return (
           reply: "Added '${t?['title'] ?? cmd.text}' to Tasks! I'll keep an eye on it.",
@@ -579,7 +678,7 @@ class MorganaAppState extends ChangeNotifier {
       case CommandKind.addNote:
         await notes.add(cmd.text.length > 44 ? cmd.text.substring(0, 44) : cmd.text, cmd.text);
         notify("Saved note: ${cmd.text}", tone: P5ToastTone.ok);
-        morganaSay("Jotted that down in Notes!", emotion: 'wink');
+        morganaSay("Jotted that down in Notes!", emotion: 'wink', context: 'note_save');
         _safeNotify();
         return (
           reply: "Saved quick note '${cmd.text}' in your Notebook!",
@@ -592,7 +691,7 @@ class MorganaAppState extends ChangeNotifier {
         final st = DateTime.now().add(const Duration(hours: 1));
         await events.add(cmd.text, DateTime(st.year, st.month, st.day, st.hour, 0));
         notify("Added event: ${cmd.text}", tone: P5ToastTone.ok);
-        morganaSay("Scheduled '${cmd.text}' on your 7-day timeline!", emotion: 'wink');
+        morganaSay("Scheduled '${cmd.text}' on your 7-day timeline!", emotion: 'wink', voice: 'kettei');
         _safeNotify();
         return (
           reply: "Scheduled '${cmd.text}' starting at ${st.hour.toString().padLeft(2, '0')}:00!",
@@ -612,6 +711,7 @@ class MorganaAppState extends ChangeNotifier {
         );
       case CommandKind.startBreak:
         addManualTimer(cmd.minutes * 60, '${cmd.minutes}m Break');
+        morganaSay("${cmd.minutes}-minute break started! Stretch and hydrate!", emotion: 'wink', voice: 'gokurou');
         return (
           reply: "${cmd.minutes}-minute break started! Stretch your shoulders and grab some water.",
           badge: 'BREAK ${cmd.minutes}M',
@@ -646,6 +746,18 @@ class MorganaAppState extends ChangeNotifier {
           actionLabel: '',
           actionTab: '',
           accentRed: nxt,
+        );
+      case CommandKind.toggleSleep:
+        final nxt = cmd.boolFlag ?? !sleepMode;
+        await setSleepMode(nxt, announce: true);
+        return (
+          reply: nxt
+              ? "Sleep Mode is on—I'll assume you're asleep and keep everything quiet. Good night!"
+              : "Welcome back! Sleep Mode is off—I'm wide awake!",
+          badge: nxt ? 'SLEEP ON' : 'AWAKE',
+          actionLabel: '',
+          actionTab: '',
+          accentRed: false,
         );
       case CommandKind.checkStatus:
         final pend = tasks.pending().length;
@@ -716,10 +828,16 @@ class MorganaAppState extends ChangeNotifier {
           );
         }
         final low = cmd.text.toLowerCase();
-        final reply = low.contains('cat') || low.contains('kucing')
+        final isCat = low.contains('cat') || low.contains('kucing');
+        final reply = isCat
             ? "Hey! For the last time, I am NOT a cat! I'm Morgana—and I'm here to keep you sharp!"
-            : "Try commands like 'task finish report', 'note great idea #work', 'saldo', 'focus 25', or enable Gemini AI in Settings to chat freely!";
-        morganaSay(reply, emotion: low.contains('cat') || low.contains('kucing') ? 'angry' : 'wink');
+            : "Try commands like 'task finish report', 'note great idea #work', 'saldo', 'sleep', 'bangun', or enable Gemini AI in Settings!";
+        morganaSay(
+          reply,
+          emotion: isCat ? 'angry' : 'wink',
+          voice: isCat ? 'chigau' : null,
+          context: isCat ? 'cat_tease' : '',
+        );
         return (
           reply: reply,
           badge: 'MORGANA',

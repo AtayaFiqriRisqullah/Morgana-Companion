@@ -54,7 +54,16 @@ class _MorganaHomeScreenState extends State<MorganaHomeScreen> {
           onAvatarTap: app.tapMorgana,
           actions: [
             P5Button(
-              label: app.overlayRunning ? 'BUBBLE ON' : 'BUBBLE',
+              label: app.sleepMode ? 'AWAKE' : 'SLEEP',
+              icon: app.sleepMode ? Icons.wb_sunny_outlined : Icons.bedtime_outlined,
+              variant: app.sleepMode ? P5BtnVariant.gold : P5BtnVariant.soft,
+              height: 30,
+              fontSize: 10.5,
+              onTap: () => app.setSleepMode(!app.sleepMode),
+            ),
+            const SizedBox(width: 6),
+            P5Button(
+              label: 'BUBBLE',
               icon: Icons.bubble_chart,
               variant: app.overlayRunning ? P5BtnVariant.mint : P5BtnVariant.soft,
               height: 30,
@@ -82,6 +91,7 @@ class _MorganaHomeScreenState extends State<MorganaHomeScreen> {
                 MorganaStageWidget(
                   emotion: app.morganaEmotion,
                   talking: app.morganaTalking,
+                  asleep: app.sleepMode,
                   menuOpen: _menuOpen,
                   enabledTabs: app.settings.enabledTabs,
                   onTapMorgana: app.tapMorgana,
@@ -104,8 +114,8 @@ class _MorganaHomeScreenState extends State<MorganaHomeScreen> {
                     decoration: BoxDecoration(
                       color: const Color(0xFF0E0E15),
                       borderRadius: BorderRadius.circular(10),
-                      border: Border.all(color: P5Colors.white, width: 1.6),
-                      boxShadow: const [BoxShadow(color: P5Colors.red, offset: Offset(4, 4))],
+                      border: Border.all(color: app.sleepMode ? P5Colors.gold : P5Colors.white, width: 1.6),
+                      boxShadow: [BoxShadow(color: app.sleepMode ? P5Colors.gold : P5Colors.red, offset: const Offset(4, 4))],
                     ),
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
@@ -128,10 +138,13 @@ class _MorganaHomeScreenState extends State<MorganaHomeScreen> {
                                 borderRadius: BorderRadius.circular(4),
                                 border: Border.all(color: P5Colors.goldBorder),
                               ),
-                              child: Text(app.morganaEmotion.toUpperCase(), style: P5Text.display(10, color: P5Colors.gold)),
+                              child: Text(
+                                app.sleepMode && !app.morganaTalking ? 'SLEEP · ASLEEP' : app.morganaEmotion.toUpperCase(),
+                                style: P5Text.display(10, color: P5Colors.gold),
+                              ),
                             ),
                             const Spacer(),
-                            Text('TAP TO CHAT', style: P5Text.display(10, color: P5Colors.dim)),
+                            Text(app.sleepMode ? 'USER ASLEEP' : 'TAP TO CHAT', style: P5Text.display(10, color: P5Colors.dim)),
                           ],
                         ),
                         const SizedBox(height: 7),
@@ -153,7 +166,7 @@ class _MorganaHomeScreenState extends State<MorganaHomeScreen> {
                         controller: _quickAskCtrl,
                         style: P5Text.body(14, color: P5Colors.white),
                         decoration: const InputDecoration(
-                          hintText: 'Quick command: saldo · task ... · focus 25 · ask Morgana',
+                          hintText: 'Quick command: saldo · task ... · sleep · bangun',
                           prefixIcon: Icon(Icons.bolt, color: P5Colors.gold, size: 18),
                         ),
                         onSubmitted: (_) => _submitQuickAsk(),

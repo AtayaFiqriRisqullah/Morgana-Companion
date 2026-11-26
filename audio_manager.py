@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import os
+import random
 import sys
 import time
 from pathlib import Path
@@ -45,6 +46,7 @@ STATS_SOUNDS: dict[str, str] = {
 }
 
 VOICE_SOUNDS: dict[str, str] = {
+    # Original 8 Japanese Morgana clips
     "dousuru": "dousuru morgana.mp3",
     "hmm": "hmm approve morgana.mp3",
     "hoi": "hoi morgana .mp3",
@@ -53,6 +55,66 @@ VOICE_SOUNDS: dict[str, str] = {
     "oh_excited": "oh excited morgana.mp3",
     "uwooh": "uwooh morgana.mp3",
     "yareyare": "yareyare morgana .mp3",
+    # Curated 36 Persona 5 Royal Japanese Morgana reaction clips
+    "ohayou": "morgana_ohayou.wav",           # "Ohayou~" (Good morning!)
+    "choushi": "morgana_choushi.wav",         # "Choushi wa dou da?" (How's it going?)
+    "taihen": "morgana_taihen.wav",           # "Taihen sou da naa" (Looks rough/busy)
+    "oi": "morgana_oi.wav",                   # "Oi!" (Stern hey!)
+    "nyaa": "morgana_nyaa.wav",               # "Nyaa~!" (Playful meow)
+    "maana": "morgana_maana.wav",             # "Ma, maa na!" (Smug confidence)
+    "sigh": "morgana_sigh.wav",               # "Haaa..." (Tired sigh)
+    "oicho": "morgana_oicho.wav",             # "Oi cho—!" (Startled/panicked)
+    "gokurou": "morgana_gokurou.wav",         # "N? Gokurou!" (Good work!)
+    "chigau": "morgana_chigau.wav",           # "Chigautsuu no!" (Not a cat / wrong!)
+    "maji": "morgana_maji.wav",               # "Maji ka yo?!" (Are you serious?!)
+    "sleepy_nyaa": "morgana_sleepy_nyaa.wav", # "Nyaa~..." (Cozy sleepy purr/meow)
+    "iizo": "morgana_iizo.wav",               # "Ii zo!" (Nice / Good going!)
+    "wahaha": "morgana_wahaha.wav",           # "Wa-ha-ha!" (Joyful laugh)
+    "ikuzo": "morgana_ikuzo.wav",             # "Ikuzo!" (Let's go!)
+    "shigoto": "morgana_shigoto.wav",         # "Shigoto no jikan da ze!" (Work time!)
+    "nyahaha": "morgana_nyahaha.wav",         # "Nyahaha! Fufu!" (Cheeky happy giggle)
+    "kensan": "morgana_kensan.wav",           # "Jiko kensan ni hagendoke!" (Self-improvement!)
+    "icchou": "morgana_icchou.wav",           # "Icchou agari!" (All done!)
+    "yarujanee": "morgana_yarujanee.wav",     # "Yaru ja nee ka!" (Awesome / Not bad!)
+    "yawn": "morgana_yawn.wav",               # "Uuuun..." (Sleepy yawn/stretch)
+    "asameshi": "morgana_asameshi.wav",       # "Asameshi mae da ze!" (Piece of cake!)
+    "kaigi_start": "morgana_kaigi_start.wav", # "Dewa, sakusen kaigi wo hajimeyou ka!"
+    "kaigi_end": "morgana_kaigi_end.wav",     # "Yoshi, kaigi oshimai!"
+    "naruhodo": "morgana_naruhodo.wav",       # "Naruhodo!" (I see!)
+    "kangaero": "morgana_kangaero.wav",       # "Oi oi, yoku kangaero!" (Think carefully!)
+    "dekita": "morgana_dekita.wav",           # "Kou! Dekita ze!" (There! All done!)
+    "kaketa": "morgana_kaketa.wav",           # "Umaku kaketa zo!" (Wrote it nicely!)
+    "kettei": "morgana_kettei.wav",           # "Jaa, kettei da na!" (Then it's decided!)
+    "sugoi": "morgana_sugoi.wav",             # "Sugoi naa!" (Amazing!)
+    "fumu": "morgana_fumu.wav",               # "Fumu fumu." (Hmm hmm)
+    "unun": "morgana_unun.wav",               # "Un, un!" (Warm uh-huh!)
+    "sateto": "morgana_sateto.wav",           # "Sate to..." (Now then...)
+    "yoshi": "morgana_yoshi.wav",             # "Yoshi!" (Crisp alright!)
+    "acchaa": "morgana_acchaa.wav",           # "Acchaa..." (Oops / Oh no...)
+    "anosaa": "morgana_anosaa.wav",           # "Ano saa..." (Hey, um...)
+}
+
+# Semantic anti-repeat rotation pools so repeated generic voice keys sound lively and varied
+# while ALWAYS preserving the exact mood/valence of the voice key.
+VOICE_POOLS: dict[str, tuple[str, ...]] = {
+    "oh_excited": ("oh_excited", "sugoi", "yarujanee", "wahaha", "yoshi"),
+    "hmm": ("hmm", "unun", "iizo", "maana", "fumu"),
+    "hoi": ("hoi", "oi", "kangaero"),
+    "naa": ("naa", "choushi", "nyaa", "sateto"),
+    "dousuru": ("dousuru", "sateto", "fumu"),
+    "oh_asking": ("oh_asking", "naruhodo", "anosaa"),
+    "uwooh": ("uwooh", "oicho", "maji"),
+    "yareyare": ("yareyare", "sigh"),
+    # High-level contextual pools
+    "sleep_on": ("sleepy_nyaa", "yawn"),
+    "task_done": ("icchou", "dekita", "iizo", "yoshi", "gokurou"),
+    "focus_start": ("ikuzo", "shigoto", "sateto"),
+    "stat_log": ("iizo", "kensan", "yoshi", "maana"),
+    "rank_up": ("sugoi", "yarujanee", "wahaha", "oh_excited"),
+    "wink_happy": ("nyahaha", "unun", "nyaa", "hmm"),
+    "smug_win": ("asameshi", "maana", "iizo", "hmm"),
+    "worried_cue": ("taihen", "anosaa", "oh_asking"),
+    "error_cue": ("acchaa", "oh_asking"),
 }
 
 
@@ -283,6 +345,7 @@ class AudioManager(QObject):
         self._stats_pool: list[_WarmPcmChannel] = []
         self._voice_ch: _WarmPcmChannel | None = None
         self._last_ui_t: dict[str, float] = {}
+        self._last_voice_by_pool: dict[str, str] = {}
         self._seq_timers: list[QTimer] = []
         self._init_engine()
 
@@ -503,15 +566,34 @@ class AudioManager(QObject):
         if ch is not None:
             ch.play(pcm, self._sfx_volume, self._UI_VOL_MULT.get(key, 0.88))
 
+    def _resolve_voice_key(self, key: str) -> str | None:
+        pool = VOICE_POOLS.get(key)
+        if pool:
+            valid = [k for k in pool if k in VOICE_SOUNDS]
+            if not valid:
+                return None
+            # Prefer clips already decoded in RAM so voice response stays instant right after startup
+            ready = [k for k in valid if VOICE_SOUNDS[k] in self._pcm]
+            candidates = ready or valid
+            last = self._last_voice_by_pool.get(key)
+            fresh = [k for k in candidates if k != last] if len(candidates) > 1 else candidates
+            chosen = random.choice(fresh or candidates)
+            self._last_voice_by_pool[key] = chosen
+            return chosen
+        return key if key in VOICE_SOUNDS else None
+
     def play_voice(self, key: str) -> None:
         if not (self._enabled and self._ready and self._voice_volume > 0.001):
             return
-        fname = VOICE_SOUNDS.get(key)
-        if fname is None or self._voice_ch is None:
+        resolved = self._resolve_voice_key(key)
+        if resolved is None or self._voice_ch is None:
+            return
+        fname = VOICE_SOUNDS.get(resolved)
+        if fname is None:
             return
         pcm = self._pcm.get(fname)
         if pcm is None:
-            self._pending_by_file[fname] = ("voice", key)
+            self._pending_by_file[fname] = ("voice", resolved)
             return
         # Dedicated single channel: immediately switches voice in RAM without self-overlap
         self._voice_ch.play(pcm, self._voice_volume, 1.0)

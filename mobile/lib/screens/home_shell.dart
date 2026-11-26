@@ -94,8 +94,13 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
                     ),
                     const Spacer(),
                     Text(
-                      app.overlayRunning ? 'BUBBLE LIVE' : 'BUBBLE OFF',
-                      style: P5Text.display(11, color: app.overlayRunning ? P5Colors.mint : P5Colors.muted),
+                      app.sleepMode
+                          ? 'SLEEP MODE · ASLEEP'
+                          : (app.overlayRunning ? 'BUBBLE LIVE' : 'BUBBLE OFF'),
+                      style: P5Text.display(
+                        11,
+                        color: app.sleepMode ? P5Colors.gold : (app.overlayRunning ? P5Colors.mint : P5Colors.muted),
+                      ),
                     ),
                   ],
                 ),
@@ -140,6 +145,18 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
                       },
                     ),
                   ],
+                ),
+                const SizedBox(height: 10),
+                P5Button(
+                  label: app.sleepMode ? "I'M AWAKE! (EXIT SLEEP MODE)" : "SLEEP MODE (I'M GOING TO SLEEP)",
+                  icon: app.sleepMode ? Icons.wb_sunny_outlined : Icons.bedtime_outlined,
+                  variant: app.sleepMode ? P5BtnVariant.mint : P5BtnVariant.gold,
+                  height: 42,
+                  fontSize: 12,
+                  onTap: () {
+                    Navigator.pop(ctx);
+                    app.setSleepMode(!app.sleepMode);
+                  },
                 ),
               ],
             ),

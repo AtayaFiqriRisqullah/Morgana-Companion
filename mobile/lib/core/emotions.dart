@@ -48,6 +48,7 @@ const Map<String, ExpressionMeta> kMorganaExpressions = {
 };
 
 const Map<String, String> kVoiceAssets = {
+  // Original 8 Japanese Morgana clips
   'dousuru': 'audio/dousuru morgana.mp3',
   'hmm': 'audio/hmm approve morgana.mp3',
   'hoi': 'audio/hoi morgana .mp3',
@@ -56,6 +57,65 @@ const Map<String, String> kVoiceAssets = {
   'oh_excited': 'audio/oh excited morgana.mp3',
   'uwooh': 'audio/uwooh morgana.mp3',
   'yareyare': 'audio/yareyare morgana .mp3',
+  // Curated 36 Persona 5 Royal Japanese Morgana reaction clips
+  'ohayou': 'audio/morgana_ohayou.wav',
+  'choushi': 'audio/morgana_choushi.wav',
+  'taihen': 'audio/morgana_taihen.wav',
+  'oi': 'audio/morgana_oi.wav',
+  'nyaa': 'audio/morgana_nyaa.wav',
+  'maana': 'audio/morgana_maana.wav',
+  'sigh': 'audio/morgana_sigh.wav',
+  'oicho': 'audio/morgana_oicho.wav',
+  'gokurou': 'audio/morgana_gokurou.wav',
+  'chigau': 'audio/morgana_chigau.wav',
+  'maji': 'audio/morgana_maji.wav',
+  'sleepy_nyaa': 'audio/morgana_sleepy_nyaa.wav',
+  'iizo': 'audio/morgana_iizo.wav',
+  'wahaha': 'audio/morgana_wahaha.wav',
+  'ikuzo': 'audio/morgana_ikuzo.wav',
+  'shigoto': 'audio/morgana_shigoto.wav',
+  'nyahaha': 'audio/morgana_nyahaha.wav',
+  'kensan': 'audio/morgana_kensan.wav',
+  'icchou': 'audio/morgana_icchou.wav',
+  'yarujanee': 'audio/morgana_yarujanee.wav',
+  'yawn': 'audio/morgana_yawn.wav',
+  'asameshi': 'audio/morgana_asameshi.wav',
+  'kaigi_start': 'audio/morgana_kaigi_start.wav',
+  'kaigi_end': 'audio/morgana_kaigi_end.wav',
+  'naruhodo': 'audio/morgana_naruhodo.wav',
+  'kangaero': 'audio/morgana_kangaero.wav',
+  'dekita': 'audio/morgana_dekita.wav',
+  'kaketa': 'audio/morgana_kaketa.wav',
+  'kettei': 'audio/morgana_kettei.wav',
+  'sugoi': 'audio/morgana_sugoi.wav',
+  'fumu': 'audio/morgana_fumu.wav',
+  'unun': 'audio/morgana_unun.wav',
+  'sateto': 'audio/morgana_sateto.wav',
+  'yoshi': 'audio/morgana_yoshi.wav',
+  'acchaa': 'audio/morgana_acchaa.wav',
+  'anosaa': 'audio/morgana_anosaa.wav',
+};
+
+/// Semantic anti-repeat rotation pools matching desktop `audio_manager.VOICE_POOLS`.
+const Map<String, List<String>> kVoicePools = {
+  'oh_excited': ['oh_excited', 'sugoi', 'yarujanee', 'wahaha', 'yoshi'],
+  'hmm': ['hmm', 'unun', 'iizo', 'maana', 'fumu'],
+  'hoi': ['hoi', 'oi', 'kangaero'],
+  'naa': ['naa', 'choushi', 'nyaa', 'sateto'],
+  'dousuru': ['dousuru', 'sateto', 'fumu'],
+  'oh_asking': ['oh_asking', 'naruhodo', 'anosaa'],
+  'uwooh': ['uwooh', 'oicho', 'maji'],
+  'yareyare': ['yareyare', 'sigh'],
+  // High-level contextual pools
+  'sleep_on': ['sleepy_nyaa', 'yawn'],
+  'task_done': ['icchou', 'dekita', 'iizo', 'yoshi', 'gokurou'],
+  'focus_start': ['ikuzo', 'shigoto', 'sateto'],
+  'stat_log': ['iizo', 'kensan', 'yoshi', 'maana'],
+  'rank_up': ['sugoi', 'yarujanee', 'wahaha', 'oh_excited'],
+  'wink_happy': ['nyahaha', 'unun', 'nyaa', 'hmm'],
+  'smug_win': ['asameshi', 'maana', 'iizo', 'hmm'],
+  'worried_cue': ['taihen', 'anosaa', 'oh_asking'],
+  'error_cue': ['acchaa', 'oh_asking'],
 };
 
 const Map<String, String> kUiSfxAssets = {
@@ -68,26 +128,97 @@ const Map<String, String> kUiSfxAssets = {
   'rank_up': 'audio/social stats level up animation.wav',
 };
 
+const Map<String, String> _exprAliases = {
+  'happy': 'wink',
+  'smile': 'wink',
+  'cheerful': 'wink',
+  'joy': 'excited',
+  'proud': 'smug',
+  'confident': 'smug',
+  'determined': 'serious',
+  'focused': 'serious',
+  'concerned': 'worried',
+  'anxious': 'worried',
+  'nervous': 'uneasy',
+  'confused': 'uneasy',
+  'awkward': 'uneasy',
+  'shocked': 'shout',
+  'surprised': 'shout',
+  'annoyed': 'angry',
+  'mad': 'angry',
+  'tired': 'sad',
+  'exhausted': 'sad',
+  'sleepy': 'neutral',
+};
+
+const Set<String> kPositiveExcitedVoices = {
+  'oh_excited', 'sugoi', 'yarujanee', 'wahaha', 'yoshi', 'icchou', 'dekita',
+  'rank_up', 'task_done',
+};
+const Set<String> kPositiveUpbeatVoices = {
+  'hmm', 'iizo', 'maana', 'asameshi', 'gokurou', 'ikuzo', 'shigoto',
+  'kensan', 'kaketa', 'kettei', 'kaigi_start', 'kaigi_end', 'ohayou',
+  'choushi', 'nyahaha', 'nyaa', 'unun', 'sateto', 'focus_start', 'stat_log',
+  'wink_happy', 'smug_win',
+};
+const Set<String> kUrgentAngryVoices = {'hoi', 'oi', 'kangaero', 'chigau'};
+const Set<String> kShockVoices = {'uwooh', 'oicho', 'maji'};
+const Set<String> kSadTiredVoices = {'yareyare', 'sigh', 'yawn'};
+const Set<String> kSleepCozyVoices = {'sleepy_nyaa', 'sleep_on'};
+const Set<String> kUneasyWorriedVoices = {'acchaa', 'taihen', 'anosaa', 'error_cue', 'worried_cue'};
+
+// Order matters: positive/celebratory cues win over worried/sad so upbeat lines
+// mentioning rest/sleep/tasks never display the sad/sweating sprite.
 const List<MapEntry<String, List<String>>> _emotionRules = [
   MapEntry('shout', ['hurry', 'due now:', 'starting now:', 'go to bed!', 'lights out', "time's up", 'uwooh']),
-  MapEntry('angry', ["shouldn't be staying up", 'not letting this slide', 'past bedtime', 'over budget']),
-  MapEntry('uneasy', ['are you sure', "cats can't", "couldn't", 'expired', 'failed', 'error']),
-  MapEntry('excited', ['ooh', 'whoa', 'paying off', 'awesome', 'great effort', 'rank up', 'level up', 'completed']),
-  MapEntry('smug', ['focus session', 'lock in', 'momentum', 'timer set', 'logged +', 'recorded']),
-  MapEntry('wink', ['good morning', 'take it easy', 'enjoy your rest', 'plenty of time', 'synced']),
-  MapEntry('worried', ["don't forget", 'deadline', 'upcoming', 'next up:', 'pending task']),
-  MapEntry('sad', ['tired', 'sleep', 'rest up', 'bedtime', 'yawn']),
+  MapEntry('angry', ["shouldn't be staying up", 'not letting this slide', 'past bedtime', 'over budget', 'not a cat', 'bukan kucing']),
+  MapEntry('excited', [
+    'rank up', 'leveled up', 'level up', 'ooh', 'whoa', 'paying off', 'awesome', 'amazing',
+    'great effort', 'great work', 'great job', 'completed', 'crushed it', 'on fire',
+    'looking cool', 'mantap', 'keren', 'hebat', 'semangat', 'berhasil', 'sukses',
+  ]),
+  MapEntry('uneasy', ['are you sure', "cats can't", "couldn't", 'expired', 'failed', 'error', 'invalid']),
+  MapEntry('smug', [
+    'focus session', 'focus sprint', 'lock in', 'locked in', 'momentum', 'steady progress',
+    'timer set', 'logged +', 'recorded', 'piece of cake', 'sharp', 'streak', 'scheduled', 'saved',
+  ]),
+  MapEntry('wink', [
+    'good morning', 'welcome back', 'take it easy', 'enjoy your rest', 'plenty of time', 'synced',
+    "i'm awake", 'wide awake', 'sleep mode is off', 'good night', 'sweet dreams', 'guilt-free',
+    'breather', 'recharged', 'well-rested', 'jotted that down',
+  ]),
+  MapEntry('worried', ['overdue', "don't forget", 'deadline', 'upcoming', 'running low', 'careful']),
+  MapEntry('sad', [
+    "aren't you tired", 'must be tired', 'worn out', 'good grief', 'yawn...',
+    'rough day', 'feeling down', 'capek', 'lelah', 'ngantuk', 'sedih',
+  ]),
   MapEntry('serious', ["shouldn't you", 'study', 'money', 'budget', 'plan']),
 ];
 
 const List<MapEntry<String, List<String>>> _voiceRules = [
-  MapEntry('hoi', ["time's up", 'due now:', 'starting now:', 'hurry', 'go to bed!', 'past bedtime', 'over budget']),
-  MapEntry('uwooh', ['uwooh', 'whoa!', 'almost morning']),
-  MapEntry('oh_excited', ['rank up', 'level up', 'ooh', 'whoa', 'awesome', 'great effort', 'completed']),
-  MapEntry('yareyare', ['tired', 'sleep', 'rest up', 'bedtime', 'good grief']),
+  MapEntry('chigau', ['not a cat', 'bukan kucing', 'i am not a cat']),
+  MapEntry('uwooh', ['uwooh', 'almost morning']),
+  MapEntry('hoi', ["time's up", 'due now:', 'starting now:', 'hurry', 'go to bed!', 'past bedtime']),
+  MapEntry('kangaero', ['over budget']),
+  MapEntry('ohayou', ['good morning', 'selamat pagi', "i'm awake", 'wide awake', 'sleep mode is off']),
+  MapEntry('sleep_on', ['good night', 'sweet dreams', 'sleep mode is on', "assume you're asleep", 'selamat tidur']),
+  MapEntry('rank_up', ['rank up', 'leveled up', 'level up']),
+  MapEntry('oh_excited', [
+    'ooh', 'whoa', 'awesome', 'amazing', 'great effort', 'great work', 'great job',
+    'paying off', 'looking cool', 'mantap', 'keren', 'hebat', 'semangat',
+  ]),
+  MapEntry('kaketa', ['saved quick note', 'jotted that down', 'notebook', 'journal']),
+  MapEntry('kensan', ['social stat', 'confidant', 'daily habit']),
+  MapEntry('focus_start', ['focus sprint', 'focus session', 'locked in', 'lock in']),
+  MapEntry('gokurou', ['breather', 'break started', 'well done', 'earned']),
+  MapEntry('task_done', ['completed', 'checked off', 'task done', 'cleared', 'finished']),
+  MapEntry('kettei', ['timer set', 'scheduled', 'recorded', 'synced', 'added task']),
+  MapEntry('acchaa', ["couldn't", 'expired', 'failed', 'error', 'invalid']),
+  MapEntry('yareyare', ["aren't you tired", 'must be tired', 'worn out', 'good grief', 'yawn', 'bedtime']),
+  MapEntry('taihen', ['overdue', 'running low']),
   MapEntry('dousuru', ['what should', "what's next", "what's the move", 'plan']),
-  MapEntry('oh_asking', ['are you sure', 'checking', 'failed', 'error']),
-  MapEntry('hmm', ['logged +', 'timer set', 'focus session', 'recorded', 'synced', 'good work']),
+  MapEntry('oh_asking', ['are you sure', 'checking']),
+  MapEntry('hmm', ['logged +', 'momentum', 'steady progress', 'take it easy']),
 ];
 
 const Map<String, String> _emotionVoiceFallback = {
@@ -95,34 +226,103 @@ const Map<String, String> _emotionVoiceFallback = {
   'shout': 'uwooh',
   'angry': 'hoi',
   'sad': 'yareyare',
-  'uneasy': 'oh_asking',
-  'worried': 'naa',
+  'uneasy': 'acchaa',
+  'worried': 'taihen',
   'smug': 'hmm',
-  'wink': 'hmm',
+  'wink': 'wink_happy',
   'serious': 'dousuru',
   'neutral': 'naa',
 };
+
+String normalizeExpression(String? emotion, {String fallback = 'neutral'}) {
+  final fb = kMorganaExpressions.containsKey(fallback) ? fallback : 'neutral';
+  if (emotion == null || emotion.trim().isEmpty) return fb;
+  final low = emotion.trim().toLowerCase();
+  if (kMorganaExpressions.containsKey(low)) return low;
+  final mapped = _exprAliases[low];
+  return (mapped != null && kMorganaExpressions.containsKey(mapped)) ? mapped : fb;
+}
 
 String emotionForText(String text, {String fallback = 'neutral'}) {
   final low = text.toLowerCase();
   for (final rule in _emotionRules) {
     if (rule.value.any((k) => low.contains(k))) return rule.key;
   }
-  return kMorganaExpressions.containsKey(fallback) ? fallback : 'neutral';
+  return normalizeExpression(fallback);
 }
 
-String voiceForDialogue(String text, {String emotion = 'neutral', String context = ''}) {
+String voiceForDialogue(String text, {String emotion = 'neutral', String context = '', int? hour}) {
   final low = text.toLowerCase();
-  if (context == 'rank_up') return 'oh_excited';
+  final emo = normalizeExpression(emotion);
+  if (context == 'rank_up') return 'rank_up';
   if (context == 'timer_up') return 'hoi';
-  if (context == 'bedtime') return (emotion == 'shout' || emotion == 'angry') ? 'hoi' : 'yareyare';
-  if (context == 'startup') return 'naa';
-  if (context == 'stat_log') return 'hmm';
+  if (context == 'sleep_on') return 'sleep_on';
+  if (context == 'wake_up') return (hour != null && hour >= 4 && hour < 12) ? 'ohayou' : 'choushi';
+  if (context == 'bedtime') return (emo == 'shout' || emo == 'angry') ? 'hoi' : 'yareyare';
+  if (context == 'startup') return (hour != null && hour >= 4 && hour < 12) ? 'ohayou' : 'choushi';
+  if (context == 'stat_log') return 'stat_log';
+  if (context == 'task_done') return 'task_done';
+  if (context == 'note_save') return 'kaketa';
+  if (context == 'focus_start') return 'focus_start';
+  if (context == 'cat_tease') return 'chigau';
   for (final rule in _voiceRules) {
     if (rule.value.any((k) => low.contains(k))) return rule.key;
   }
-  if (low.contains('?')) return 'oh_asking';
-  return _emotionVoiceFallback[emotion] ?? 'naa';
+  if (low.contains('?') && (emo == 'neutral' || emo == 'worried' || emo == 'serious' || emo == 'uneasy')) {
+    return 'oh_asking';
+  }
+  return _emotionVoiceFallback[emo] ?? 'naa';
+}
+
+/// Cross-validates `(emotion, voice)` so Morgana's sprite, sentence, and audio NEVER contradict.
+({String emotion, String voice}) resolveReaction(
+  String text, {
+  String? emotion,
+  String? voice,
+  String fallback = 'neutral',
+  String context = '',
+  int? hour,
+}) {
+  final probeText = (context == 'startup' && text.contains('\n')) ? text.split('\n').first : text;
+  var emo = emotion != null && emotion.trim().isNotEmpty
+      ? normalizeExpression(emotion, fallback: fallback)
+      : emotionForText(probeText, fallback: fallback);
+
+  final forcedVoice = voice != null && voice.trim().isNotEmpty;
+  var vkey = forcedVoice
+      ? voice.trim()
+      : voiceForDialogue(probeText, emotion: emo, context: context, hour: hour);
+
+  // 1) Never show a sad/worried/uneasy face when playing an excited or upbeat voice!
+  if (kPositiveExcitedVoices.contains(vkey)) {
+    if (emo == 'sad' || emo == 'worried' || emo == 'uneasy' || emo == 'neutral') {
+      emo = 'excited';
+    }
+  } else if (kPositiveUpbeatVoices.contains(vkey)) {
+    if (emo == 'sad' || emo == 'worried' || emo == 'uneasy') {
+      emo = const {'ohayou', 'choushi', 'nyahaha', 'nyaa', 'unun', 'wink_happy', 'gokurou'}.contains(vkey)
+          ? 'wink'
+          : 'smug';
+    }
+  } else if (kSleepCozyVoices.contains(vkey)) {
+    if (emo == 'sad') emo = 'wink';
+  } else if (kUrgentAngryVoices.contains(vkey)) {
+    if (emo == 'sad') emo = 'angry';
+  } else if (kShockVoices.contains(vkey)) {
+    if (emo == 'sad') emo = 'shout';
+  }
+
+  // 2) If expression is upbeat/excited and voice was auto-selected, never play a sad/tired clip.
+  if (!forcedVoice) {
+    if (emo == 'excited' && (kSadTiredVoices.contains(vkey) || kUneasyWorriedVoices.contains(vkey))) {
+      vkey = 'oh_excited';
+    } else if ((emo == 'wink' || emo == 'smug') &&
+        (kSadTiredVoices.contains(vkey) || kUneasyWorriedVoices.contains(vkey))) {
+      vkey = emo == 'wink' ? 'wink_happy' : 'smug_win';
+    }
+  }
+
+  return (emotion: emo, voice: vkey);
 }
 
 const List<String> kMorganaTapQuips = [

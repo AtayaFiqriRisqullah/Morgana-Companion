@@ -191,14 +191,19 @@ Context: $contextNote
         final obj = jsonDecode(cleaned.substring(start, end + 1)) as Map<String, dynamic>;
         final reply = (obj['reply'] ?? '').toString().trim();
         if (reply.isNotEmpty) {
-          final em = (obj['emotion'] ?? '').toString().trim().toLowerCase();
-          final emo = kMorganaExpressions.containsKey(em) ? em : emotionForText(reply);
+          final rawEm = (obj['emotion'] ?? '').toString().trim().toLowerCase();
+          var emo = rawEm.isEmpty ? emotionForText(reply) : normalizeExpression(rawEm, fallback: emotionForText(reply));
+          final textEmo = emotionForText(reply);
+          if (emo == 'sad' && (textEmo == 'excited' || textEmo == 'wink' || textEmo == 'smug')) {
+            emo = textEmo;
+          }
+          final resolved = resolveReaction(reply, emotion: emo);
           final act = (obj['action'] ?? '').toString().trim().toLowerCase();
           return AiReply(
             ok: true,
             text: reply,
-            emotion: emo,
-            voice: voiceForDialogue(reply, emotion: emo),
+            emotion: resolved.emotion,
+            voice: resolved.voice,
             action: act,
             badge: 'MORGANA · AI',
           );
@@ -206,12 +211,12 @@ Context: $contextNote
       }
     } catch (_) {}
     final txt = cleaned.isEmpty ? "Looking cool! What's our next move?" : cleaned;
-    final emo = emotionForText(txt);
+    final resolved = resolveReaction(txt);
     return AiReply(
       ok: true,
       text: txt,
-      emotion: emo,
-      voice: voiceForDialogue(txt, emotion: emo),
+      emotion: resolved.emotion,
+      voice: resolved.voice,
       badge: 'MORGANA · AI',
     );
   }

@@ -11,6 +11,7 @@ enum CommandKind {
   checkBalance,
   checkStatus,
   toggleDnd,
+  toggleSleep,
   openTab,
   chat,
 }
@@ -106,6 +107,14 @@ ParsedCommand parseQuickCommand(String raw) {
         text: expM.group(2)?.trim() ?? '',
       );
     }
+  }
+
+  // Sleep Mode ("user is asleep") / Wake Up toggle (EN + ID)
+  if (RegExp(r'^/?(sleep(?:\s+mode)?(?:\s+on)?|tidur|mau\s+tidur|aku\s+tidur|good\s*night|selamat\s+tidur)$').hasMatch(low)) {
+    return const ParsedCommand(kind: CommandKind.toggleSleep, boolFlag: true);
+  }
+  if (RegExp(r'^/?(sleep(?:\s+mode)?\s+off|wake(?:\s+up)?|awake|i.?m\s+awake|bangun|aku\s+bangun)$').hasMatch(low)) {
+    return const ParsedCommand(kind: CommandKind.toggleSleep, boolFlag: false);
   }
 
   // DND toggle
