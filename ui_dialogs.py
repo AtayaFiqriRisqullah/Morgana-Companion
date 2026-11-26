@@ -213,6 +213,15 @@ def _draw_icon(p: QPainter, kind: str, rect: QRectF, color: QColor) -> None:
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(color)
         p.drawRoundedRect(QRectF(cx - r * 0.65, cy - r * 0.65, r * 1.3, r * 1.3), 1.8, 1.8)
+    elif kind == "edit":
+        p.drawPolyline(QPolygonF([
+            QPointF(cx - r * 0.78, cy + r * 0.78),
+            QPointF(cx - r * 0.58, cy + r * 0.16),
+            QPointF(cx + r * 0.42, cy - r * 0.84),
+            QPointF(cx + r * 0.84, cy - r * 0.42),
+            QPointF(cx - r * 0.16, cy + r * 0.58),
+            QPointF(cx - r * 0.78, cy + r * 0.78),
+        ]))
     p.restore()
 
 
@@ -256,6 +265,7 @@ class P5FluidButton(QPushButton):
         self.setFont(p5_font(fpx, italic=False) if display else ui_font(fpx, bold=True))
         self._hover = Spring(0.0, 380.0)
         self._press = Spring(0.0, 640.0)
+        self._flash = 0.0                # 1.0 -> 0.0 Persona 5 click/attention slash flash
         self._ticker = FrameTicker(self._frame, self)
 
     def set_variant(self, variant: str) -> None:
@@ -263,9 +273,26 @@ class P5FluidButton(QPushButton):
         self.update()
 
     def set_active(self, on: bool, active_variant: str = "primary") -> None:
+        was = self._active and self._variant == active_variant
         self._active = on
         self._variant = active_variant if on else self._base_variant
+        if on and not was and self.isVisible():
+            self._flash = 0.75
+            self._ticker.start()
         self.update()
+
+    def pulse(self) -> None:
+        """Trigger a brief Persona 5 diagonal sheen flash to confirm or highlight this action."""
+        self._flash = 1.0
+        self._ticker.start()
+
+    def changeEvent(self, e) -> None:
+        if e.type() == QEvent.Type.EnabledChange:
+            self.setCursor(Qt.CursorShape.PointingHandCursor if self.isEnabled() else Qt.CursorShape.ArrowCursor)
+            if not self.isEnabled():
+                self._hover.target = 0.0
+                self._press.target = 0.0
+        super().changeEvent(e)
 
     def sizeHint(self) -> QSize:
         fm = QFontMetrics(self.font())
@@ -280,8 +307,9 @@ class P5FluidButton(QPushButton):
     def enterEvent(self, e) -> None:
         if self.isEnabled() and self._sfx_hover:
             play_ui("ui_hover")
-        self._hover.target = 1.0
-        self._ticker.start()
+        if self.isEnabled():
+            self._hover.target = 1.0
+            self._ticker.start()
         super().enterEvent(e)
 
     def leaveEvent(self, e) -> None:
@@ -297,6 +325,7 @@ class P5FluidButton(QPushButton):
             elif self._sfx_click:
                 play_ui(self._sfx_click)
             self._press.target = 1.0
+            self._flash = 1.0
             self._ticker.start()
         super().mousePressEvent(e)
 
@@ -307,6 +336,11 @@ class P5FluidButton(QPushButton):
 
     def _frame(self, dt: float) -> bool:
         moving = self._hover.step(dt) | self._press.step(dt)
+        if self._flash > 0.01:
+            self._flash = max(0.0, self._flash - dt * 4.8)
+            moving = True
+        else:
+            self._flash = 0.0
         self.update()
         return moving
 
@@ -317,21 +351,25 @@ class P5FluidButton(QPushButton):
         bg0, bg1, bd0, bd1, fg = self.VARIANTS.get(self._variant, self.VARIANTS["soft"])
         hov = clamp(self._hover.value)
         prs = clamp(self._press.value)
+        fl = clamp(self._flash)
 
         bg = lerp_color(bg0, bg1, hov)
         bg.setAlpha(int(bg0.alpha() + (bg1.alpha() - bg0.alpha()) * hov))
         bd = lerp_color(bd0, bd1, hov)
         bd.setAlpha(int(bd0.alpha() + (bd1.alpha() - bd0.alpha()) * hov))
+        if fl > 0.05 and bg.alpha() > 20:
+            bd = lerp_color(bd, WHITE, fl * 0.85)
+            bd.setAlpha(255)
 
         r = QRectF(self.rect()).adjusted(1.0, 1.0, -1.0, -1.0)
         if prs > 0.01:
-            s = 1.0 - 0.03 * prs
+            s = 1.0 - 0.048 * prs
             c = r.center()
-            p.translate(c)
+            p.translate(c.x(), c.y() + 1.4 * prs)
             p.scale(s, s)
-            p.translate(-c)
+            p.translate(-c.x(), -c.y())
         if not self.isEnabled():
-            p.setOpacity(0.4)
+            p.setOpacity(0.38)
 
         clip = QPainterPath()
         clip.addRoundedRect(r, self._radius, self._radius)
@@ -339,41 +377,55 @@ class P5FluidButton(QPushButton):
         # Sculpted subtle vertical gradient sheen on opaque variants
         if bg.alpha() > 20:
             grad = QLinearGradient(r.topLeft(), r.bottomLeft())
-            grad.setColorAt(0.0, bg.lighter(114 if self._variant == "primary" else 112))
-            grad.setColorAt(1.0, bg.darker(106))
+            grad.setColorAt(0.0, bg.lighter(115 if self._variant == "primary" else 113))
+            grad.setColorAt(1.0, bg.darker(108))
             p.fillPath(clip, grad)
         else:
             p.fillPath(clip, bg)
 
-        # Persona 5 interactive accents (clipped neatly inside button bounds)
-        if bg.alpha() > 20:
+        # Persona 5 interactive accents + tactile click-slash flash (clipped neatly inside bounds)
+        if bg.alpha() > 20 or fl > 0.02:
             p.save()
             p.setClipPath(clip)
             p.setPen(Qt.PenStyle.NoPen)
-            # Crisp 1px top specular bevel rim
-            top_a = 38 if self._variant == "primary" else 18
-            p.setBrush(QColor(255, 255, 255, top_a))
-            p.drawRect(QRectF(r.left(), r.top(), r.width(), 1.2))
-            # Diagonal Persona gloss slash on primary & gold buttons (sweeps on hover)
-            if self._variant in ("primary", "gold"):
-                sx = r.left() + r.width() * (0.14 + 0.56 * hov)
-                sw = max(14.0, r.width() * 0.14)
-                p.setBrush(QColor(255, 255, 255, int(20 + 24 * hov)))
+            if bg.alpha() > 20:
+                top_a = 42 if self._variant == "primary" else 20
+                p.setBrush(QColor(255, 255, 255, top_a))
+                p.drawRect(QRectF(r.left(), r.top(), r.width(), 1.3))
+                # Diagonal Persona gloss slash on colored accent variants (sweeps on hover)
+                if self._variant in ("primary", "gold", "mint", "danger"):
+                    sx = r.left() + r.width() * (0.14 + 0.56 * hov)
+                    sw = max(14.0, r.width() * 0.15)
+                    p.setBrush(QColor(255, 255, 255, int(20 + 26 * hov)))
+                    p.drawPolygon(QPolygonF([
+                        QPointF(sx, r.top()),
+                        QPointF(sx + sw, r.top()),
+                        QPointF(sx + sw - 12.0, r.bottom()),
+                        QPointF(sx - 12.0, r.bottom()),
+                    ]))
+                elif self._variant == "soft" and hov > 0.02:
+                    bar_h = r.height() * (0.35 + 0.65 * hov)
+                    p.setBrush(RED)
+                    p.drawRect(QRectF(r.left(), r.center().y() - bar_h / 2.0, 3.5, bar_h))
+
+            # Crisp Persona 5 diagonal flash burst sweeping across button on every click!
+            if fl > 0.01:
+                prog = 1.0 - fl
+                fx = r.left() - 18.0 + prog * (r.width() + 48.0)
+                fw = max(18.0, r.width() * 0.24)
+                p.setBrush(QColor(255, 255, 255, int(135 * fl)))
                 p.drawPolygon(QPolygonF([
-                    QPointF(sx, r.top()),
-                    QPointF(sx + sw, r.top()),
-                    QPointF(sx + sw - 12.0, r.bottom()),
-                    QPointF(sx - 12.0, r.bottom()),
+                    QPointF(fx, r.top()),
+                    QPointF(fx + fw, r.top()),
+                    QPointF(fx + fw - 14.0, r.bottom()),
+                    QPointF(fx - 14.0, r.bottom()),
                 ]))
-            elif self._variant == "soft" and hov > 0.02:
-                # Crimson left-edge hover accent slash on soft buttons
-                bar_h = r.height() * (0.35 + 0.65 * hov)
-                p.setBrush(RED)
-                p.drawRect(QRectF(r.left(), r.center().y() - bar_h / 2.0, 3.0, bar_h))
+                p.setBrush(QColor(255, 255, 255, int(42 * fl)))
+                p.drawRect(r)
             p.restore()
 
         if bd.alpha() > 4:
-            p.setPen(QPen(bd, 1.4))
+            p.setPen(QPen(bd, 1.5 if (hov > 0.3 or fl > 0.1) else 1.3))
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawRoundedRect(r, self._radius, self._radius)
 
@@ -528,6 +580,316 @@ class P5DateTimeEdit(QDateTimeEdit):
 
 
 # ---------------------------------------------------------------------------
+# P5ToastOverlay & _P5KpiCard: live Persona 5 feedback toast & interactive KPI cards
+# ---------------------------------------------------------------------------
+class P5ToastOverlay(QWidget):
+    """Floating Persona 5 slanted confirmation/warning toast pinned cleanly over P5FluidPanel."""
+
+    TONES = {
+        "ok":   (P5_MINT_FG, BLACK, "✓"),
+        "gold": (GOLD,       BLACK, "★"),
+        "warn": (GOLD,       BLACK, "!"),
+        "err":  (RED,        WHITE, "×"),
+        "info": (RED,        WHITE, "★"),
+    }
+
+    def __init__(self, parent: QWidget, scale: float = 1.0) -> None:
+        super().__init__(parent)
+        self._scale = max(0.75, min(1.5, float(scale)))
+        self._text = ""
+        self._tone = "ok"
+        self._show = Spring(0.0, 380.0, 26.0)
+        self._ticker = FrameTicker(self._frame, self)
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.timeout.connect(self.dismiss)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.hide()
+
+    def show_toast(self, message: str, tone: str = "ok", ms: int = 2400) -> None:
+        msg = (message or "").strip()
+        if not msg:
+            return
+        self._text = msg
+        self._tone = tone if tone in self.TONES else "info"
+        sc = self._scale
+        par = self.parentWidget()
+        max_w = max(220, (par.width() - 56) if par else 420)
+        f = ui_font(_sc(13, sc, 10), bold=True)
+        tw = QFontMetrics(f).horizontalAdvance(msg)
+        w = min(max_w, max(_sc(150, sc, 120), tw + _sc(64, sc, 48)))
+        h = _sc(36, sc, 28)
+        self.setFixedSize(w + 10, h + 10)
+        self._reposition()
+        self._show.target = 1.0
+        if not self.isVisible():
+            self._show.snap(0.0)
+        else:
+            self._show.value = min(self._show.value, 0.72)
+        self.show()
+        self.raise_()
+        self._ticker.start()
+        self._hide_timer.start(max(900, int(ms)))
+
+    def _reposition(self) -> None:
+        par = self.parentWidget()
+        if par is None:
+            return
+        sc = self._scale
+        x = max(14, (par.width() - self.width()) // 2)
+        y = max(14, par.height() - self.height() - _sc(52, sc, 40))
+        self.move(x, y)
+
+    def dismiss(self) -> None:
+        self._hide_timer.stop()
+        if not self.isVisible():
+            return
+        self._show.target = 0.0
+        self._ticker.start()
+
+    def stop_all(self) -> None:
+        self._hide_timer.stop()
+        self._ticker.stop()
+        self._show.snap(0.0)
+        self.hide()
+
+    def _frame(self, dt: float) -> bool:
+        moving = self._show.step(dt)
+        self.update()
+        if self._show.target == 0.0 and self._show.value < 0.04:
+            self._show.snap(0.0)
+            self.hide()
+            return False
+        return moving
+
+    def paintEvent(self, _event) -> None:
+        sv = clamp(self._show.value)
+        if sv <= 0.02 or not self._text:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        sc = self._scale
+        accent, ic_fg, glyph = self.TONES.get(self._tone, self.TONES["info"])
+        slide_y = (1.0 - sv) * 14.0 * sc
+        p.setOpacity(sv)
+        p.translate(0.0, slide_y)
+
+        skew = 9.0 * sc
+        r = QRectF(3.0, 2.0, self.width() - 10.0, self.height() - 10.0)
+        poly = QPolygonF([
+            QPointF(r.left() + skew, r.top()),
+            QPointF(r.right(), r.top()),
+            QPointF(r.right() - skew, r.bottom()),
+            QPointF(r.left(), r.bottom()),
+        ])
+
+        # Hard Persona 5 offset accent shadow + obsidian pill
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(0, 0, 0, 145))
+        p.drawPolygon(poly.translated(5.0, 5.0))
+        p.setBrush(accent)
+        p.drawPolygon(poly.translated(3.0, 3.0))
+        p.setBrush(QColor("#0B0B11"))
+        p.drawPolygon(poly)
+
+        # Left slanted accent slash + crisp icon badge
+        clip = QPainterPath()
+        clip.addPolygon(poly)
+        clip.closeSubpath()
+        badge_w = 28.0 * sc
+        p.save()
+        p.setClipPath(clip)
+        slash = QPolygonF([
+            QPointF(r.left(), r.top()),
+            QPointF(r.left() + skew + badge_w, r.top()),
+            QPointF(r.left() + badge_w, r.bottom()),
+            QPointF(r.left(), r.bottom()),
+        ])
+        p.setBrush(accent)
+        p.drawPolygon(slash)
+        p.setPen(pen(WHITE, 1.4))
+        p.drawLine(QPointF(r.left() + skew + badge_w + 1.0, r.top()),
+                   QPointF(r.left() + badge_w + 1.0, r.bottom()))
+        p.restore()
+
+        p.setPen(pen(WHITE, 1.7))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPolygon(poly)
+
+        p.setFont(p5_font(_sc(14, sc, 11), italic=False))
+        p.setPen(ic_fg)
+        p.drawText(QRectF(r.left() + skew * 0.45, r.top(), badge_w, r.height()),
+                   Qt.AlignmentFlag.AlignCenter.value, glyph)
+
+        f = ui_font(_sc(13, sc, 10), bold=True)
+        p.setFont(f)
+        p.setPen(WHITE)
+        tx = r.left() + skew + badge_w + 8.0 * sc
+        tw = max(40.0, r.right() - tx - skew - 4.0 * sc)
+        elided = QFontMetrics(f).elidedText(self._text, Qt.TextElideMode.ElideRight, int(tw))
+        p.drawText(QRectF(tx, r.top(), tw, r.height()),
+                   Qt.AlignmentFlag.AlignVCenter.value | Qt.AlignmentFlag.AlignLeft.value, elided)
+
+
+class _P5KpiCard(QFrame):
+    """Interactive Persona 5 KPI summary card with hover lift, click action, and update-pulse flash."""
+
+    clicked = pyqtSignal()
+
+    def __init__(
+        self, title: str, accent: str, border_col: str, tint_col: str,
+        action_hint: str = "", scale: float = 1.0, parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._scale = max(0.75, min(1.5, float(scale)))
+        self._accent = QColor(border_col)
+        self._tint = QColor(tint_col)
+        self._action_hint = action_hint
+        self._active = False
+        self._hover = Spring(0.0, 380.0)
+        self._press = Spring(0.0, 640.0)
+        self._flash = 0.0
+        self._ticker = FrameTicker(self._frame, self)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        sc = self._scale
+        cl = QVBoxLayout(self)
+        cl.setContentsMargins(_sc(12, sc, 8), _sc(6, sc, 4), _sc(10, sc, 7), _sc(6, sc, 4))
+        cl.setSpacing(_sc(2, sc, 1))
+
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(_sc(4, sc, 2))
+        t_lbl = QLabel(title)
+        t_lbl.setStyleSheet(
+            f'color: #A6ABC0; font-family: "Barlow Condensed", sans-serif; '
+            f'font-size: {_sc(10, sc, 8)}px; font-weight: 800; letter-spacing: 0.7px; background: transparent;'
+        )
+        top.addWidget(t_lbl)
+        top.addStretch(1)
+        self._hint_lbl = QLabel(action_hint)
+        self._hint_lbl.setStyleSheet(
+            f'color: {accent}; font-family: "Barlow Condensed", sans-serif; '
+            f'font-size: {_sc(9, sc, 8)}px; font-weight: 800; letter-spacing: 0.5px; background: transparent;'
+        )
+        self._hint_lbl.setVisible(False)
+        top.addWidget(self._hint_lbl)
+        cl.addLayout(top)
+
+        self.val_lbl = QLabel("Rp 0")
+        self.val_lbl.setStyleSheet(
+            f'color: {accent}; font-family: "Barlow Condensed", "Anton", sans-serif; '
+            f'font-size: {_sc(18, sc, 14)}px; font-weight: 900; background: transparent;'
+        )
+        cl.addWidget(self.val_lbl)
+
+        self.sub_lbl = QLabel("")
+        self.sub_lbl.setStyleSheet(f'color: #9A9FA8; font-size: {_sc(10, sc, 8)}px; background: transparent;')
+        cl.addWidget(self.sub_lbl)
+
+    def set_active(self, on: bool) -> None:
+        self._active = bool(on)
+        self.update()
+
+    def pulse(self) -> None:
+        self._flash = 1.0
+        self._ticker.start()
+
+    def enterEvent(self, e) -> None:
+        play_ui("ui_hover")
+        self._hover.target = 1.0
+        if self._action_hint:
+            self._hint_lbl.setVisible(True)
+        self._ticker.start()
+        super().enterEvent(e)
+
+    def leaveEvent(self, e) -> None:
+        self._hover.target = 0.0
+        self._hint_lbl.setVisible(False)
+        self._ticker.start()
+        super().leaveEvent(e)
+
+    def mousePressEvent(self, e) -> None:
+        if e.button() == Qt.MouseButton.LeftButton:
+            play_ui("select")
+            self._press.target = 1.0
+            self._flash = 1.0
+            self._ticker.start()
+            self.clicked.emit()
+        super().mousePressEvent(e)
+
+    def mouseReleaseEvent(self, e) -> None:
+        self._press.target = 0.0
+        self._ticker.start()
+        super().mouseReleaseEvent(e)
+
+    def _frame(self, dt: float) -> bool:
+        moving = self._hover.step(dt) | self._press.step(dt)
+        if self._flash > 0.01:
+            self._flash = max(0.0, self._flash - dt * 3.8)
+            moving = True
+        else:
+            self._flash = 0.0
+        self.update()
+        return moving
+
+    def paintEvent(self, _event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        hov = clamp(self._hover.value)
+        prs = clamp(self._press.value)
+        fl = clamp(self._flash)
+        r = QRectF(self.rect()).adjusted(1.0, 1.0, -1.0, -1.0)
+        if prs > 0.01:
+            p.translate(0.0, 1.2 * prs)
+
+        clip = QPainterPath()
+        clip.addRoundedRect(r, 8.0, 8.0)
+
+        bg_grad = QLinearGradient(r.topLeft(), r.bottomRight())
+        t0 = self._tint.lighter(int(100 + 22 * hov + (16 if self._active else 0)))
+        bg_grad.setColorAt(0.0, t0)
+        bg_grad.setColorAt(0.68, QColor("#1A1A26") if (hov > 0.2 or self._active) else QColor("#171722"))
+        bg_grad.setColorAt(1.0, QColor("#13131C"))
+        p.fillPath(clip, bg_grad)
+
+        p.save()
+        p.setClipPath(clip)
+        p.setPen(Qt.PenStyle.NoPen)
+        # Bold left accent stripe (widens crisply on hover/active)
+        bar_w = 3.5 + 2.0 * max(hov, 1.0 if self._active else 0.0)
+        p.setBrush(self._accent)
+        p.drawRect(QRectF(r.left(), r.top(), bar_w, r.height()))
+        # Subtle top edge sheen
+        p.setBrush(QColor(255, 255, 255, int(16 + 22 * hov)))
+        p.drawRect(QRectF(r.left(), r.top(), r.width(), 1.2))
+        # Persona 5 update / click diagonal light sweep
+        if fl > 0.01:
+            prog = 1.0 - fl
+            fx = r.left() - 24.0 + prog * (r.width() + 60.0)
+            fw = max(24.0, r.width() * 0.28)
+            fc = QColor(self._accent)
+            fc.setAlpha(int(95 * fl))
+            p.setBrush(fc)
+            p.drawPolygon(QPolygonF([
+                QPointF(fx, r.top()),
+                QPointF(fx + fw, r.top()),
+                QPointF(fx + fw - 18.0, r.bottom()),
+                QPointF(fx - 18.0, r.bottom()),
+            ]))
+            p.setBrush(QColor(255, 255, 255, int(45 * fl)))
+            p.drawRect(r)
+        p.restore()
+
+        bd_col = lerp_color(QColor("#303042"), self._accent, max(hov * 0.85, 0.9 if self._active else fl))
+        p.setPen(QPen(bd_col, 1.5 if (self._active or hov > 0.2 or fl > 0.1) else 1.0))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(r, 8.0, 8.0)
+
+
+# ---------------------------------------------------------------------------
 # P5FluidPanel: obsidian + white-bordered Persona 5 frame with Windows-safe reveal
 # ---------------------------------------------------------------------------
 class P5FluidPanel(QWidget):
@@ -586,6 +948,39 @@ class P5FluidPanel(QWidget):
         self.body.setSpacing(_sc(10, sc, 7))
         self.outer.addWidget(content_w, 1)
 
+        # Floating Persona 5 action confirmation / warning toast overlay (never shifts layout)
+        self._toast = P5ToastOverlay(self, scale=sc)
+
+    def notify(self, message: str, tone: str = "ok", ms: int = 2400) -> None:
+        """Show an instant Persona 5 slanted feedback toast inside this window."""
+        self._toast.show_toast(message, tone=tone, ms=ms)
+
+    def nudge_input(self, widget: QWidget, message: str = "", tone: str = "warn") -> None:
+        """Highlight an empty/invalid input briefly, focus it, play cue, and show feedback toast."""
+        play_ui("cancel")
+        if widget is not None:
+            if not hasattr(widget, "_p5_orig_qss"):
+                widget._p5_orig_qss = widget.styleSheet()
+            gen = getattr(widget, "_p5_nudge_gen", 0) + 1
+            widget._p5_nudge_gen = gen
+            widget.setStyleSheet(
+                "background-color: #2B1F0A; border: 2px solid #FAD02C; border-radius: 7px; color: #FFFFFF;"
+            )
+            widget.setFocus()
+            if isinstance(widget, QLineEdit):
+                widget.selectAll()
+
+            def _restore(w=widget, expected=gen) -> None:
+                try:
+                    if getattr(w, "_p5_nudge_gen", 0) == expected:
+                        w.setStyleSheet(getattr(w, "_p5_orig_qss", ""))
+                except RuntimeError:
+                    pass
+
+            QTimer.singleShot(420, _restore)
+        if message:
+            self.notify(message, tone=tone)
+
     def _btn(self, text: str = "", variant: str = "soft", icon: str = "",
              display: bool = False, px: int = 12, radius: float = 6.0,
              sfx_hover: bool = True, sfx_click: str | None = None) -> P5FluidButton:
@@ -635,6 +1030,7 @@ class P5FluidPanel(QWidget):
         if not self.isVisible() or self._closing:
             return
         play_ui("close")
+        self._toast.stop_all()
         self.on_closing()
         self._closing = True
         self._open.configure(420.0)
@@ -764,9 +1160,15 @@ class P5FluidPanel(QWidget):
     def on_closing(self) -> None:
         """Called right before closing."""
 
+    def resizeEvent(self, e) -> None:
+        super().resizeEvent(e)
+        if hasattr(self, "_toast") and self._toast.isVisible():
+            self._toast._reposition()
+
     def closeEvent(self, e) -> None:
         # Handle OS/Alt+F4 close identically to clicking X so cleanup & signals always run
         self._ticker.stop()
+        self._toast.stop_all()
         self._closing = False
         self.on_closing()
         e.accept()
@@ -1448,6 +1850,7 @@ class TasksDialog(P5FluidPanel):
         self._delegate = TaskRowDelegate(self.list, scale=sc)
         self.list.setItemDelegate(self._delegate)
         self.list.itemChanged.connect(self._on_item_changed)
+        self.list.itemSelectionChanged.connect(self._sync_selection_ui)
         self.list.delete_pressed.connect(self._delete_selected)
         self.list.space_pressed.connect(self._toggle_selected_done)
         cl.addWidget(self.list)
@@ -1461,15 +1864,15 @@ class TasksDialog(P5FluidPanel):
         # Footer actions
         foot = QHBoxLayout()
         foot.setSpacing(_sc(5, sc, 4))
-        tip = QLabel("Space: done · Right-click: stat")
-        tip.setObjectName("tip")
-        foot.addWidget(tip, 1)
+        self._foot_tip = QLabel("Space: done · Right-click: stat")
+        self._foot_tip.setObjectName("tip")
+        foot.addWidget(self._foot_tip, 1)
 
-        tog_due = self._btn("DUE", variant="soft", icon="clock", display=True, px=9)
-        tog_due.setFixedHeight(_sc(28, sc, 24))
-        tog_due.setToolTip("Set or clear deadline on selected task(s)")
-        tog_due.clicked.connect(self._open_due_for_selected)
-        foot.addWidget(tog_due)
+        self._foot_due_btn = self._btn("DUE", variant="soft", icon="clock", display=True, px=9)
+        self._foot_due_btn.setFixedHeight(_sc(28, sc, 24))
+        self._foot_due_btn.setToolTip("Set or clear deadline on selected task(s)")
+        self._foot_due_btn.clicked.connect(self._open_due_for_selected)
+        foot.addWidget(self._foot_due_btn)
 
         self._set_stat_btn = self._btn("STAT ▾", variant="gold", display=True, px=9)
         self._set_stat_btn.setFixedHeight(_sc(28, sc, 24))
@@ -1477,22 +1880,22 @@ class TasksDialog(P5FluidPanel):
         self._set_stat_btn.clicked.connect(self._open_stat_menu_for_selected)
         foot.addWidget(self._set_stat_btn)
 
-        tog_prio = self._btn("PRIO", variant="soft", icon="bolt", display=True, px=9)
-        tog_prio.setFixedHeight(_sc(28, sc, 24))
-        tog_prio.setToolTip("Toggle High priority on selected task(s)")
-        tog_prio.clicked.connect(self._toggle_selected_priority)
-        foot.addWidget(tog_prio)
+        self._foot_prio_btn = self._btn("PRIO", variant="soft", icon="bolt", display=True, px=9)
+        self._foot_prio_btn.setFixedHeight(_sc(28, sc, 24))
+        self._foot_prio_btn.setToolTip("Toggle High priority on selected task(s)")
+        self._foot_prio_btn.clicked.connect(self._toggle_selected_priority)
+        foot.addWidget(self._foot_prio_btn)
 
-        del_btn = self._btn("DEL", variant="danger", display=True, px=9)
-        del_btn.setFixedHeight(_sc(28, sc, 24))
-        del_btn.setToolTip("Delete selected task(s) (Del)")
-        del_btn.clicked.connect(self._delete_selected)
-        foot.addWidget(del_btn)
+        self._foot_del_btn = self._btn("DEL", variant="danger", display=True, px=9)
+        self._foot_del_btn.setFixedHeight(_sc(28, sc, 24))
+        self._foot_del_btn.setToolTip("Delete selected task(s) (Del)")
+        self._foot_del_btn.clicked.connect(self._delete_selected)
+        foot.addWidget(self._foot_del_btn)
 
-        clear_btn = self._btn("CLEAR DONE", variant="soft", display=True, px=9)
-        clear_btn.setFixedHeight(_sc(28, sc, 24))
-        clear_btn.clicked.connect(self._clear_done)
-        foot.addWidget(clear_btn)
+        self._foot_clear_btn = self._btn("CLEAR DONE", variant="soft", display=True, px=9)
+        self._foot_clear_btn.setFixedHeight(_sc(28, sc, 24))
+        self._foot_clear_btn.clicked.connect(self._clear_done)
+        foot.addWidget(self._foot_clear_btn)
         self.body.addLayout(foot)
 
         QShortcut(QKeySequence("Ctrl+F"), self).activated.connect(self.search_edit.setFocus)
@@ -1528,6 +1931,7 @@ class TasksDialog(P5FluidPanel):
                 changed = True
         if changed:
             self.refresh()
+            self.notify(f"Stat set to {SOCIAL_STATS[stat_key]['label']}", tone="gold", ms=1800)
             self.tasks_changed.emit()
 
     def _open_stat_menu_for_selected(self) -> None:
@@ -1605,6 +2009,7 @@ class TasksDialog(P5FluidPanel):
             target = (now + timedelta(days=1)).replace(hour=9, minute=0)
         self._due_edit.setDateTime(_to_qdt(target))
         self._due_check.setChecked(True)
+        self.notify(f"Deadline preset: {target:%d %b %H:%M}", tone="gold", ms=1500)
 
     def _apply_due_to_selected(self) -> None:
         dt = _from_qdt(self._due_edit.dateTime())
@@ -1615,7 +2020,10 @@ class TasksDialog(P5FluidPanel):
                 changed = True
         if changed:
             self.refresh()
+            self.notify(f"Deadline set: {dt:%d %b %H:%M}", tone="gold")
             self.tasks_changed.emit()
+        else:
+            self.notify("Select a task in the list first to apply deadline", tone="warn")
 
     def _clear_due_selected(self) -> None:
         self._due_check.setChecked(False)
@@ -1626,6 +2034,7 @@ class TasksDialog(P5FluidPanel):
                 changed = True
         if changed:
             self.refresh()
+            self.notify("Deadline cleared", tone="info")
             self.tasks_changed.emit()
 
     def _set_filter(self, key: str) -> None:
@@ -1634,12 +2043,27 @@ class TasksDialog(P5FluidPanel):
             chip.set_active(k == key)
         self.refresh()
 
+    def _sync_selection_ui(self) -> None:
+        sel = [i for i in self.list.selectedItems() if i.data(ROLE_ID)]
+        has_sel = bool(sel)
+        self._foot_due_btn.setEnabled(has_sel)
+        self._foot_prio_btn.setEnabled(has_sel)
+        self._foot_del_btn.setEnabled(has_sel)
+        if has_sel:
+            n = len(sel)
+            self._foot_tip.setText(f"{n} sel · Space / Del")
+        else:
+            self._foot_tip.setText("Space: done · R-click: stat")
+
     def _update_status(self) -> None:
         tasks = self.store.all()
         done = sum(1 for t in tasks if t.get("done"))
         self.progress.setRange(0, max(len(tasks), 1))
         self.progress.setValue(done)
         self._count_lbl.setText(f"{len(tasks) - done} LEFT · {done} DONE")
+        self._foot_clear_btn.setEnabled(done > 0)
+        self._foot_clear_btn.setText(f"CLEAR DONE ({done})" if done > 0 else "CLEAR DONE")
+        self._sync_selection_ui()
 
     @staticmethod
     def _due_badge(task: dict, now: datetime) -> tuple[str, bool]:
@@ -1722,6 +2146,7 @@ class TasksDialog(P5FluidPanel):
             stat=self._new_stat,
         )
         if task is None:
+            self.nudge_input(self.input, "Type a task title first!", tone="warn")
             return
         self.input.clear()
         if self._new_high:
@@ -1732,6 +2157,7 @@ class TasksDialog(P5FluidPanel):
             self._set_filter("all")
         else:
             self.refresh()
+        self.notify(f"Added task: {task['title'][:36]}", tone="ok")
         self.tasks_changed.emit()
 
     def _on_item_changed(self, item: QListWidgetItem) -> None:
@@ -1752,11 +2178,13 @@ class TasksDialog(P5FluidPanel):
             if done:
                 play_ui("select")
                 self._delegate.start_check_anim(task_id)
+                self.notify(f"Completed '{task['title'][:34]}'!", tone="ok")
                 self.task_reward_eligible.emit(task_id)
                 self.task_completed.emit(task["title"], len(self.store.pending()))
             else:
                 play_ui("cancel")
                 self._delegate.clear_anim(task_id)
+                self.notify("Marked task as pending", tone="info", ms=1500)
             self._resort_timer.start()
         self._update_status()
         self.tasks_changed.emit()
@@ -1777,6 +2205,7 @@ class TasksDialog(P5FluidPanel):
                 changed = True
         if changed:
             self.refresh()
+            self.notify("Updated task priority", tone="gold", ms=1600)
             self.tasks_changed.emit()
 
     def _delete_selected(self) -> None:
@@ -1791,6 +2220,7 @@ class TasksDialog(P5FluidPanel):
         self.tasks_changed.emit()
         n = len(removed)
         self._undo.trigger(f"Deleted {n} {'task' if n == 1 else 'tasks'}.")
+        self.notify(f"Deleted {n} {'task' if n == 1 else 'tasks'} · Undo available", tone="info")
 
     def _clear_done(self) -> None:
         done_items = [dict(t) for t in self.store.all() if t.get("done")]
@@ -1802,12 +2232,14 @@ class TasksDialog(P5FluidPanel):
         self.tasks_changed.emit()
         n = len(done_items)
         self._undo.trigger(f"Cleared {n} completed {'task' if n == 1 else 'tasks'}.")
+        self.notify(f"Cleared {n} completed {'task' if n == 1 else 'tasks'}", tone="info")
 
     def _undo_delete(self) -> None:
         if self._undo_items:
             self.store.restore(self._undo_items)
             self._undo_items = []
             self.refresh()
+            self.notify("Restored deleted task(s)", tone="ok")
             self.tasks_changed.emit()
 
 
@@ -3182,12 +3614,15 @@ class NotesDialog(P5FluidPanel):
                 first_line = (self._current_plain_text().strip().splitlines() or [""])[0].strip()
                 title = first_line[:120]
         if not title:
-            self.status.setText("Write or highlight something first to send to Tasks.")
+            msg = "Write or highlight something first to send to Tasks."
+            self.status.setText(msg)
+            self.nudge_input(self.title_edit, msg, tone="warn")
             return
         if self._dirty:
             self._save(silent=True)
         self.send_to_task.emit(title, None)
         self.status.setText(f"Sent to Tasks: '{title[:34]}'")
+        self.notify(f"Sent to Tasks: '{title[:34]}'", tone="ok")
 
     def _migrate_legacy_deadline(self) -> None:
         if not self._legacy_dl_note_id:
@@ -3205,6 +3640,7 @@ class NotesDialog(P5FluidPanel):
         self.notes_changed.emit()
         self.refresh()
         self.status.setText("Moved legacy deadline to Tasks!")
+        self.notify("Moved legacy deadline to Tasks!", tone="ok")
 
     def _clear_legacy_deadline(self) -> None:
         if not self._legacy_dl_note_id:
@@ -3215,6 +3651,7 @@ class NotesDialog(P5FluidPanel):
         self.notes_changed.emit()
         self.refresh()
         self.status.setText("Cleared legacy deadline.")
+        self.notify("Cleared legacy deadline", tone="info")
 
     def _copy_markdown(self) -> None:
         title = self.title_edit.text().strip()
@@ -3222,11 +3659,13 @@ class NotesDialog(P5FluidPanel):
         payload = f"# {title}\n\n{body}".strip() if title else body
         if not payload:
             self.status.setText("Nothing to copy yet.")
+            self.notify("Nothing to copy yet — write a note first", tone="warn")
             return
         cb = QApplication.clipboard()
         if cb is not None:
             cb.setText(payload)
             self.status.setText("Copied Markdown to clipboard!")
+            self.notify("Copied Markdown to clipboard!", tone="ok")
 
     # -- note list ---------------------------------------------------------------
     def _card_meta(self, note: dict) -> tuple[str, str, str, list[str]]:
@@ -3424,6 +3863,7 @@ class NotesDialog(P5FluidPanel):
         self.store.set_pinned(self._current_id, pinned)
         self._sync_flags_ui(pinned, bool(note.get("archived")))
         self.refresh()
+        self.notify("Note pinned to top" if pinned else "Note unpinned", tone="gold" if pinned else "info", ms=1800)
 
     def _toggle_archive(self) -> None:
         if not self._current_id:
@@ -3437,6 +3877,7 @@ class NotesDialog(P5FluidPanel):
         self.refresh()
         self.notes_changed.emit()
         self.status.setText("Moved to Archive." if arch else "Restored from Archive.")
+        self.notify("Moved note to Archive" if arch else "Restored note from Archive", tone="info")
 
     def _save(self, silent: bool = False) -> bool:
         silent = silent is True
@@ -3445,7 +3886,9 @@ class NotesDialog(P5FluidPanel):
         content = self._current_markdown().strip()
         if not title and not content:
             if not silent:
-                self.status.setText("Add a title or content first.")
+                msg = "Add a title or content first."
+                self.status.setText(msg)
+                self.nudge_input(self.title_edit, msg, tone="warn")
             return False
         if not title:
             first = (content.splitlines() or ["Untitled"])[0].lstrip("#>-•* ").strip()
@@ -3468,8 +3911,10 @@ class NotesDialog(P5FluidPanel):
         self.refresh()
         if self.store.last_error:
             self.status.setText("Save failed: " + self.store.last_error)
+            self.notify("Save failed: " + self.store.last_error[:60], tone="err")
         else:
             self.status.setText(f"Saved · {datetime.now():%H:%M}")
+            self.notify(f"Saved '{title[:34]}'", tone="ok", ms=1800)
         return True
 
     def _delete(self) -> None:
@@ -3485,6 +3930,7 @@ class NotesDialog(P5FluidPanel):
         self._new()
         self.notes_changed.emit()
         self._undo.trigger(f"Deleted '{title[:28]}'.")
+        self.notify(f"Deleted '{title[:28]}' · Undo available", tone="info")
 
     def _undo_delete(self) -> None:
         if self._undo_note is None:
@@ -3496,6 +3942,7 @@ class NotesDialog(P5FluidPanel):
             self.refresh()
             self.notes_changed.emit()
             self.status.setText("Note restored.")
+            self.notify("Note restored!", tone="ok")
 
 
 # ---------------------------------------------------------------------------
@@ -3890,6 +4337,7 @@ class SettingsDialog(P5FluidPanel):
         self._ai_test_btn.setEnabled(False)
         self._ai_test_lbl.setStyleSheet(f"color: #FAD02C; font-size: {_sc(12, self._ui_scale, 9)}px;")
         self._ai_test_lbl.setText("Testing connection with Morgana...")
+        self.notify("Testing AI connection...", tone="info", ms=1600)
         self.test_ai_requested.emit({
             "provider": prov,
             "api_key": self.ai_key_edit.text().strip(),
@@ -3903,6 +4351,7 @@ class SettingsDialog(P5FluidPanel):
         color = "#5CE09A" if ok else "#FF6B78"
         self._ai_test_lbl.setStyleSheet(f"color: {color}; font-size: {_sc(12, self._ui_scale, 9)}px; font-weight: bold;")
         self._ai_test_lbl.setText(message)
+        self.notify(message[:76], tone="ok" if ok else "err", ms=2800)
 
     def _sync_sheets_fields(self, _checked: bool = False) -> None:
         tasks_on = self.sheets_sync_enabled_check.isChecked()
@@ -3940,6 +4389,7 @@ class SettingsDialog(P5FluidPanel):
         self._sheets_sync_btn.setEnabled(False)
         self._sheets_status_lbl.setStyleSheet(f"color: #FAD02C; font-size: {_sc(12, self._ui_scale, 9)}px;")
         self._sheets_status_lbl.setText("Testing Google Sheets connection...")
+        self.notify("Testing Google Sheets connection...", tone="info", ms=1600)
         self.test_sheets_sync_requested.emit(self._sheets_form_payload())
 
     def _on_sync_sheets_now_clicked(self) -> None:
@@ -3947,6 +4397,7 @@ class SettingsDialog(P5FluidPanel):
         self._sheets_sync_btn.setEnabled(False)
         self._sheets_status_lbl.setStyleSheet(f"color: #FAD02C; font-size: {_sc(12, self._ui_scale, 9)}px;")
         self._sheets_status_lbl.setText("Pushing active task deadlines to Google Sheets...")
+        self.notify("Syncing task deadlines to Google Sheets...", tone="info", ms=1600)
         self.sync_sheets_now_requested.emit(self._sheets_form_payload())
 
     def set_sheets_status(self, ok: bool, message: str) -> None:
@@ -3957,6 +4408,7 @@ class SettingsDialog(P5FluidPanel):
         color = "#5CE09A" if ok else "#FF6B78"
         self._sheets_status_lbl.setStyleSheet(f"color: {color}; font-size: {_sc(12, self._ui_scale, 9)}px; font-weight: bold;")
         self._sheets_status_lbl.setText(message)
+        self.notify(message[:76], tone="ok" if ok else "err", ms=2800)
 
     def _row(self, layout: QVBoxLayout, text: str, widget: QWidget, wide: bool = False) -> None:
         sc = self._ui_scale
@@ -4025,20 +4477,28 @@ class SettingsDialog(P5FluidPanel):
             audio().set_sfx_volume(int(value))
 
     def _test_voice(self) -> None:
+        if not self.sound_check.isChecked():
+            self.notify("Enable sound checkbox above to hear voice preview", tone="warn")
+            return
         mgr = audio()
         if mgr is None:
             return
-        mgr.set_enabled(self.sound_check.isChecked())
+        mgr.set_enabled(True)
         mgr.set_voice_volume(self.voice_slider.value())
         play_voice("hmm")
+        self.notify(f"Playing voice preview ({self.voice_slider.value()}%)", tone="info", ms=1200)
 
     def _test_sfx(self) -> None:
+        if not self.sound_check.isChecked():
+            self.notify("Enable sound checkbox above to hear SFX preview", tone="warn")
+            return
         mgr = audio()
         if mgr is None:
             return
-        mgr.set_enabled(self.sound_check.isChecked())
+        mgr.set_enabled(True)
         mgr.set_sfx_volume(self.sfx_slider.value())
         play_ui("open_window")
+        self.notify(f"Playing UI SFX preview ({self.sfx_slider.value()}%)", tone="info", ms=1200)
 
     def on_closing(self) -> None:
         """Restore persisted audio volumes if the user closed Settings without saving."""
@@ -4134,6 +4594,7 @@ class SettingsDialog(P5FluidPanel):
     def _reset(self) -> None:
         self._fill(SETTINGS_DEFAULTS)
         self.status.setText("Defaults loaded. Click SAVE to apply.")
+        self.notify("Defaults loaded — click SAVE to apply", tone="gold")
 
     def _save(self) -> None:
         self._saving = True
@@ -4144,7 +4605,10 @@ class SettingsDialog(P5FluidPanel):
                 w.interpretText()
             chosen_tabs = [k for k in RADIAL_TAB_KEYS if self.tab_checks[k].isChecked()]
             if not chosen_tabs:
-                self.status.setText("Keep at least one radial menu tab enabled.")
+                play_ui("cancel")
+                msg = "Keep at least one radial menu tab enabled."
+                self.status.setText(msg)
+                self.notify(msg, tone="warn")
                 return
             b, w = self.bed_edit.time(), self.wake_edit.time()
             wu = self.wrapup_edit.time()
@@ -4203,10 +4667,13 @@ class SettingsDialog(P5FluidPanel):
                 self.autostart_changed.emit(self.autostart_check.isChecked())
             if self.store.last_error:
                 self.status.setText("Save failed: " + self.store.last_error)
+                self.notify("Save failed: " + self.store.last_error[:60], tone="err")
             elif b == w:
                 self.status.setText("Saved, but bedtime and wake times match—bedtime reminders won't trigger.")
+                self.notify("Saved (bedtime & wake match — curfew paused)", tone="warn")
             else:
                 self.status.setText("Saved and applied.")
+                self.notify("Settings saved & applied!", tone="ok")
         finally:
             self._saving = False
 
@@ -4516,14 +4983,18 @@ class EventsDialog(P5FluidPanel):
 
         self._foot_refresh = self._btn("REFRESH", variant="soft", icon="refresh", display=True, px=10)
         self._foot_refresh.setFixedHeight(_sc(28, sc, 24))
-        self._foot_refresh.clicked.connect(lambda _c=False: self.refresh_requested.emit(True))
+        self._foot_refresh.clicked.connect(self._on_manual_refresh)
         foot.addWidget(self._foot_refresh)
         self.body.addLayout(foot)
 
-        QShortcut(QKeySequence("F5"), self).activated.connect(lambda: self.refresh_requested.emit(True))
-        QShortcut(QKeySequence("Ctrl+R"), self).activated.connect(lambda: self.refresh_requested.emit(True))
+        QShortcut(QKeySequence("F5"), self).activated.connect(self._on_manual_refresh)
+        QShortcut(QKeySequence("Ctrl+R"), self).activated.connect(self._on_manual_refresh)
         QShortcut(QKeySequence("Ctrl+N"), self).activated.connect(self._toggle_new_event_form)
         QShortcut(QKeySequence("Ctrl+,"), self).activated.connect(lambda: self.open_settings.emit())
+
+    def _on_manual_refresh(self) -> None:
+        self.notify("Refreshing 7-day schedule...", tone="info", ms=1400)
+        self.refresh_requested.emit(True)
 
     # -- Local Event Form ----------------------------------------------------
     def _default_ev_times(self) -> tuple[datetime, datetime]:
@@ -4568,6 +5039,7 @@ class EventsDialog(P5FluidPanel):
         self._ev_save_btn.setText("UPDATE EVENT")
         self._ev_form_box.setVisible(True)
         self._ev_title_edit.setFocus()
+        self.notify(f"Editing '{ev.get('title', '')[:30]}'", tone="gold", ms=1800)
 
     def _close_event_form(self) -> None:
         self._editing_local_id = None
@@ -4599,24 +5071,28 @@ class EventsDialog(P5FluidPanel):
             en = st + timedelta(hours=1)
         self._ev_start.setDateTime(_to_qdt(st))
         self._ev_end.setDateTime(_to_qdt(en))
+        self.notify(f"Event time preset: {st:%d %b %H:%M}", tone="gold", ms=1500)
 
     def _save_local_event(self) -> None:
         if self.local_store is None:
             return
         title = self._ev_title_edit.text().strip()
         if not title:
-            self._ev_err.setText("Please enter an event title.")
-            self._ev_title_edit.setFocus()
+            msg = "Please enter an event title."
+            self._ev_err.setText(msg)
+            self.nudge_input(self._ev_title_edit, msg, tone="warn")
             return
         all_day = self._ev_all_day.isChecked()
         st = _from_qdt(self._ev_start.dateTime())
         en = None if all_day else _from_qdt(self._ev_end.dateTime())
         loc = self._ev_loc_edit.text().strip()
+        was_edit = bool(self._editing_local_id)
         if self._editing_local_id:
             self.local_store.update(self._editing_local_id, title, st, en, all_day=all_day, location=loc)
         else:
             self.local_store.add(title, st, en, all_day=all_day, location=loc)
         self._close_event_form()
+        self.notify(f"Updated '{title[:34]}'" if was_edit else f"Added event '{title[:34]}'", tone="ok")
         self.local_events_changed.emit()
 
     def _delete_local_event(self, raw_id: str) -> None:
@@ -4631,11 +5107,13 @@ class EventsDialog(P5FluidPanel):
             self._close_event_form()
         self.local_events_changed.emit()
         self._undo.trigger(f"Deleted event '{ev.get('title', '')[:30]}'.")
+        self.notify(f"Deleted '{ev.get('title', '')[:30]}' · Undo available", tone="info")
 
     def _undo_delete_local(self) -> None:
         if self.local_store is not None and self._undo_event is not None:
             self.local_store.restore(self._undo_event)
             self._undo_event = None
+            self.notify("Restored deleted event!", tone="ok")
             self.local_events_changed.emit()
 
     # -- View state ----------------------------------------------------------
@@ -5931,6 +6409,7 @@ class SocialStatsDialog(P5FluidPanel):
         self._habit_delegate = HabitRowDelegate(self._habit_list, scale=sc)
         self._habit_list.setItemDelegate(self._habit_delegate)
         self._habit_list.itemChanged.connect(self._on_habit_item_changed)
+        self._habit_list.itemSelectionChanged.connect(self._sync_habit_selection_ui)
         self._habit_list.space_pressed.connect(self._toggle_selected_habit)
         self._habit_list.delete_pressed.connect(self._delete_selected_habit)
         hlc.addWidget(self._habit_list, 1)
@@ -5940,10 +6419,10 @@ class SocialStatsDialog(P5FluidPanel):
         htip = QLabel("Resets daily · Auto-rewards Stats · Space")
         htip.setObjectName("tip")
         hf_foot.addWidget(htip, 1)
-        hdel_btn = self._btn("DELETE", variant="danger", display=True, px=10)
-        hdel_btn.setFixedHeight(_sc(26, sc, 22))
-        hdel_btn.clicked.connect(self._delete_selected_habit)
-        hf_foot.addWidget(hdel_btn)
+        self._hdel_btn = self._btn("DELETE", variant="danger", display=True, px=10)
+        self._hdel_btn.setFixedHeight(_sc(26, sc, 22))
+        self._hdel_btn.clicked.connect(self._delete_selected_habit)
+        hf_foot.addWidget(self._hdel_btn)
         hlc.addLayout(hf_foot)
         hpl.addWidget(hlist_card, 1)
         right.addWidget(self._habits_page, 1)
@@ -6089,6 +6568,7 @@ class SocialStatsDialog(P5FluidPanel):
         self._log_list.setMouseTracking(True)
         self._log_list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self._log_list.setItemDelegate(StatLogDelegate(self._log_list, scale=sc))
+        self._log_list.itemSelectionChanged.connect(self._sync_log_selection_ui)
         self._log_list.delete_pressed.connect(self._delete_selected)
         self._log_list.itemDoubleClicked.connect(lambda _it: self._start_edit_selected())
         hl.addWidget(self._log_list, 1)
@@ -6100,16 +6580,16 @@ class SocialStatsDialog(P5FluidPanel):
         tip.setObjectName("tip")
         h_foot.addWidget(tip, 1)
 
-        edit_btn = self._btn("EDIT", variant="gold", display=True, px=10)
-        edit_btn.setFixedHeight(_sc(26, sc, 22))
-        edit_btn.setToolTip("Edit selected log entry (stat, activity, block, points)")
-        edit_btn.clicked.connect(self._start_edit_selected)
-        h_foot.addWidget(edit_btn)
+        self._log_edit_btn = self._btn("EDIT", variant="gold", display=True, px=10)
+        self._log_edit_btn.setFixedHeight(_sc(26, sc, 22))
+        self._log_edit_btn.setToolTip("Edit selected log entry (stat, activity, block, points)")
+        self._log_edit_btn.clicked.connect(self._start_edit_selected)
+        h_foot.addWidget(self._log_edit_btn)
 
-        del_btn = self._btn("DELETE", variant="danger", display=True, px=10)
-        del_btn.setFixedHeight(_sc(26, sc, 22))
-        del_btn.clicked.connect(self._delete_selected)
-        h_foot.addWidget(del_btn)
+        self._log_del_btn = self._btn("DELETE", variant="danger", display=True, px=10)
+        self._log_del_btn.setFixedHeight(_sc(26, sc, 22))
+        self._log_del_btn.clicked.connect(self._delete_selected)
+        h_foot.addWidget(self._log_del_btn)
         hl.addLayout(h_foot)
 
         lpl.addWidget(hist_card, 1)
@@ -6200,14 +6680,29 @@ class SocialStatsDialog(P5FluidPanel):
             self._cancel_edit()
 
     # -- Custom Daily Habits actions -----------------------------------------
+    def _sync_habit_selection_ui(self) -> None:
+        item = self._habit_list.currentItem()
+        self._hdel_btn.setEnabled(bool(item is not None and item.data(ROLE_ID)))
+
+    def _sync_log_selection_ui(self) -> None:
+        item = self._log_list.currentItem()
+        has_sel = bool(item is not None and item.data(ROLE_ID))
+        self._log_edit_btn.setEnabled(has_sel)
+        self._log_del_btn.setEnabled(has_sel)
+
     def _add_habit(self) -> None:
         if self.habits is None:
             return
         h = self.habits.add(self._habit_input.text(), stat=self._habit_stat, points=self._habit_pts)
         if h is None:
+            self.nudge_input(self._habit_input, "Type a daily habit title first!", tone="warn")
             return
         self._habit_input.clear()
         self._refresh_habits()
+        self.notify(
+            f"Added habit '{h['title'][:30]}' (+{h['points']} {SOCIAL_STATS[h['stat']]['short']})",
+            tone="ok",
+        )
         self._habit_input.setFocus()
 
     def _on_habit_item_changed(self, item: QListWidgetItem) -> None:
@@ -6224,10 +6719,16 @@ class SocialStatsDialog(P5FluidPanel):
         now_done, entry, old_lv, new_lv = self.habits.toggle_today(hid, self.store)
         if now_done:
             self._habit_delegate.start_check_anim(hid)
+            sk = habit.get("stat", "knowledge")
+            self.notify(
+                f"Completed '{habit['title'][:28]}' (+{habit.get('points', 2)} {SOCIAL_STATS.get(sk, {}).get('short', sk[:3].upper())})",
+                tone="ok",
+            )
         else:
             play_ui("cancel")
             self._habit_delegate.clear_anim(hid)
             self._refresh_visuals(animate=True)
+            self.notify("Unchecked habit for today", tone="info", ms=1500)
         self._refresh_habits()
         self._refresh_log()
         self.habit_toggled.emit(hid, now_done, entry, old_lv, new_lv)
@@ -6252,6 +6753,7 @@ class SocialStatsDialog(P5FluidPanel):
         self.habits.delete(hid)
         self._refresh_habits()
         self._undo.trigger(f"Removed habit '{habit.get('title', '')[:28]}'.")
+        self.notify(f"Removed habit '{habit.get('title', '')[:28]}' · Undo available", tone="info")
 
     def _refresh_habits(self) -> None:
         if self.habits is None:
@@ -6269,6 +6771,7 @@ class SocialStatsDialog(P5FluidPanel):
                 "Type a habit above, choose its Social Stat & points (+1 to +3), and click ADD HABIT."
             ))
             self._habit_list.blockSignals(False)
+            self._sync_habit_selection_ui()
             return
 
         # Pending today first, then done today
@@ -6287,6 +6790,7 @@ class SocialStatsDialog(P5FluidPanel):
             it.setData(ROLE_STREAK, f"{st_days}D STREAK" if st_days >= 1 else "")
             self._habit_list.addItem(it)
         self._habit_list.blockSignals(False)
+        self._sync_habit_selection_ui()
 
     # -- Manual Time Block & History actions ---------------------------------
     def _start_edit_selected(self) -> None:
@@ -6315,7 +6819,9 @@ class SocialStatsDialog(P5FluidPanel):
         self._log_btn.setText("SAVE EDIT")
         self._log_btn._icon = ""
         self._log_btn.set_variant("gold")
+        self._log_btn.pulse()
         self._cancel_edit_btn.setVisible(True)
+        self.notify(f"Editing '{entry.get('activity', '')[:28]}' — Enter to save, Esc to cancel", tone="gold", ms=2000)
         self._act_input.setFocus()
         self._act_input.selectAll()
 
@@ -6334,6 +6840,9 @@ class SocialStatsDialog(P5FluidPanel):
         self._pts_spin.interpretText()
         pts = self._pts_spin.value()
         if self._editing_log_id is not None:
+            if not self._act_input.text().strip():
+                self.nudge_input(self._act_input, "Describe your activity before saving!", tone="warn")
+                return
             eid = self._editing_log_id
             updated, prev = self.store.update(
                 eid,
@@ -6353,6 +6862,7 @@ class SocialStatsDialog(P5FluidPanel):
             self.stats_changed.emit()
             lbl = SOCIAL_STATS.get(updated["stat"], {}).get("label", updated["stat"].title())
             self._undo.trigger(f"Updated '{updated['activity'][:24]}' → {lbl} +{updated['points']}.")
+            self.notify(f"Updated log → {lbl} +{updated['points']}", tone="gold")
             return
 
         entry, old_lv, new_lv = self.store.add(
@@ -6363,9 +6873,12 @@ class SocialStatsDialog(P5FluidPanel):
             source="manual",
         )
         if entry is None:
+            self.nudge_input(self._act_input, "Describe your activity before logging!", tone="warn")
             return
         self._act_input.clear()
         self._refresh_log()
+        lbl = SOCIAL_STATS.get(entry["stat"], {}).get("label", entry["stat"].title())
+        self.notify(f"+{entry['points']} {lbl} logged!", tone="ok")
         self.stat_logged.emit(entry["stat"], entry["activity"], entry["points"], old_lv, new_lv)
 
     def prepare_reward_animation(self, stat: str, prev_totals: dict[str, int] | None = None) -> None:
@@ -6418,6 +6931,7 @@ class SocialStatsDialog(P5FluidPanel):
         self.refresh()
         self.stats_changed.emit()
         self._undo.trigger(f"Removed '{entry.get('activity', '')[:28]}' (+{entry.get('points', 0)} pts).")
+        self.notify(f"Removed log entry · Undo available", tone="info")
 
     def _undo_delete(self) -> None:
         if self._undo_payload is None:
@@ -6433,6 +6947,7 @@ class SocialStatsDialog(P5FluidPanel):
         self._refresh_visuals(animate=True)
         self._refresh_habits()
         self._refresh_log()
+        self.notify("Restored deleted item!", tone="ok")
         self.stats_changed.emit()
 
     def refresh(self) -> None:
@@ -6485,6 +7000,7 @@ class SocialStatsDialog(P5FluidPanel):
                    if self._log_filter == "all"
                    else f"No {SOCIAL_STATS[self._log_filter]['label']} entries yet.")
             self._log_list.addItem(_hint_item(msg))
+            self._sync_log_selection_ui()
             return
         src_labels = {"habit": "HABIT", "task": "TASK", "focus": "FOCUS", "note": "NOTE", "chat": "CHAT"}
         for e in entries:
@@ -6503,6 +7019,7 @@ class SocialStatsDialog(P5FluidPanel):
             meta_parts = [p for p in (src_tag, e.get("block", "Daytime"), d_fmt) if p]
             item.setData(ROLE_DATE, " · ".join(meta_parts))
             self._log_list.addItem(item)
+        self._sync_log_selection_ui()
 
 
 # ---------------------------------------------------------------------------
@@ -7119,7 +7636,7 @@ class TimerDialog(P5FluidPanel):
         brk_btn = self._btn("5M BREAK", variant="mint", display=True, px=9)
         brk_btn.setFixedHeight(_sc(24, sc, 20))
         brk_btn.setToolTip("Start a 5-minute break timer and reset continuous screen-time counter")
-        brk_btn.clicked.connect(lambda _c=False: self.break_requested.emit(5))
+        brk_btn.clicked.connect(self._request_quick_break)
         ssl.addWidget(brk_btn)
         self.body.addWidget(scr_strip)
 
@@ -7194,10 +7711,10 @@ class TimerDialog(P5FluidPanel):
         self._label_edit.returnPressed.connect(self._add_manual_timer)
         lbl_row.addWidget(self._label_edit, 1)
 
-        add_btn = self._btn("START TIMER", variant="primary", icon="plus", display=True, px=10)
-        add_btn.setFixedHeight(_sc(30, sc, 25))
-        add_btn.clicked.connect(self._add_manual_timer)
-        lbl_row.addWidget(add_btn)
+        self._start_manual_btn = self._btn("START TIMER", variant="primary", icon="plus", display=True, px=10)
+        self._start_manual_btn.setFixedHeight(_sc(30, sc, 25))
+        self._start_manual_btn.clicked.connect(self._add_manual_timer)
+        lbl_row.addWidget(self._start_manual_btn)
         ml.addLayout(lbl_row)
 
         self._manual_err = QLabel("")
@@ -7223,6 +7740,14 @@ class TimerDialog(P5FluidPanel):
         self._sync_spinners_from_settings()
         self._rebuild_manual_list()
 
+    def _request_quick_break(self) -> None:
+        self.notify("5-minute break started — stretch & hydrate!", tone="ok")
+        self.break_requested.emit(5)
+
+    def _cancel_manual_timer(self, tid: str) -> None:
+        self.notify("Timer cancelled", tone="info", ms=1500)
+        self.manual_cancel_requested.emit(tid)
+
     def _select_focus_stat(self, stat: str, emit: bool = False) -> None:
         key = stat if stat in self._focus_stat_chips else "knowledge"
         self._focus_stat = key
@@ -7230,6 +7755,11 @@ class TimerDialog(P5FluidPanel):
             btn.set_active(k == key, active_variant="gold" if k != "none" else "primary")
         self._focus_stat_hint.setText("No reward" if key == "none" else SOCIAL_STATS[key]["label"])
         if emit:
+            self.notify(
+                "Focus stat reward disabled" if key == "none" else f"Focus reward: {SOCIAL_STATS[key]['label']}",
+                tone="gold",
+                ms=1600,
+            )
             self.focus_stat_changed.emit(key)
 
     def _sync_spinners_from_settings(self) -> None:
@@ -7254,11 +7784,14 @@ class TimerDialog(P5FluidPanel):
 
     def _toggle_focus(self) -> None:
         if self._focus_running:
+            self.notify("Focus session stopped", tone="info")
             self.focus_stop_requested.emit()
         else:
             self._focus_spin.interpretText()
             self._rest_spin.interpretText()
-            self.focus_start_requested.emit(self._focus_spin.value(), self._rest_spin.value())
+            fm, rm = self._focus_spin.value(), self._rest_spin.value()
+            self.notify(f"Focus started: {fm}m focus / {rm}m break!", tone="ok")
+            self.focus_start_requested.emit(fm, rm)
 
     def _on_manual_spin_edited(self, _val: int) -> None:
         self._preset_default_label = ""
@@ -7270,6 +7803,8 @@ class TimerDialog(P5FluidPanel):
         self._m_spin.setValue(m)
         self._s_spin.setValue(0)
         self._manual_err.hide()
+        self._start_manual_btn.pulse()
+        self.notify(f"Preset {minutes}m ready — press Enter or START TIMER", tone="gold", ms=1600)
         self._label_edit.setFocus()
 
     def _apply_until_2359(self) -> None:
@@ -7290,6 +7825,8 @@ class TimerDialog(P5FluidPanel):
             sp.blockSignals(False)
         self._preset_default_label = "23:59 Reminder"
         self._manual_err.hide()
+        self._start_manual_btn.pulse()
+        self.notify(f"Countdown to 23:59 set ({h:02d}:{m:02d}:{s:02d})", tone="gold", ms=1800)
         self._label_edit.setFocus()
 
     def _add_manual_timer(self) -> None:
@@ -7297,13 +7834,16 @@ class TimerDialog(P5FluidPanel):
             sp.interpretText()
         total = self._h_spin.value() * 3600 + self._m_spin.value() * 60 + self._s_spin.value()
         if total <= 0:
-            self._manual_err.setText("Set at least 1 second before starting a timer.")
+            msg = "Set at least 1 second before starting a timer."
+            self._manual_err.setText(msg)
             self._manual_err.show()
+            self.nudge_input(self._m_spin, msg, tone="warn")
             return
         self._manual_err.hide()
         label = self._label_edit.text().strip() or self._preset_default_label
         self._preset_default_label = ""
         self._label_edit.clear()
+        self.notify(f"Started timer: {label or _fmt_hms(total)} ({_fmt_hms(total)})", tone="ok")
         self.manual_add_requested.emit(total, label)
 
     def update_focus(self, running: bool, phase: str, remaining_s: int,
@@ -7409,7 +7949,7 @@ class TimerDialog(P5FluidPanel):
 
             cancel = self._btn("CANCEL", variant="danger", display=True, px=9)
             cancel.setFixedHeight(_sc(24, sc, 20))
-            cancel.clicked.connect(lambda _c=False, i=tid: self.manual_cancel_requested.emit(i))
+            cancel.clicked.connect(lambda _c=False, i=tid: self._cancel_manual_timer(i))
             top.addWidget(cancel)
             rl.addLayout(top)
 
@@ -7543,7 +8083,7 @@ class QuickCommandDialog(P5FluidPanel):
         self._clear_btn = self._btn("NEW CHAT", variant="ghost", display=True, px=9)
         self._clear_btn.setFixedHeight(_sc(22, sc, 19))
         self._clear_btn.setToolTip("Clear multi-turn AI chat memory")
-        self._clear_btn.clicked.connect(self.clear_requested.emit)
+        self._clear_btn.clicked.connect(self._on_clear_chat)
         self._clear_btn.setVisible(False)
         top_r.addWidget(self._clear_btn)
 
@@ -7672,9 +8212,14 @@ class QuickCommandDialog(P5FluidPanel):
         self.input_edit.setText(cmd)
         self._submit()
 
+    def _on_clear_chat(self) -> None:
+        self.notify("Started a fresh chat", tone="info", ms=1500)
+        self.clear_requested.emit()
+
     def _submit(self) -> None:
         txt = self.input_edit.text().strip()
         if not txt:
+            self.nudge_input(self.input_edit, "Type a command or message for Morgana first!", tone="warn")
             return
         if not self._history or self._history[-1] != txt:
             self._history.append(txt)
@@ -8027,31 +8572,72 @@ class WrapUpDialog(P5FluidPanel):
     def _on_rollover_clicked(self) -> None:
         chosen = [tid for tid, cb in self._rollover_checks if cb.isChecked()]
         if not chosen:
-            self._rollover_status.setText("Check at least one task to move to tomorrow.")
+            play_ui("cancel")
+            msg = "Check at least one task to move to tomorrow."
+            self._rollover_status.setText(msg)
+            self.notify(msg, tone="warn")
             return
         self.rollover_requested.emit(chosen)
         word = "task" if len(chosen) == 1 else "tasks"
-        self._rollover_status.setText(f"Moved {len(chosen)} {word} to tomorrow!")
+        msg = f"Moved {len(chosen)} {word} to tomorrow!"
+        self._rollover_status.setText(msg)
+        self.notify(msg, tone="ok")
 
     def _on_save_reflection(self) -> None:
         txt = self.reflection_edit.text().strip()
         if not txt:
-            self._ref_status.setText("Type a short reflection first!")
+            msg = "Type a short reflection first!"
+            self._ref_status.setText(msg)
+            self.nudge_input(self.reflection_edit, msg, tone="warn")
             return
         self.reflection_edit.clear()
         self.reflection_saved.emit(txt, self._selected_mood)
-        self._ref_status.setText(f"Saved [{self._selected_mood}] reflection to Journal in Notes!")
+        msg = f"Saved [{self._selected_mood}] reflection to Journal in Notes!"
+        self._ref_status.setText(msg)
+        self.notify(msg, tone="ok")
 
 
 # ---------------------------------------------------------------------------
 # 10. FINANCE LEDGER (bot-wa inspired personal finance window)
 # ---------------------------------------------------------------------------
 class FinanceTxDelegate(QStyledItemDelegate):
-    """Paints Persona 5 finance transaction rows (OUT/IN/TF badge, title, metadata, Rupiah amount)."""
+    """Paints Persona 5 finance transaction rows with color-coded left stripe, inline hover Edit/Delete, and flash."""
+
+    edit_clicked = pyqtSignal(str)
+    delete_clicked = pyqtSignal(str)
 
     def __init__(self, parent: QWidget | None = None, scale: float = 1.0) -> None:
         super().__init__(parent)
         self._scale = scale
+        self._flashes: dict[str, float] = {}
+        self._ticker = FrameTicker(self._frame, self)
+
+    def flash_item(self, tx_id: str) -> None:
+        if not tx_id:
+            return
+        self._flashes[tx_id] = 1.0
+        self._ticker.start()
+
+    def _frame(self, dt: float) -> bool:
+        for k in list(self._flashes):
+            nxt = self._flashes[k] - dt * 2.2
+            if nxt <= 0.01:
+                del self._flashes[k]
+            else:
+                self._flashes[k] = nxt
+        view = self.parent()
+        if view is not None and hasattr(view, "viewport"):
+            view.viewport().update()
+        return bool(self._flashes)
+
+    def _action_rects(self, r: QRectF) -> tuple[QRectF, QRectF]:
+        sc = self._scale
+        sz = float(_sc(24, sc, 20))
+        gap = float(_sc(4, sc, 3))
+        y = r.center().y() - sz / 2.0
+        del_r = QRectF(r.right() - sz - _sc(7, sc, 5), y, sz, sz)
+        edit_r = QRectF(del_r.left() - gap - sz, y, sz, sz)
+        return edit_r, del_r
 
     def sizeHint(self, option, index) -> QSize:
         if index.data(ROLE_ID) is None:
@@ -8064,8 +8650,9 @@ class FinanceTxDelegate(QStyledItemDelegate):
         p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
         r = QRectF(option.rect).adjusted(2, 2, -2, -2)
         sc = self._scale
+        tx_id = index.data(ROLE_ID)
 
-        if index.data(ROLE_ID) is None:
+        if tx_id is None:
             p.setPen(P5_MUTED)
             p.setFont(ui_font(_sc(13, sc, 10), bold=False))
             p.drawText(r.adjusted(12, 0, -12, 0),
@@ -8082,6 +8669,7 @@ class FinanceTxDelegate(QStyledItemDelegate):
         amt_txt = index.data(ROLE_BADGE) or "Rp 0"
         meta_txt = index.data(ROLE_DATE) or ""
         title = index.data(Qt.ItemDataRole.DisplayRole) or ""
+        fl = self._flashes.get(tx_id, 0.0)
 
         if tx_type == "income":
             tag, tag_bg, tag_fg, amt_fg, stripe_col = "IN", P5_MINT_BG, P5_MINT_FG, P5_MINT_FG, P5_MINT_FG
@@ -8091,16 +8679,31 @@ class FinanceTxDelegate(QStyledItemDelegate):
             tag, tag_bg, tag_fg, amt_fg, stripe_col = "OUT", P5_RED_BG, P5_RED_FG, P5_RED_FG, RED
 
         grad = QLinearGradient(r.topLeft(), r.bottomLeft())
-        grad.setColorAt(0.0, bg.lighter(108))
+        grad.setColorAt(0.0, bg.lighter(112 if hov else 108))
         grad.setColorAt(1.0, bg)
-        p.setPen(QPen(bd, 1.3 if sel else 1.0))
+        if fl > 0.01:
+            bd = lerp_color(bd, stripe_col, fl)
+        p.setPen(QPen(bd, 1.5 if (sel or fl > 0.05) else 1.0))
         p.setBrush(grad)
         p.drawRoundedRect(r, 7.0, 7.0)
+
+        # Brief Persona 5 flash sweep for newly added / edited rows
+        if fl > 0.01:
+            p.save()
+            clip = QPainterPath()
+            clip.addRoundedRect(r, 7.0, 7.0)
+            p.setClipPath(clip)
+            fc = QColor(stripe_col)
+            fc.setAlpha(int(85 * fl))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(fc)
+            p.drawRect(r)
+            p.restore()
 
         # Crisp color-coded left accent bar (Mint IN / Gold TF / Crimson OUT)
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(WHITE if sel else stripe_col)
-        p.drawRoundedRect(QRectF(r.left() + 0.5, r.top() + 5.0, 3.0, r.height() - 10.0), 1.5, 1.5)
+        p.drawRoundedRect(QRectF(r.left() + 0.5, r.top() + 5.0, 3.2 if hov else 3.0, r.height() - 10.0), 1.5, 1.5)
 
         pill_w = _sc(38, sc, 30)
         pill_h = _sc(22, sc, 18)
@@ -8112,11 +8715,27 @@ class FinanceTxDelegate(QStyledItemDelegate):
         p.setPen(tag_fg)
         p.drawText(pill, Qt.AlignmentFlag.AlignCenter.value, tag)
 
+        # Inline quick-action Edit & Delete buttons appear crisply on hover
+        show_actions = hov and not bool(index.data(ROLE_FLAG))
+        right_edge = r.right() - _sc(8, sc, 6)
+        if show_actions:
+            edit_r, del_r = self._action_rects(r)
+            p.setPen(QPen(QColor("#6C5514"), 1.1))
+            p.setBrush(P5_GOLD_BG)
+            p.drawRoundedRect(edit_r, 5.0, 5.0)
+            _draw_icon(p, "edit", edit_r.adjusted(2, 2, -2, -2), P5_GOLD_FG)
+
+            p.setPen(QPen(QColor("#731823"), 1.1))
+            p.setBrush(P5_RED_BG)
+            p.drawRoundedRect(del_r, 5.0, 5.0)
+            _draw_icon(p, "trash", del_r.adjusted(2, 2, -2, -2), P5_RED_FG)
+            right_edge = edit_r.left() - _sc(8, sc, 6)
+
         # Right-aligned Rupiah amount
         af = p5_font(_sc(13, sc, 10), italic=False)
         p.setFont(af)
-        amt_w = min(_sc(125, sc, 94), max(_sc(76, sc, 62), QFontMetrics(af).horizontalAdvance(amt_txt) + _sc(10, sc, 6)))
-        amt_rect = QRectF(r.right() - amt_w - _sc(8, sc, 6), r.top(), amt_w, r.height())
+        amt_w = min(_sc(125, sc, 94), max(_sc(74, sc, 60), QFontMetrics(af).horizontalAdvance(amt_txt) + _sc(8, sc, 6)))
+        amt_rect = QRectF(right_edge - amt_w, r.top(), amt_w, r.height())
         p.setPen(amt_fg)
         p.drawText(amt_rect, Qt.AlignmentFlag.AlignVCenter.value | Qt.AlignmentFlag.AlignRight.value, amt_txt)
 
@@ -8137,6 +8756,24 @@ class FinanceTxDelegate(QStyledItemDelegate):
         p.drawText(QRectF(tx, r.top() + _sc(25, sc, 20), tw, _sc(18, sc, 14)),
                    Qt.AlignmentFlag.AlignVCenter.value | Qt.AlignmentFlag.AlignLeft.value, el_meta)
         p.restore()
+
+    def editorEvent(self, event, model, option, index) -> bool:
+        tx_id = index.data(ROLE_ID)
+        if not tx_id or bool(index.data(ROLE_FLAG)):
+            return False
+        if event.type() == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
+            r = QRectF(option.rect).adjusted(2, 2, -2, -2)
+            edit_r, del_r = self._action_rects(r)
+            pos = event.position()
+            if edit_r.adjusted(-2, -2, 2, 2).contains(pos):
+                play_ui("select")
+                self.edit_clicked.emit(tx_id)
+                return True
+            if del_r.adjusted(-2, -2, 2, 2).contains(pos):
+                play_ui("cancel")
+                self.delete_clicked.emit(tx_id)
+                return True
+        return super().editorEvent(event, model, option, index)
 
 
 class FinanceDialog(P5FluidPanel):
@@ -8185,6 +8822,8 @@ class FinanceDialog(P5FluidPanel):
         self._sheet_cache: dict[tuple[int, int], FinanceSheetMonthData] = {}
         self._sheet_tx_by_id: dict[str, dict] = {}
         self._sheet_error = ""
+        self._sheet_silent_refresh = False
+        self._active_shortcut_name = ""
         self._budget_inputs: dict[str, QLineEdit] = {}
         self._budget_bars: dict[str, tuple[QLabel, QLabel, QProgressBar]] = {}
         self._wallet_rows: dict[str, tuple[QLabel, QProgressBar]] = {}
@@ -8234,45 +8873,32 @@ class FinanceDialog(P5FluidPanel):
         self.header_bar.addWidget(set_btn)
         self._add_close_button()
 
-        # -- Top KPI Summary Strip (Total Balance, Income, Expense, Today) ---
+        # -- Top Interactive KPI Summary Strip (clickable filters + update pulse) ---
         kpi_row = QHBoxLayout()
         kpi_row.setSpacing(_sc(8, sc, 6))
 
-        def _kpi_card(title: str, accent: str, border_col: str, tint_col: str) -> tuple[QFrame, QLabel, QLabel]:
-            card = _make_card("subcard")
-            card.setStyleSheet(
-                f"QFrame#subcard {{ "
-                f"background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 {tint_col}, stop:0.65 #171722, stop:1 #13131C); "
-                f"border: 1px solid #303042; border-left: 3.5px solid {border_col}; border-radius: 8px; }}"
-            )
-            cl = QVBoxLayout(card)
-            cl.setContentsMargins(_sc(11, sc, 8), _sc(6, sc, 4), _sc(10, sc, 7), _sc(6, sc, 4))
-            cl.setSpacing(_sc(2, sc, 1))
-            t_lbl = QLabel(title)
-            t_lbl.setStyleSheet(
-                f'color: #A6ABC0; font-family: "Barlow Condensed", sans-serif; '
-                f'font-size: {_sc(10, sc, 8)}px; font-weight: 800; letter-spacing: 0.7px; background: transparent;'
-            )
-            val_lbl = QLabel("Rp 0")
-            val_lbl.setStyleSheet(
-                f'color: {accent}; font-family: "Barlow Condensed", "Anton", sans-serif; '
-                f'font-size: {_sc(18, sc, 14)}px; font-weight: 900; background: transparent;'
-            )
-            sub_lbl = QLabel("")
-            sub_lbl.setStyleSheet(f'color: #9A9FA8; font-size: {_sc(10, sc, 8)}px; background: transparent;')
-            cl.addWidget(t_lbl)
-            cl.addWidget(val_lbl)
-            cl.addWidget(sub_lbl)
-            return card, val_lbl, sub_lbl
+        self._kpi_bal_card = _P5KpiCard("TOTAL BALANCE", "#FFE46B", "#FAD02C", "#241E0F", "WALLETS ▸", scale=sc)
+        self._kpi_inc_card = _P5KpiCard("MONTH INCOME", "#5CE09A", "#5CE09A", "#11241C", "FILTER IN ▸", scale=sc)
+        self._kpi_exp_card = _P5KpiCard("MONTH EXPENSE", "#FF5C6C", "#E60012", "#281116", "FILTER OUT ▸", scale=sc)
+        self._kpi_tod_card = _P5KpiCard("TODAY SPEND", "#FFFFFF", "#D8D8EC", "#1F1F2E", "TODAY ▸", scale=sc)
+        self._kpi_bal_val, self._kpi_bal_sub = self._kpi_bal_card.val_lbl, self._kpi_bal_card.sub_lbl
+        self._kpi_inc_val, self._kpi_inc_sub = self._kpi_inc_card.val_lbl, self._kpi_inc_card.sub_lbl
+        self._kpi_exp_val, self._kpi_exp_sub = self._kpi_exp_card.val_lbl, self._kpi_exp_card.sub_lbl
+        self._kpi_tod_val, self._kpi_tod_sub = self._kpi_tod_card.val_lbl, self._kpi_tod_card.sub_lbl
 
-        c_bal, self._kpi_bal_val, self._kpi_bal_sub = _kpi_card("TOTAL BALANCE", "#FFE46B", "#FAD02C", "#241E0F")
-        c_inc, self._kpi_inc_val, self._kpi_inc_sub = _kpi_card("MONTH INCOME", "#5CE09A", "#5CE09A", "#11241C")
-        c_exp, self._kpi_exp_val, self._kpi_exp_sub = _kpi_card("MONTH EXPENSE", "#FF5C6C", "#E60012", "#281116")
-        c_tod, self._kpi_tod_val, self._kpi_tod_sub = _kpi_card("TODAY SPEND", "#FFFFFF", "#D8D8EC", "#1F1F2E")
-        kpi_row.addWidget(c_bal, 3)
-        kpi_row.addWidget(c_inc, 2)
-        kpi_row.addWidget(c_exp, 2)
-        kpi_row.addWidget(c_tod, 2)
+        self._kpi_bal_card.setToolTip("Click to view Wallet Balances & Monthly Budgets")
+        self._kpi_inc_card.setToolTip("Click to filter Income transactions")
+        self._kpi_exp_card.setToolTip("Click to filter Expense transactions")
+        self._kpi_tod_card.setToolTip("Click to filter Today's transactions")
+        self._kpi_bal_card.clicked.connect(lambda: self._on_kpi_clicked("bal"))
+        self._kpi_inc_card.clicked.connect(lambda: self._on_kpi_clicked("inc"))
+        self._kpi_exp_card.clicked.connect(lambda: self._on_kpi_clicked("exp"))
+        self._kpi_tod_card.clicked.connect(lambda: self._on_kpi_clicked("tod"))
+
+        kpi_row.addWidget(self._kpi_bal_card, 3)
+        kpi_row.addWidget(self._kpi_inc_card, 2)
+        kpi_row.addWidget(self._kpi_exp_card, 2)
+        kpi_row.addWidget(self._kpi_tod_card, 2)
         self.body.addLayout(kpi_row)
 
         # -- Segmented Tab Bar: TRANSACTIONS | BUDGETS & BILLS ---------------
@@ -8318,7 +8944,7 @@ class FinanceDialog(P5FluidPanel):
         fh.addWidget(self._amt_preview_lbl)
         fl.addLayout(fh)
 
-        # Transaction type pills (EXPENSE / INCOME / TRANSFER)
+        # Semantic color-coded Transaction type pills (EXPENSE=Red / INCOME=Mint / TRANSFER=Gold)
         type_row = QHBoxLayout()
         type_row.setSpacing(_sc(5, sc, 4))
         self._type_btns: dict[str, P5FluidButton] = {}
@@ -8365,6 +8991,22 @@ class FinanceDialog(P5FluidPanel):
         amt_row.addWidget(self._date_edit, 2)
         fl.addLayout(amt_row)
 
+        # 1-Click Quick-Amount Accumulator Chips (+5rb .. +100rb & CLR)
+        qamt_row = QHBoxLayout()
+        qamt_row.setSpacing(_sc(4, sc, 3))
+        for q_lbl, q_val in (("+5rb", 5_000), ("+10rb", 10_000), ("+20rb", 20_000), ("+50rb", 50_000), ("+100rb", 100_000)):
+            qb = self._btn(q_lbl, variant="soft", display=True, px=9)
+            qb.setFixedHeight(_sc(21, sc, 18))
+            qb.setToolTip(f"Add {format_rupiah(q_val)} to amount")
+            qb.clicked.connect(lambda _c=False, v=q_val: self._bump_amount(v))
+            qamt_row.addWidget(qb, 1)
+        clr_amt = self._btn("CLR", variant="ghost", display=True, px=9, sfx_click="cancel")
+        clr_amt.setFixedHeight(_sc(21, sc, 18))
+        clr_amt.setToolTip("Clear amount")
+        clr_amt.clicked.connect(self._clear_amount)
+        qamt_row.addWidget(clr_amt)
+        fl.addLayout(qamt_row)
+
         # Description / Source input
         self._title_input = QLineEdit()
         self._title_input.setPlaceholderText("Item or note (e.g. Kopi susu, Galon)")
@@ -8396,7 +9038,7 @@ class FinanceDialog(P5FluidPanel):
         cat_vl.addLayout(cat_grid)
         fl.addWidget(self._cat_wrap)
 
-        # Source / Active Wallet chips
+        # Source / Active Wallet chips (show live compact balance!)
         self._wallet_hdr = QLabel("WALLET (QRIS = BNI / MANDIRI)")
         self._wallet_hdr.setStyleSheet(
             f'color: #A0A5B5; font-family: "Barlow Condensed", sans-serif; '
@@ -8407,8 +9049,8 @@ class FinanceDialog(P5FluidPanel):
         w_row.setSpacing(_sc(5, sc, 4))
         self._wallet_btns: dict[str, P5FluidButton] = {}
         for w in FINANCE_WALLETS:
-            wb = self._btn(w.upper(), variant="soft", display=True, px=10)
-            wb.setFixedHeight(_sc(25, sc, 22))
+            wb = self._btn(w.upper(), variant="soft", display=True, px=9)
+            wb.setFixedHeight(_sc(26, sc, 22))
             wb.clicked.connect(lambda _c=False, wk=w: self._select_wallet(wk))
             self._wallet_btns[w] = wb
             w_row.addWidget(wb, 1)
@@ -8429,8 +9071,8 @@ class FinanceDialog(P5FluidPanel):
         tw_row.setSpacing(_sc(5, sc, 4))
         self._to_wallet_btns: dict[str, P5FluidButton] = {}
         for w in FINANCE_WALLETS:
-            twb = self._btn(w.upper(), variant="soft", display=True, px=10)
-            twb.setFixedHeight(_sc(25, sc, 22))
+            twb = self._btn(w.upper(), variant="soft", display=True, px=9)
+            twb.setFixedHeight(_sc(26, sc, 22))
             twb.clicked.connect(lambda _c=False, wk=w: self._select_to_wallet(wk))
             self._to_wallet_btns[w] = twb
             tw_row.addWidget(twb, 1)
@@ -8441,12 +9083,12 @@ class FinanceDialog(P5FluidPanel):
         cta_row = QHBoxLayout()
         cta_row.setSpacing(_sc(6, sc, 4))
         self._submit_btn = self._btn("RECORD EXPENSE", variant="primary", icon="plus", display=True, px=11)
-        self._submit_btn.setFixedHeight(_sc(32, sc, 26))
+        self._submit_btn.setFixedHeight(_sc(33, sc, 27))
         self._submit_btn.clicked.connect(self._submit_transaction)
         cta_row.addWidget(self._submit_btn, 1)
 
-        self._cancel_edit_btn = self._btn("CANCEL", variant="soft", display=True, px=10)
-        self._cancel_edit_btn.setFixedHeight(_sc(32, sc, 26))
+        self._cancel_edit_btn = self._btn("CANCEL", variant="soft", display=True, px=10, sfx_click="cancel")
+        self._cancel_edit_btn.setFixedHeight(_sc(33, sc, 27))
         self._cancel_edit_btn.setToolTip("Cancel edit (Esc)")
         self._cancel_edit_btn.clicked.connect(self._cancel_edit)
         self._cancel_edit_btn.hide()
@@ -8462,7 +9104,7 @@ class FinanceDialog(P5FluidPanel):
         left_wrap.addWidget(self._form_card, 1)
         tx_cols.addLayout(left_wrap, 44)
 
-        # Right column: Searchable Transaction History + Undo bar
+        # Right column: Searchable Transaction History + Inline Hover Actions + Undo bar
         right_wrap = QVBoxLayout()
         right_wrap.setSpacing(_sc(6, sc, 4))
 
@@ -8472,17 +9114,28 @@ class FinanceDialog(P5FluidPanel):
         hl.setSpacing(_sc(5, sc, 4))
 
         hh = QHBoxLayout()
+        hh.setSpacing(_sc(6, sc, 4))
         h_lbl = QLabel("TRANSACTIONS")
         h_lbl.setObjectName("section")
         hh.addWidget(h_lbl)
         hh.addStretch(1)
         self._tx_count_lbl = QLabel("")
-        self._tx_count_lbl.setObjectName("tip")
+        self._tx_count_lbl.setStyleSheet(
+            f'color: #C2C6D8; font-family: "Barlow Condensed", sans-serif; '
+            f'font-size: {_sc(12, sc, 9)}px; font-weight: 800;'
+        )
         hh.addWidget(self._tx_count_lbl)
+        self._reset_flt_btn = self._btn("× RESET", variant="gold", display=True, px=9)
+        self._reset_flt_btn.setFixedHeight(_sc(20, sc, 18))
+        self._reset_flt_btn.setToolTip("Clear search & filter")
+        self._reset_flt_btn.clicked.connect(self._reset_filters)
+        self._reset_flt_btn.hide()
+        hh.addWidget(self._reset_flt_btn)
         hl.addLayout(hh)
 
         self._search_input = QLineEdit()
-        self._search_input.setPlaceholderText("Search transactions, category, wallet...")
+        self._search_input.setPlaceholderText("Search transactions, category, wallet... (Ctrl+F)")
+        self._search_input.setClearButtonEnabled(True)
         self._search_input.textChanged.connect(lambda _t: self._refresh_tx_list())
         hl.addWidget(self._search_input)
 
@@ -8508,26 +9161,32 @@ class FinanceDialog(P5FluidPanel):
         self._tx_list = _KeyAwareList()
         self._tx_list.setMouseTracking(True)
         self._tx_list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
-        self._tx_list.setItemDelegate(FinanceTxDelegate(self._tx_list, scale=sc))
+        self._tx_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._tx_list.customContextMenuRequested.connect(self._open_tx_context_menu)
+        self._tx_delegate = FinanceTxDelegate(self._tx_list, scale=sc)
+        self._tx_delegate.edit_clicked.connect(self._start_edit_by_id)
+        self._tx_delegate.delete_clicked.connect(self._delete_tx_by_id)
+        self._tx_list.setItemDelegate(self._tx_delegate)
+        self._tx_list.itemSelectionChanged.connect(self._sync_tx_selection_ui)
         self._tx_list.delete_pressed.connect(self._delete_selected_tx)
         self._tx_list.itemDoubleClicked.connect(lambda _it: self._start_edit_selected_tx())
         hl.addWidget(self._tx_list, 1)
 
         h_foot = QHBoxLayout()
         h_foot.setSpacing(_sc(6, sc, 4))
-        tip = QLabel("Double-click to edit · Shorthand: 15rb, 1.5jt")
-        tip.setObjectName("tip")
-        h_foot.addWidget(tip, 1)
+        self._tx_foot_tip = QLabel("Hover a row to edit/delete · Right-click for more")
+        self._tx_foot_tip.setObjectName("tip")
+        h_foot.addWidget(self._tx_foot_tip, 1)
 
-        edit_btn = self._btn("EDIT", variant="gold", display=True, px=10)
-        edit_btn.setFixedHeight(_sc(26, sc, 22))
-        edit_btn.clicked.connect(self._start_edit_selected_tx)
-        h_foot.addWidget(edit_btn)
+        self._edit_tx_btn = self._btn("EDIT", variant="gold", display=True, px=10)
+        self._edit_tx_btn.setFixedHeight(_sc(26, sc, 22))
+        self._edit_tx_btn.clicked.connect(self._start_edit_selected_tx)
+        h_foot.addWidget(self._edit_tx_btn)
 
-        del_btn = self._btn("DELETE", variant="danger", display=True, px=10)
-        del_btn.setFixedHeight(_sc(26, sc, 22))
-        del_btn.clicked.connect(self._delete_selected_tx)
-        h_foot.addWidget(del_btn)
+        self._del_tx_btn = self._btn("DELETE", variant="danger", display=True, px=10)
+        self._del_tx_btn.setFixedHeight(_sc(26, sc, 22))
+        self._del_tx_btn.clicked.connect(self._delete_selected_tx)
+        h_foot.addWidget(self._del_tx_btn)
         hl.addLayout(h_foot)
 
         right_wrap.addWidget(hist_card, 1)
@@ -8605,7 +9264,7 @@ class FinanceDialog(P5FluidPanel):
             set_b.clicked.connect(lambda _c=False, c=cat: self._save_budget(c))
             edit_row.addWidget(set_b)
 
-            clr_b = self._btn("×", variant="soft", display=True, px=10)
+            clr_b = self._btn("×", variant="soft", display=True, px=10, sfx_click="cancel")
             clr_b.setFixedSize(_sc(25, sc, 22), _sc(25, sc, 22))
             clr_b.setToolTip(f"Clear {cat} budget limit")
             clr_b.clicked.connect(lambda _c=False, c=cat: self._clear_budget(c))
@@ -8673,9 +9332,11 @@ class FinanceDialog(P5FluidPanel):
         b_add1.setSpacing(_sc(5, sc, 3))
         self._bill_name_in = QLineEdit()
         self._bill_name_in.setPlaceholderText("Bill name (e.g. Kos, Wi-Fi)")
+        self._bill_name_in.returnPressed.connect(self._add_bill)
         b_add1.addWidget(self._bill_name_in, 2)
         self._bill_amt_in = QLineEdit()
         self._bill_amt_in.setPlaceholderText("Amount (e.g. 500rb)")
+        self._bill_amt_in.returnPressed.connect(self._add_bill)
         b_add1.addWidget(self._bill_amt_in, 1)
         bill_l.addLayout(b_add1)
 
@@ -8691,13 +9352,13 @@ class FinanceDialog(P5FluidPanel):
         self._bill_day_spin.setFixedHeight(_sc(26, sc, 24))
         b_add2.addWidget(self._bill_day_spin)
 
-        self._bill_cat_cb = QComboBox()
+        self._bill_cat_cb = P5ComboBox()
         self._bill_cat_cb.addItems(list(FINANCE_CATEGORIES))
         self._bill_cat_cb.setCurrentText("Mingguan&Bulanan")
         self._bill_cat_cb.setFixedHeight(_sc(26, sc, 24))
         b_add2.addWidget(self._bill_cat_cb, 1)
 
-        self._bill_wal_cb = QComboBox()
+        self._bill_wal_cb = P5ComboBox()
         self._bill_wal_cb.addItems(list(FINANCE_WALLETS))
         self._bill_wal_cb.setCurrentText("BNI")
         self._bill_wal_cb.setFixedHeight(_sc(26, sc, 24))
@@ -8727,12 +9388,14 @@ class FinanceDialog(P5FluidPanel):
         sc_add.setSpacing(_sc(5, sc, 3))
         self._sc_name_in = QLineEdit()
         self._sc_name_in.setPlaceholderText("Name (e.g. Parkir)")
+        self._sc_name_in.returnPressed.connect(self._add_shortcut)
         sc_add.addWidget(self._sc_name_in, 2)
         self._sc_amt_in = QLineEdit()
         self._sc_amt_in.setPlaceholderText("Price (opt.)")
         self._sc_amt_in.setFixedWidth(_sc(92, sc, 74))
+        self._sc_amt_in.returnPressed.connect(self._add_shortcut)
         sc_add.addWidget(self._sc_amt_in)
-        self._sc_cat_cb = QComboBox()
+        self._sc_cat_cb = P5ComboBox()
         self._sc_cat_cb.addItems(list(FINANCE_CATEGORIES))
         self._sc_cat_cb.setFixedHeight(_sc(26, sc, 24))
         sc_add.addWidget(self._sc_cat_cb, 1)
@@ -8752,6 +9415,7 @@ class FinanceDialog(P5FluidPanel):
         self._plan_page.setWidget(plan_body)
         self.body.addWidget(self._plan_page, 1)
 
+        QShortcut(QKeySequence("Ctrl+F"), self).activated.connect(self._focus_search)
         QShortcut(QKeySequence("Ctrl+,"), self).activated.connect(lambda: self.open_settings.emit())
         self._select_tx_type("expense")
         self._select_category("Jajan")
@@ -8807,12 +9471,15 @@ class FinanceDialog(P5FluidPanel):
         if not self._sheet_mode:
             return
         self._sheet_error = ""
+        self._sheet_silent_refresh = bool(silent)
         if silent and self._sheet_data is not None:
             # Keep current numbers & form fully usable during background sync!
             self._sheet_action_btn.setEnabled(False)
             self._sheet_badge.setText("SYNCING...")
         else:
             self.set_sheet_busy(True)
+            if self.isVisible():
+                self.notify(f"Syncing '{month_tab_name(self._view_month)}' from Sheets...", tone="info", ms=1500)
         self.sheet_refresh_requested.emit(self._view_year, self._view_month)
 
     def apply_sheet_month(self, data: FinanceSheetMonthData) -> None:
@@ -8822,6 +9489,8 @@ class FinanceDialog(P5FluidPanel):
             return
         if (data.year, data.month) != (self._view_year, self._view_month):
             return
+        was_silent = self._sheet_silent_refresh
+        self._sheet_silent_refresh = False
         self._sheet_busy = False
         self._submit_btn.setEnabled(True)
         self._sheet_action_btn.setEnabled(True)
@@ -8829,6 +9498,9 @@ class FinanceDialog(P5FluidPanel):
             self._sheet_data = data
             self._sheet_error = ""
             self._sheet_tx_by_id = {t["id"]: t for t in data.transactions}
+            if not was_silent and self.isVisible():
+                self._pulse_kpis("bal", "inc", "exp", "tod")
+                self.notify(f"Synced '{data.tab}' · {len(data.transactions)} entries", tone="ok")
         else:
             # Keep cached data visible if transient network hiccup; only clear if no cache for this month
             cached = self._sheet_cache.get((self._view_year, self._view_month))
@@ -8836,6 +9508,8 @@ class FinanceDialog(P5FluidPanel):
             self._sheet_tx_by_id = {t["id"]: t for t in cached.transactions} if cached else {}
             self._sheet_error = data.error or "Failed to load Google Sheets."
             self._form_status.setText(self._sheet_error)
+            if self.isVisible():
+                self.notify(self._sheet_error[:72], tone="err", ms=3200)
         self._update_sheet_badge()
         self.refresh()
 
@@ -8852,15 +9526,18 @@ class FinanceDialog(P5FluidPanel):
         self._sheet_action_btn.setEnabled(True)
         self._update_sheet_badge()
         if not ok:
+            err_msg = message or ("Google Sheets bill write failed." if action == "bill" else "Google Sheets write failed.")
             if action == "bill":
-                self._plan_status.setText(message or "Google Sheets bill write failed.")
+                self._plan_status.setText(err_msg)
             else:
-                self._form_status.setText(message or "Google Sheets write failed.")
+                self._form_status.setText(err_msg)
+            self.notify(err_msg[:76], tone="err", ms=3200)
             return
         if action in ("add", "edit", "bill", "undo"):
             play_ui("select")
         elif action == "delete":
             play_ui("close")
+        self._active_shortcut_name = ""
         if action == "edit":
             self._cancel_edit()
             self._form_status.setText(message)
@@ -8868,10 +9545,13 @@ class FinanceDialog(P5FluidPanel):
             self._amt_input.clear()
             self._title_input.clear()
             self._form_status.setText(message)
+            self._update_submit_cta()
         elif action == "bill":
             self._plan_status.setText(message)
         else:
             self._form_status.setText(message)
+        self._pulse_kpis("bal", "inc", "exp", "tod")
+        self.notify(message or "Synced to Google Sheets!", tone="gold" if action == "edit" else "ok")
         if undo_kind and undo_payload:
             self._undo_kind = undo_kind
             self._undo_payload = undo_payload
@@ -8880,6 +9560,7 @@ class FinanceDialog(P5FluidPanel):
     def _on_sheet_action_clicked(self) -> None:
         if not self._sheet_mode:
             if self._sheet_creds_ready:
+                self.notify("Switching to live Google Sheets sync...", tone="info", ms=1800)
                 self.sheet_connect_requested.emit()
             else:
                 self.open_settings.emit()
@@ -8945,7 +9626,88 @@ class FinanceDialog(P5FluidPanel):
             self._sheet_action_btn.setToolTip(f"Refresh '{tab_name}' from Google Sheets{sync_note}")
             self._sheet_action_btn.setEnabled(True)
 
-    # -- Navigation & Tab Switching ------------------------------------------
+    # -- Navigation, KPIs & Tab Switching ------------------------------------
+    @staticmethod
+    def _short_rp(v: int) -> str:
+        sign = "-" if v < 0 else ""
+        a = abs(int(v))
+        if a >= 1_000_000:
+            fmt = f"{a / 1_000_000:.1f}" if a >= 10_000_000 else f"{a / 1_000_000:.2f}"
+            s = fmt.rstrip("0").rstrip(".")
+            return f"{sign}{s}jt"
+        if a >= 1_000:
+            return f"{sign}{a / 1_000:.0f}rb"
+        return f"{sign}{a}"
+
+    def _pulse_kpis(self, *which: str) -> None:
+        cards = {
+            "bal": self._kpi_bal_card,
+            "inc": self._kpi_inc_card,
+            "exp": self._kpi_exp_card,
+            "tod": self._kpi_tod_card,
+        }
+        for key in which:
+            card = cards.get(key)
+            if card is not None:
+                card.pulse()
+
+    def _sync_kpi_active_states(self) -> None:
+        on_tx = self._active_tab == "tx"
+        self._kpi_bal_card.set_active(self._active_tab == "plan")
+        self._kpi_inc_card.set_active(on_tx and self._tx_filter == "income")
+        self._kpi_exp_card.set_active(on_tx and self._tx_filter == "expense")
+        self._kpi_tod_card.set_active(on_tx and self._tx_filter == "today")
+
+    def _on_kpi_clicked(self, which: str) -> None:
+        if which == "bal":
+            nxt = "tx" if self._active_tab == "plan" else "plan"
+            self._set_tab(nxt)
+            self.notify(
+                "Viewing Wallet Balances & Monthly Budgets" if nxt == "plan" else "Back to Transactions",
+                tone="gold" if nxt == "plan" else "info",
+                ms=1800,
+            )
+            return
+
+        if self._active_tab != "tx":
+            self._set_tab("tx")
+
+        if which == "tod":
+            today = date.today()
+            if (self._view_year, self._view_month) != (today.year, today.month):
+                self._activate_month_view(today.year, today.month)
+            nxt_flt = "all" if self._tx_filter == "today" else "today"
+            self._set_filter(nxt_flt)
+            self.notify(
+                "Filtering: Today's transactions" if nxt_flt == "today" else "Filter cleared: All entries",
+                tone="info",
+                ms=1800,
+            )
+            return
+
+        target = "income" if which == "inc" else "expense"
+        nxt_flt = "all" if self._tx_filter == target else target
+        self._set_filter(nxt_flt)
+        label = "Income" if target == "income" else "Expense"
+        self.notify(
+            f"Filtering: {label} entries" if nxt_flt == target else "Filter cleared: All entries",
+            tone="ok" if nxt_flt == "income" else "info",
+            ms=1800,
+        )
+
+    def _focus_search(self) -> None:
+        if self._active_tab != "tx":
+            self._set_tab("tx")
+        self._search_input.setFocus()
+        self._search_input.selectAll()
+
+    def _reset_filters(self) -> None:
+        self._search_input.blockSignals(True)
+        self._search_input.clear()
+        self._search_input.blockSignals(False)
+        self._set_filter("all")
+        self.notify("Search & filters cleared", tone="info", ms=1500)
+
     def on_shown(self) -> None:
         self._update_sheet_badge()
         self.refresh()
@@ -8955,12 +9717,15 @@ class FinanceDialog(P5FluidPanel):
             QTimer.singleShot(20, self._amt_input.setFocus)
 
     def on_closing(self) -> None:
+        self._tx_delegate._ticker.stop()
+        self._tx_delegate._flashes.clear()
         if self._editing_tx_id is not None:
             self._cancel_edit()
 
     def keyPressEvent(self, e) -> None:
         if e.key() == Qt.Key.Key_Escape and self._editing_tx_id is not None:
             self._cancel_edit()
+            self.notify("Edit discarded", tone="info", ms=1500)
             e.accept()
             return
         super().keyPressEvent(e)
@@ -8971,6 +9736,7 @@ class FinanceDialog(P5FluidPanel):
         self._plan_page.setVisible(tab == "plan")
         self._tab_tx_btn.set_active(tab == "tx")
         self._tab_plan_btn.set_active(tab == "plan")
+        self._sync_kpi_active_states()
 
     def _activate_month_view(self, year: int, month: int) -> None:
         self._view_year, self._view_month = int(year), int(month)
@@ -8994,16 +9760,45 @@ class FinanceDialog(P5FluidPanel):
             m = 1
             y += 1
         self._activate_month_view(y, m)
+        self._pulse_kpis("bal", "inc", "exp")
 
     def _jump_this_month(self) -> None:
         today = date.today()
+        changed = (self._view_year, self._view_month) != (today.year, today.month)
         self._activate_month_view(today.year, today.month)
+        if changed:
+            self.notify(f"Jumped to {self._MONTH_NAMES[today.month - 1]} {today.year}", tone="gold", ms=1600)
+            self._pulse_kpis("bal", "inc", "exp", "tod")
 
     # -- Form Controls -------------------------------------------------------
+    def _bump_amount(self, delta: int) -> None:
+        cur = parse_rupiah(self._amt_input.text()) or 0
+        nxt = cur + int(delta)
+        self._amt_input.setText(str(nxt))
+        self._amt_input.setFocus()
+        self._amt_input.setCursorPosition(len(self._amt_input.text()))
+        self._submit_btn.pulse()
+
+    def _clear_amount(self) -> None:
+        self._amt_input.clear()
+        self._amt_input.setFocus()
+
+    def _update_submit_cta(self) -> None:
+        amt = parse_rupiah(self._amt_input.text())
+        if self._editing_tx_id is not None:
+            base = "SAVE EDIT"
+            variant = "gold"
+        else:
+            base = {"expense": "RECORD EXPENSE", "income": "RECORD INCOME", "transfer": "RECORD TRANSFER"}[self._tx_type]
+            variant = {"expense": "primary", "income": "mint", "transfer": "gold"}[self._tx_type]
+        self._submit_btn.set_variant(variant)
+        self._submit_btn.setText(f"{base} · {format_rupiah(amt)}" if amt else base)
+
     def _select_tx_type(self, kind: str) -> None:
         self._tx_type = kind
+        mode_var = {"expense": "primary", "income": "mint", "transfer": "gold"}
         for k, btn in self._type_btns.items():
-            btn.set_active(k == kind)
+            btn.set_active(k == kind, mode_var[k])
         is_exp = kind == "expense"
         is_tf = kind == "transfer"
         self._sc_wrap.setVisible(is_exp and bool(self.store.shortcuts()))
@@ -9022,8 +9817,15 @@ class FinanceDialog(P5FluidPanel):
             self._wallet_hdr.setText("WALLET (QRIS = BNI / MANDIRI)")
             self._title_input.setPlaceholderText("Item or note (e.g. Kopi susu, Galon)")
         if self._editing_tx_id is None:
-            labels = {"expense": "RECORD EXPENSE", "income": "RECORD INCOME", "transfer": "RECORD TRANSFER"}
-            self._submit_btn.setText(labels[kind])
+            if kind == "expense":
+                self._form_card.setStyleSheet("")
+            else:
+                accent = "#2B684E" if kind == "income" else "#7A6118"
+                self._form_card.setStyleSheet(
+                    "QFrame#card { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #171722, stop:1 #111118); "
+                    f"border: 1.3px solid {accent}; border-radius: 9px; }}"
+                )
+        self._update_submit_cta()
 
     def _select_category(self, cat: str) -> None:
         self._selected_cat = cat
@@ -9041,12 +9843,13 @@ class FinanceDialog(P5FluidPanel):
     def _select_to_wallet(self, wallet: str) -> None:
         self._selected_to_wallet = wallet
         for w, btn in self._to_wallet_btns.items():
-            btn.set_active(w == wallet)
+            btn.set_active(w == wallet, "gold")
 
     def _update_amount_preview(self, text: str) -> None:
         raw = text.strip()
         if not raw:
             self._amt_preview_lbl.setText("")
+            self._update_submit_cta()
             return
         amt = parse_rupiah(raw)
         if amt is None:
@@ -9061,38 +9864,52 @@ class FinanceDialog(P5FluidPanel):
                 f'font-size: {_sc(12, self._ui_scale, 10)}px; font-weight: 800;'
             )
             self._amt_preview_lbl.setText(f"= {format_rupiah(amt)}")
+        self._update_submit_cta()
 
     def _apply_shortcut(self, sc_entry: dict) -> None:
         if self._editing_tx_id is not None:
             self._cancel_edit()
+        self._active_shortcut_name = sc_entry["name"]
         self._select_tx_type("expense")
         self._select_category(sc_entry["category"])
         self._title_input.setText(sc_entry["name"])
+        self._refresh_shortcut_chips()
         if sc_entry.get("amount"):
             self._amt_input.setText(str(sc_entry["amount"]))
-            self._form_status.setText(f"Shortcut '{sc_entry['name']}' ready — hit Enter or Record!")
+            self._amt_input.setFocus()
+            self._amt_input.selectAll()
+            self._submit_btn.pulse()
+            self._form_status.setText(f"Shortcut '{sc_entry['name']}' ready — press Enter or click Record!")
+            self.notify(f"Loaded '{sc_entry['name']}' · {format_rupiah(sc_entry['amount'])} — press Enter!", tone="gold", ms=2000)
         else:
             self._amt_input.clear()
             self._amt_input.setFocus()
             self._form_status.setText(f"Shortcut '{sc_entry['name']}' selected — type amount!")
+            self.notify(f"Loaded '{sc_entry['name']}' — enter amount", tone="info", ms=1800)
 
     def _set_filter(self, key: str) -> None:
         self._tx_filter = key
         for k, btn in self._filter_btns.items():
             btn.set_active(k == key)
+        self._sync_kpi_active_states()
         self._refresh_tx_list()
 
-    # -- Transaction CRUD + Inline Edit + Undo -------------------------------
+    # -- Transaction CRUD + Inline Edit + Duplicate + Context Menu + Undo ----
     def _submit_transaction(self) -> None:
         if self._sheet_mode and self._sheet_busy:
+            self.notify("Still syncing with Google Sheets...", tone="info", ms=1400)
             return
         amt = parse_rupiah(self._amt_input.text())
         if amt is None:
-            self._form_status.setText("Enter a valid amount (e.g. 15rb, 1.5jt, or 25000).")
-            self._amt_input.setFocus()
+            msg = "Enter a valid amount (e.g. 15rb, 1.5jt, or 25000)."
+            self._form_status.setText(msg)
+            self.nudge_input(self._amt_input, msg, tone="warn")
             return
         if self._tx_type == "transfer" and self._selected_wallet == self._selected_to_wallet:
-            self._form_status.setText("Choose two different wallets for a transfer.")
+            play_ui("cancel")
+            msg = "Choose two different wallets for a transfer."
+            self._form_status.setText(msg)
+            self.notify(msg, tone="warn")
             return
         title = self._title_input.text().strip()
         qd = self._date_edit.date()
@@ -9104,21 +9921,20 @@ class FinanceDialog(P5FluidPanel):
                 allowed = self._selected_wallet if self._selected_wallet in ("BNI", "Mandiri") else None
                 bad = forbidden_bank_word(title, allowed_bank=allowed)
                 if bad:
-                    if allowed:
-                        self._form_status.setText(
-                            f"Cannot include '{bad}' in a {allowed} deposit note (protects Sheet bank formulas)."
-                        )
-                    else:
-                        self._form_status.setText(
-                            f"Cash income note cannot include '{bad}' (Sheets would count it as bank income)."
-                        )
+                    msg = (
+                        f"Cannot include '{bad}' in a {allowed} deposit note (protects Sheet bank formulas)."
+                        if allowed else
+                        f"Cash income note cannot include '{bad}' (Sheets would count it as bank income)."
+                    )
+                    self._form_status.setText(msg)
+                    self.nudge_input(self._title_input, msg, tone="warn")
                     return
             elif self._tx_type == "transfer":
                 bad = forbidden_bank_word(title, allowed_bank=None)
                 if bad:
-                    self._form_status.setText(
-                        f"Transfer note cannot include '{bad}' (protects Sheet bank formulas)."
-                    )
+                    msg = f"Transfer note cannot include '{bad}' (protects Sheet bank formulas)."
+                    self._form_status.setText(msg)
+                    self.nudge_input(self._title_input, msg, tone="warn")
                     return
 
             payload = {
@@ -9133,9 +9949,11 @@ class FinanceDialog(P5FluidPanel):
             self._view_year, self._view_month = qd.year(), qd.month()
             if self._editing_tx_id is not None and self._editing_sheet_tx is not None:
                 self.set_sheet_busy(True, "Updating row in Google Sheets...")
+                self.notify("Updating row in Google Sheets...", tone="info", ms=1500)
                 self.sheet_edit_requested.emit(dict(self._editing_sheet_tx), payload)
             else:
                 self.set_sheet_busy(True, f"Writing to Google Sheets ({month_tab_name(qd.month())})...")
+                self.notify(f"Writing to Sheets ({month_tab_name(qd.month())})...", tone="info", ms=1500)
                 self.sheet_write_requested.emit(payload)
             return
 
@@ -9151,11 +9969,15 @@ class FinanceDialog(P5FluidPanel):
             self._cancel_edit()
             if updated is not None and prev is not None:
                 play_ui("select")
+                self._active_shortcut_name = ""
                 self._undo_kind = "tx_edit"
                 self._undo_payload = prev
                 self._undo.trigger(f"Updated '{updated['title'][:26]}'")
                 self._form_status.setText(f"Saved edit: {updated['title']} ({format_rupiah(updated['amount'])})")
                 self.refresh()
+                self._tx_delegate.flash_item(updated["id"])
+                self._pulse_kpis("bal", "inc", "exp", "tod")
+                self.notify(f"Saved edit: {updated['title']} · {format_rupiah(updated['amount'])}", tone="gold")
                 self.finance_changed.emit("edit", updated)
             return
 
@@ -9167,31 +9989,58 @@ class FinanceDialog(P5FluidPanel):
             day=day_s,
         )
         if tx is None:
+            self.nudge_input(self._amt_input, "Could not save transaction. Check inputs.", tone="err")
             self._form_status.setText("Could not save transaction. Check inputs.")
             return
         play_ui("select")
+        self._active_shortcut_name = ""
         self._amt_input.clear()
         self._title_input.clear()
         self._view_year, self._view_month = qd.year(), qd.month()
         self._form_status.setText(f"Recorded {tx['title']} · {format_rupiah(tx['amount'])}")
         self.refresh()
+        self._tx_delegate.flash_item(tx["id"])
+        if tx["type"] == "income":
+            self._pulse_kpis("bal", "inc")
+            self.notify(f"+{format_rupiah(tx['amount'])} · {tx['title']} ({tx['wallet']})", tone="ok")
+        elif tx["type"] == "transfer":
+            self._pulse_kpis("bal")
+            self.notify(f"Transferred {format_rupiah(tx['amount'])} · {tx['wallet']} → {tx['to_wallet']}", tone="gold")
+        else:
+            self._pulse_kpis("bal", "exp", "tod")
+            self.notify(f"-{format_rupiah(tx['amount'])} · {tx['title']} ({tx['category']})", tone="ok")
+        self._amt_input.setFocus()
         self.finance_changed.emit("add", tx)
 
+    def _select_tx_by_id(self, tx_id: str) -> None:
+        for i in range(self._tx_list.count()):
+            it = self._tx_list.item(i)
+            if it is not None and it.data(ROLE_ID) == tx_id:
+                self._tx_list.setCurrentRow(i)
+                return
+
     def _start_edit_selected_tx(self) -> None:
-        if self._sheet_mode and self._sheet_busy:
-            return
         item = self._tx_list.currentItem()
         if item is None:
+            self.notify("Select a transaction to edit first", tone="info", ms=1800)
             return
         tx_id = item.data(ROLE_ID)
-        if not tx_id:
+        if tx_id:
+            self._start_edit_by_id(str(tx_id))
+
+    def _start_edit_by_id(self, tx_id: str) -> None:
+        if self._sheet_mode and self._sheet_busy:
+            self.notify("Wait for Google Sheets sync to finish", tone="info", ms=1500)
             return
         tx = self._sheet_tx_by_id.get(tx_id) if self._sheet_mode else self.store.get_transaction(tx_id)
         if tx is None:
             return
         if self._sheet_mode and tx.get("sheet_kind") == "qris_pool":
-            self._form_status.setText("QRIS monthly pool rows are updated automatically by QRIS expenses.")
+            msg = "QRIS monthly pool rows update automatically from QRIS expenses."
+            self._form_status.setText(msg)
+            self.notify(msg, tone="info")
             return
+        self._select_tx_by_id(tx_id)
         self._editing_tx_id = tx_id
         self._editing_sheet_tx = dict(tx) if self._sheet_mode else None
         self._select_tx_type(tx["type"])
@@ -9210,12 +10059,35 @@ class FinanceDialog(P5FluidPanel):
         self._form_hdr_lbl.setText("EDIT TRANSACTION")
         self._form_hdr_lbl.setStyleSheet("color: #FAD02C;")
         self._form_card.setStyleSheet(
-            "QFrame#card { background: #141720; border: 1.5px solid #FAD02C; border-radius: 10px; }"
+            "QFrame#card { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #1D1A12, stop:1 #13120F); "
+            "border: 1.5px solid #FAD02C; border-radius: 9px; }"
         )
-        self._submit_btn.setText("SAVE EDIT")
-        self._submit_btn.set_variant("gold")
+        self._update_submit_cta()
+        self._submit_btn.pulse()
         self._cancel_edit_btn.show()
         self._form_status.setText("Editing entry — press Esc or Cancel to discard.")
+        self.notify(f"Editing '{tx['title']}' — press Enter to save or Esc to cancel", tone="gold", ms=2000)
+        self._amt_input.setFocus()
+        self._amt_input.selectAll()
+
+    def _duplicate_tx(self, tx_id: str) -> None:
+        if self._editing_tx_id is not None:
+            self._cancel_edit()
+        tx = self._sheet_tx_by_id.get(tx_id) if self._sheet_mode else self.store.get_transaction(tx_id)
+        if tx is None or tx.get("sheet_kind") == "qris_pool":
+            return
+        self._select_tx_type(tx["type"])
+        if tx["type"] == "expense" and tx.get("category"):
+            self._select_category(tx["category"])
+        self._select_wallet(tx["wallet"] if tx.get("wallet") in FINANCE_WALLETS else "Tunai")
+        if tx["type"] == "transfer" and tx.get("to_wallet") in FINANCE_WALLETS:
+            self._select_to_wallet(tx["to_wallet"])
+        self._amt_input.setText(str(tx["amount"]))
+        self._title_input.setText(str(tx.get("edit_note", tx["title"])))
+        self._date_edit.setDate(QDate.currentDate())
+        self._submit_btn.pulse()
+        self._form_status.setText(f"Duplicated '{tx['title']}' for today — hit Enter to save!")
+        self.notify(f"Duplicated '{tx['title']}' into form — press Enter to save!", tone="gold", ms=2200)
         self._amt_input.setFocus()
         self._amt_input.selectAll()
 
@@ -9224,8 +10096,6 @@ class FinanceDialog(P5FluidPanel):
         self._editing_sheet_tx = None
         self._form_hdr_lbl.setText("RECORD TRANSACTION")
         self._form_hdr_lbl.setStyleSheet("")
-        self._form_card.setStyleSheet("")
-        self._submit_btn.set_variant("primary")
         self._cancel_edit_btn.hide()
         self._amt_input.clear()
         self._title_input.clear()
@@ -9234,13 +10104,17 @@ class FinanceDialog(P5FluidPanel):
         self._select_tx_type(self._tx_type)
 
     def _delete_selected_tx(self) -> None:
-        if self._sheet_mode and self._sheet_busy:
-            return
         item = self._tx_list.currentItem()
         if item is None:
+            self.notify("Select a transaction to delete first", tone="info", ms=1800)
             return
         tx_id = item.data(ROLE_ID)
-        if not tx_id:
+        if tx_id:
+            self._delete_tx_by_id(str(tx_id))
+
+    def _delete_tx_by_id(self, tx_id: str) -> None:
+        if self._sheet_mode and self._sheet_busy:
+            self.notify("Wait for Google Sheets sync to finish", tone="info", ms=1500)
             return
         if self._editing_tx_id == tx_id:
             self._cancel_edit()
@@ -9249,9 +10123,12 @@ class FinanceDialog(P5FluidPanel):
             if tx is None:
                 return
             if tx.get("sheet_kind") == "qris_pool":
-                self._form_status.setText("QRIS monthly pool rows are updated automatically — undo individual QRIS expenses instead.")
+                msg = "QRIS monthly pool rows update automatically — undo individual QRIS expenses instead."
+                self._form_status.setText(msg)
+                self.notify(msg, tone="info")
                 return
             self.set_sheet_busy(True, "Clearing row in Google Sheets...")
+            self.notify("Clearing row in Google Sheets...", tone="info", ms=1500)
             self.sheet_delete_requested.emit(dict(tx))
             return
         removed = self.store.delete_transaction(tx_id)
@@ -9262,7 +10139,52 @@ class FinanceDialog(P5FluidPanel):
         self._undo_payload = removed
         self._undo.trigger(f"Deleted '{removed['title'][:26]}'")
         self.refresh()
+        self._pulse_kpis("bal", "inc", "exp", "tod")
+        self.notify(f"Deleted '{removed['title']}' · Undo available", tone="info")
         self.finance_changed.emit("delete", removed)
+
+    def _open_tx_context_menu(self, pos: QPoint) -> None:
+        item = self._tx_list.itemAt(pos)
+        if item is None:
+            return
+        tx_id = item.data(ROLE_ID)
+        if not tx_id:
+            return
+        self._tx_list.setCurrentItem(item)
+        menu = QMenu(self)
+        menu.setStyleSheet(menu_qss(self._ui_scale))
+        if bool(item.data(ROLE_FLAG)):
+            a_ro = menu.addAction("Auto-computed QRIS Pool (read-only)")
+            a_ro.setEnabled(False)
+            menu.exec(self._tx_list.viewport().mapToGlobal(pos))
+            return
+        a_edit = menu.addAction("Edit Transaction")
+        a_dup = menu.addAction("Duplicate to Form (Today)")
+        menu.addSeparator()
+        a_del = menu.addAction("Delete Transaction")
+        chosen = menu.exec(self._tx_list.viewport().mapToGlobal(pos))
+        if chosen == a_edit:
+            self._start_edit_by_id(str(tx_id))
+        elif chosen == a_dup:
+            self._duplicate_tx(str(tx_id))
+        elif chosen == a_del:
+            self._delete_tx_by_id(str(tx_id))
+
+    def _sync_tx_selection_ui(self) -> None:
+        item = self._tx_list.currentItem()
+        tx_id = item.data(ROLE_ID) if item is not None else None
+        is_pool = bool(item.data(ROLE_FLAG)) if item is not None else False
+        editable = bool(tx_id) and not is_pool
+        self._edit_tx_btn.setEnabled(editable)
+        self._del_tx_btn.setEnabled(editable)
+        if editable and item is not None:
+            title = item.text()
+            amt = item.data(ROLE_BADGE) or ""
+            self._tx_foot_tip.setText(f"Selected: {title[:26]} ({amt}) · Double-click to edit")
+        elif tx_id and is_pool:
+            self._tx_foot_tip.setText("QRIS pool row (auto-synced by QRIS expenses)")
+        else:
+            self._tx_foot_tip.setText("Hover a row to edit/delete · Right-click for more")
 
     def _undo_last(self) -> None:
         if not self._undo_payload:
@@ -9277,38 +10199,55 @@ class FinanceDialog(P5FluidPanel):
         self._undo_payload = None
         if self._sheet_mode and kind.startswith("sheet_"):
             self.set_sheet_busy(True, "Reverting last change in Google Sheets...")
+            self.notify("Reverting last change in Google Sheets...", tone="info", ms=1600)
             self.sheet_undo_requested.emit(kind, payload)
             return
         restored = self.store.restore_transaction(payload)
         if restored is not None:
             play_ui("select")
             self.refresh()
+            self._tx_delegate.flash_item(restored["id"])
+            self._pulse_kpis("bal", "inc", "exp", "tod")
+            self.notify(f"Restored '{restored['title']}'", tone="ok")
             self.finance_changed.emit("edit", restored)
 
     # -- Budgets, Bills & Shortcuts Actions ----------------------------------
     def _save_budget(self, category: str) -> None:
-        raw = self._budget_inputs[category].text().strip()
+        inp = self._budget_inputs[category]
+        raw = inp.text().strip()
         if not raw:
             self._clear_budget(category)
             return
         if not self.store.set_budget(category, raw):
-            self._plan_status.setText(f"Invalid budget amount for {category} (try e.g. 500rb).")
+            msg = f"Invalid budget amount for {category} (try e.g. 500rb)."
+            self._plan_status.setText(msg)
+            self.nudge_input(inp, msg, tone="warn")
             return
         play_ui("select")
-        self._plan_status.setText(f"Set {category} monthly budget to {format_rupiah(self.store.budgets()[category])}.")
+        lim = format_rupiah(self.store.budgets()[category])
+        self._plan_status.setText(f"Set {category} monthly budget to {lim}.")
+        self.notify(f"{category} budget set to {lim}", tone="ok")
         self.refresh()
 
     def _clear_budget(self, category: str) -> None:
         self.store.set_budget(category, None)
         self._budget_inputs[category].clear()
         self._plan_status.setText(f"Cleared monthly budget for {category}.")
+        self.notify(f"Cleared {category} budget limit", tone="info")
         self.refresh()
 
     def _add_bill(self) -> None:
         name = self._bill_name_in.text().strip()
+        if not name:
+            msg = "Enter a bill name first (e.g. Kos, Wi-Fi)."
+            self._plan_status.setText(msg)
+            self.nudge_input(self._bill_name_in, msg, tone="warn")
+            return
         amt = parse_rupiah(self._bill_amt_in.text())
-        if not name or amt is None:
-            self._plan_status.setText("Enter a bill name and valid amount (e.g. Kos · 800rb).")
+        if amt is None:
+            msg = "Enter a valid bill amount (e.g. 500rb)."
+            self._plan_status.setText(msg)
+            self.nudge_input(self._bill_amt_in, msg, tone="warn")
             return
         bill = self.store.add_bill(
             name, self._bill_day_spin.value(), amt,
@@ -9320,6 +10259,7 @@ class FinanceDialog(P5FluidPanel):
             self._bill_name_in.clear()
             self._bill_amt_in.clear()
             self._plan_status.setText(f"Added monthly bill '{bill['name']}' (Day {bill['day']}).")
+            self.notify(f"Added recurring bill '{bill['name']}' · {format_rupiah(amt)}", tone="ok")
             self.refresh()
 
     def _pay_bill(self, bill_id: str) -> None:
@@ -9336,6 +10276,7 @@ class FinanceDialog(P5FluidPanel):
                 last_d = calendar.monthrange(self._view_year, self._view_month)[1]
                 pay_day = date(self._view_year, self._view_month, min(bill["day"], last_d)).isoformat()
             self._plan_status.setText(f"Recording bill '{bill['name']}' to Google Sheets...")
+            self.notify(f"Recording bill '{bill['name']}' to Sheets...", tone="info", ms=1600)
             self.set_sheet_busy(True)
             self.sheet_write_requested.emit({
                 "type": "expense",
@@ -9355,21 +10296,28 @@ class FinanceDialog(P5FluidPanel):
             play_ui("select")
             self._plan_status.setText(f"Paid '{bill['name']}' ({format_rupiah(tx['amount'])})!")
             self.refresh()
+            self._pulse_kpis("bal", "exp", "tod")
+            self.notify(f"Paid '{bill['name']}' · {format_rupiah(tx['amount'])}", tone="ok")
             self.finance_changed.emit("bill", tx)
 
     def _delete_bill(self, bill_id: str) -> None:
         if self.store.delete_bill(bill_id):
             play_ui("close")
+            self.notify("Removed recurring bill", tone="info")
             self.refresh()
 
     def _add_shortcut(self) -> None:
         name = self._sc_name_in.text().strip()
         raw_amt = self._sc_amt_in.text().strip()
         if not name:
-            self._plan_status.setText("Enter a shortcut name first.")
+            msg = "Enter a shortcut name first (e.g. Parkir, Kopi)."
+            self._plan_status.setText(msg)
+            self.nudge_input(self._sc_name_in, msg, tone="warn")
             return
         if raw_amt and parse_rupiah(raw_amt) is None:
-            self._plan_status.setText("Invalid shortcut price (leave empty or type e.g. 7rb).")
+            msg = "Invalid shortcut price (leave empty or type e.g. 7rb)."
+            self._plan_status.setText(msg)
+            self.nudge_input(self._sc_amt_in, msg, tone="warn")
             return
         sc_entry = self.store.add_shortcut(name, self._sc_cat_cb.currentText(), raw_amt or None)
         if sc_entry is not None:
@@ -9377,11 +10325,13 @@ class FinanceDialog(P5FluidPanel):
             self._sc_name_in.clear()
             self._sc_amt_in.clear()
             self._plan_status.setText(f"Saved quick shortcut '{sc_entry['name']}'.")
+            self.notify(f"Saved shortcut '{sc_entry['name']}'", tone="ok")
             self.refresh()
 
     def _delete_shortcut(self, name: str) -> None:
         if self.store.delete_shortcut(name):
             play_ui("close")
+            self.notify(f"Removed shortcut '{name}'", tone="info")
             self.refresh()
 
     # -- Full UI Refresh -----------------------------------------------------
@@ -9425,6 +10375,11 @@ class FinanceDialog(P5FluidPanel):
             self._kpi_exp_sub.setText(f"Tab: {month_tab_name(self._view_month)}")
             self._kpi_tod_val.setText("..." if self._sheet_busy else "—")
             self._kpi_tod_sub.setText("Spent today")
+            for w in FINANCE_WALLETS:
+                self._wallet_btns[w].setText(w.upper())
+                self._wallet_btns[w].setToolTip(w)
+                self._to_wallet_btns[w].setText(w.upper())
+                self._to_wallet_btns[w].setToolTip(w)
         else:
             self._kpi_bal_val.setText(format_rupiah(bal["Total"]))
             self._kpi_bal_sub.setText(
@@ -9441,6 +10396,15 @@ class FinanceDialog(P5FluidPanel):
                 self._kpi_tod_sub.setText(f"Spent today · Synced {self._sheet_data.synced_at}")
             else:
                 self._kpi_tod_sub.setText("Spent today")
+            # Live compact balances right on the wallet picker chips!
+            for w in FINANCE_WALLETS:
+                v = bal.get(w, 0)
+                lbl = f"{w.upper()} · {self._short_rp(v)}"
+                tip = f"{w} balance: {format_rupiah(v)}"
+                self._wallet_btns[w].setText(lbl)
+                self._wallet_btns[w].setToolTip(tip)
+                self._to_wallet_btns[w].setText(lbl)
+                self._to_wallet_btns[w].setToolTip(tip)
 
         self._refresh_shortcut_chips()
         self._refresh_tx_list()
@@ -9460,6 +10424,8 @@ class FinanceDialog(P5FluidPanel):
             btn = self._btn(lbl, variant="soft", display=False, px=10)
             btn.setFixedHeight(_sc(23, sc, 20))
             btn.setToolTip(f"{entry['category']}" + (f" · {format_rupiah(amt)}" if amt else ""))
+            if self._active_shortcut_name and entry["name"] == self._active_shortcut_name:
+                btn.set_active(True, "gold")
             btn.clicked.connect(lambda _c=False, e=dict(entry): self._apply_shortcut(e))
             self._sc_grid.addWidget(btn, idx // 4, idx % 4)
 
@@ -9467,11 +10433,14 @@ class FinanceDialog(P5FluidPanel):
         _bal, _summ, items = self._active_data()
         q = self._search_input.text().strip().lower()
         flt = self._tx_filter
+        today_iso = date.today().isoformat()
         filtered: list[dict] = []
         for t in items:
-            if flt in ("expense", "income", "transfer") and t["type"] != flt:
+            if flt == "today" and t["date"] != today_iso:
                 continue
-            if flt.startswith("cat:") and (t["type"] != "expense" or t.get("category") != flt[4:]):
+            elif flt in ("expense", "income", "transfer") and t["type"] != flt:
+                continue
+            elif flt.startswith("cat:") and (t["type"] != "expense" or t.get("category") != flt[4:]):
                 continue
             if q:
                 hay = f"{t['title']} {t.get('category', '')} {t['wallet']} {t.get('to_wallet', '')} {t['date']}".lower()
@@ -9479,25 +10448,49 @@ class FinanceDialog(P5FluidPanel):
                     continue
             filtered.append(t)
 
-        self._tx_count_lbl.setText(f"{len(filtered)} {'entry' if len(filtered) == 1 else 'entries'}")
+        # Count + live filtered subtotal badge
+        cnt_txt = f"{len(filtered)} {'entry' if len(filtered) == 1 else 'entries'}"
+        if filtered:
+            types = {t["type"] for t in filtered}
+            if types == {"expense"}:
+                cnt_txt += f" · -{format_rupiah(sum(t['amount'] for t in filtered))}"
+            elif types == {"income"}:
+                cnt_txt += f" · +{format_rupiah(sum(t['amount'] for t in filtered))}"
+            elif types == {"transfer"}:
+                cnt_txt += f" · {format_rupiah(sum(t['amount'] for t in filtered))}"
+            else:
+                inc_s = sum(t["amount"] for t in filtered if t["type"] == "income")
+                exp_s = sum(t["amount"] for t in filtered if t["type"] == "expense")
+                net_s = inc_s - exp_s
+                cnt_txt += f" · Net {'+' if net_s >= 0 else ''}{format_rupiah(net_s)}"
+        self._tx_count_lbl.setText(cnt_txt)
+        self._reset_flt_btn.setVisible(flt != "all" or bool(q))
+
         self._tx_list.clear()
         if not filtered:
             if self._sheet_mode and self._sheet_busy and self._sheet_data is None:
                 msg = f"Loading '{month_tab_name(self._view_month)}' from Google Sheets..."
             elif self._sheet_mode and self._sheet_error:
                 msg = f"Google Sheets unavailable:\n{self._sheet_error}"
+            elif flt == "today":
+                msg = "No transactions recorded today yet.\nUse the quick form on the left to log one!"
+            elif flt != "all" or q:
+                msg = "No transactions match this search or filter.\nClick × RESET to show all entries."
             else:
-                msg = "No transactions match this month or filter.\nRecord an expense, income, or transfer on the left!"
+                msg = "No transactions recorded this month yet.\nLog an expense, income, or transfer on the left!"
             empty = QListWidgetItem(msg)
             empty.setData(ROLE_ID, None)
             empty.setFlags(Qt.ItemFlag.NoItemFlags)
             self._tx_list.addItem(empty)
+            self._sync_tx_selection_ui()
+            self._sync_kpi_active_states()
             return
 
         for t in filtered:
             it = QListWidgetItem(t["title"])
             it.setData(ROLE_ID, t["id"])
             it.setData(ROLE_CAT, t["type"])
+            it.setData(ROLE_FLAG, t.get("sheet_kind") == "qris_pool")
             try:
                 d_str = date.fromisoformat(t["date"]).strftime("%d %b")
             except ValueError:
@@ -9515,6 +10508,8 @@ class FinanceDialog(P5FluidPanel):
             it.setData(ROLE_BADGE, amt_txt)
             it.setData(ROLE_DATE, meta)
             self._tx_list.addItem(it)
+        self._sync_tx_selection_ui()
+        self._sync_kpi_active_states()
 
     def _refresh_budgets_and_wallets(self, bal: dict[str, int], summ: dict) -> None:
         budgets = self.store.budgets()
@@ -9608,7 +10603,7 @@ class FinanceDialog(P5FluidPanel):
                     pay_b.clicked.connect(lambda _c=False, bid=b["id"]: self._pay_bill(bid))
                     rl.addWidget(pay_b)
 
-                del_b = self._btn("×", variant="soft", display=True, px=10)
+                del_b = self._btn("×", variant="soft", display=True, px=10, sfx_click="cancel")
                 del_b.setFixedSize(_sc(22, sc, 19), _sc(22, sc, 19))
                 del_b.clicked.connect(lambda _c=False, bid=b["id"]: self._delete_bill(bid))
                 rl.addWidget(del_b)
@@ -9631,7 +10626,7 @@ class FinanceDialog(P5FluidPanel):
                 lbl = QLabel(f"{entry['name']}  ({entry['category']}{amt_s})")
                 lbl.setStyleSheet(f'color: #ECEEF5; font-size: {_sc(11, sc, 9)}px; border: none;')
                 rl.addWidget(lbl, 1)
-                del_s = self._btn("×", variant="soft", display=True, px=10)
+                del_s = self._btn("×", variant="soft", display=True, px=10, sfx_click="cancel")
                 del_s.setFixedSize(_sc(22, sc, 19), _sc(22, sc, 19))
                 del_s.clicked.connect(lambda _c=False, nm=entry["name"]: self._delete_shortcut(nm))
                 rl.addWidget(del_s)
