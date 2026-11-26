@@ -445,6 +445,8 @@ class PetWindow(QWidget):
         self._hud: tuple[str, str, float, str, str] | None = None
         self._ui_scale = 1.0
         self._phase = 0.0
+        self._sil_key: tuple | None = None
+        self._sil_pm: QPixmap | None = None
 
         self._tilt = Spring(0.0, 170.0, 11.0)      # derajat; memantul saat dilepas
         self._pop = Spring(0.0, 420.0, 15.0)       # squash & stretch
@@ -650,6 +652,41 @@ class PetWindow(QWidget):
         return True
 
     # -- menggambar ----------------------------------------------------------
+    def motion_pose(self) -> tuple[float, float, float, float]:
+        """Current (bob, tilt, sx, sy) transform shared with MenuBackdrop crimson silhouette."""
+        st = self.STYLE.get(self._state, self.STYLE["idle"])
+        ph = self._phase
+        hold = clamp(self._hold.value, 0.0, 1.3)
+        pop = self._pop.value
+        bob = math.sin(ph * st["speed"]) * st["amp"] + st["droop"]
+        bob += math.sin(ph * 10.0) * 1.5 * clamp(self._talk.value)
+        breathe = math.sin(ph * st["speed"] * 0.85 + 1.2) * st["breathe"]
+        sy = max(0.2, 1.0 + breathe + pop + 0.05 * hold)
+        sx = max(0.2, 1.0 - breathe * 0.6 - pop * 0.55 + 0.05 * hold)
+        tilt = self._tilt.value + math.sin(ph * 0.8) * 0.9 * (1.0 - clamp(hold))
+        return bob - 7.0 * hold, tilt, sx, sy
+
+    def red_silhouette_pixmap(self) -> QPixmap | None:
+        """Single-slot cached solid Persona Crimson silhouette of Morgana's current sprite."""
+        dpr = round(self.devicePixelRatioF(), 2)
+        key = (self._expr, self._sprite_size, dpr)
+        if getattr(self, "_sil_key", None) == key and getattr(self, "_sil_pm", None) is not None:
+            return self._sil_pm
+        src = self._sprites.get(self._expr, self._sprite_size, self.devicePixelRatioF(), EYE_OPEN, MOUTH_BASE)
+        if src.isNull():
+            return None
+        sil = QPixmap(src.size())
+        sil.setDevicePixelRatio(src.devicePixelRatio())
+        sil.fill(Qt.GlobalColor.transparent)
+        sp = QPainter(sil)
+        sp.drawPixmap(0, 0, src)
+        sp.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+        sp.fillRect(sil.rect(), RED)
+        sp.end()
+        self._sil_key = key
+        self._sil_pm = sil
+        return sil
+
     def _draw_sprite(self, p: QPainter, expr: str) -> None:
         eye, mouth = (self._eye, self._mouth) if expr == self._expr else (EYE_OPEN, MOUTH_BASE)
         pm = self._sprites.get(expr, self._sprite_size, self.devicePixelRatioF(), eye, mouth)
@@ -663,24 +700,14 @@ class PetWindow(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        st = self.STYLE.get(self._state, self.STYLE["idle"])
-        ph = self._phase
-        hold = clamp(self._hold.value, 0.0, 1.3)
-        pop = self._pop.value
-
-        bob = math.sin(ph * st["speed"]) * st["amp"] + st["droop"]
-        bob += math.sin(ph * 10.0) * 1.5 * clamp(self._talk.value)       # pantulan kecil saat bicara
-        breathe = math.sin(ph * st["speed"] * 0.85 + 1.2) * st["breathe"]
-        sy = 1.0 + breathe + pop + 0.05 * hold
-        sx = 1.0 - breathe * 0.6 - pop * 0.55 + 0.05 * hold
-        tilt = self._tilt.value + math.sin(ph * 0.8) * 0.9 * (1.0 - clamp(hold))
+        dy_bob, tilt, sx, sy = self.motion_pose()
 
         px = self.width() / 2.0
         py = PAD + self._sprite_size * 0.94                               # pivot di "kaki"
         p.save()
-        p.translate(px, py + bob - 7.0 * hold)
+        p.translate(px, py + dy_bob)
         p.rotate(tilt)
-        p.scale(max(sx, 0.2), max(sy, 0.2))
+        p.scale(sx, sy)
         p.translate(-px, -py)
         f = clamp(self._fade.value)
         if f < 0.995 and self._prev_expr != self._expr:
@@ -739,7 +766,7 @@ class PetWindow(QWidget):
         p.setBrush(BLACK)
         p.drawPolygon(outer)
 
-        # Clip interior for slanted phase slash + progress track
+        # Clip interior for slanted phase slash + progress track + razor white separator
         clip = QPainterPath()
         clip.addPolygon(outer)
         clip.closeSubpath()
@@ -755,6 +782,15 @@ class PetWindow(QWidget):
         ])
         p.setBrush(accent)
         p.drawPolygon(slash)
+
+        # Crisp white diagonal hairline separating phase tag & countdown digits
+        p.setPen(pen(WHITE, 1.5))
+        p.drawLine(QPointF(slash_x + 3.0, y), QPointF(slash_x - skew + 3.0, y + h))
+        p.setPen(Qt.PenStyle.NoPen)
+
+        # Subtle top glossy highlight rim
+        p.setBrush(QColor(255, 255, 255, 24))
+        p.drawRect(QRectF(x, y, w, max(1.5, 2.0 * sc)))
 
         # Bottom progress strip inside HUD
         bar_h = max(2.5, 3.5 * sc)
@@ -1813,7 +1849,7 @@ def _radial_side_ax(oy_base: float) -> float:
 
 def _radial_button_extents(
     side: int, ox_px: float, oy_px: float, rot_deg: float, u_btn: float,
-    length: float = 176.0, h_in: float = 25.0, h_out: float = 48.0,
+    length: float = 188.0, h_in: float = 26.0, h_out: float = 48.0,
 ) -> tuple[float, float, float, float]:
     """Conservative pixel extents (min_x, max_x, min_y, max_y) of one wedge incl. hover/shadow/subtitle."""
     L = length * u_btn
@@ -1822,15 +1858,15 @@ def _radial_button_extents(
     s = 1.08
     slide = 10.0 * u_btn
     if side > 0:
-        x_in = -14.0 * u_btn
+        x_in = -16.0 * u_btn
         x_out = slide + (L + 6.0 * u_btn) * s + 9.0 * u_btn
     else:
-        x_in = +14.0 * u_btn
+        x_in = +16.0 * u_btn
         x_out = -(slide + (L + 6.0 * u_btn) * s + 9.0 * u_btn)
     corners = (
-        (x_in,  -hi * 0.56 * s - 4.0 * u_btn),
-        (x_in,  +hi * 0.52 * s + 7.0 * u_btn),
-        (x_out, -ho * 0.58 * s - 4.0 * u_btn),
+        (x_in,  -hi * 0.58 * s - 5.0 * u_btn),
+        (x_in,  +hi * 0.54 * s + 7.0 * u_btn),
+        (x_out, -ho * 0.58 * s - 5.0 * u_btn),
         (x_out, +ho * 0.50 * s + 10.0 * u_btn),
     )
     ang = math.radians(rot_deg)
@@ -1871,20 +1907,40 @@ def _oriented_poly(
     return tuple((u * ca - v * sa, u * sa + v * ca) for u, v in local_pts)
 
 
-def _stepped_slash_poly(
+def _joker_hero_slash_poly(
     angle: float, length: float, half_w: float, step_sign: float = 1.0,
-    notch_t: float = 0.60, back_anchor: float = 28.0,
+    notch_t: float = 0.71, back_anchor: float = 30.0,
 ) -> tuple[tuple[float, float], ...]:
-    """Iconic Persona 5 diagonal crimson beam: straight outer edge + abrupt inward notch -> razor needle."""
+    """Faithful Persona 5 Joker Assist Menu hero crimson lightning-beam:
+    bold architectural shoulder ledge + razor upper spine + dramatic ~90° lower step-notch -> needle tip."""
     s = step_sign
     pts = (
-        (-back_anchor,              -0.44 * half_w * s),
-        (length * 0.42,             -0.48 * half_w * s),
-        (length,                    -0.12 * half_w * s),   # ultra-sharp needle tip
-        (length * (notch_t - 0.03), +0.06 * half_w * s),   # razor spear underside
-        (length * (notch_t + 0.03), +0.62 * half_w * s),   # abrupt Persona 5 comic step!
-        (length * 0.24,             +1.00 * half_w * s),   # broad angular crimson belly
-        (-back_anchor,              +0.52 * half_w * s),
+        (-back_anchor,              -0.30 * half_w * s),
+        (length * 0.16,             -0.38 * half_w * s),
+        (length * 0.30,             -0.84 * half_w * s),   # bold architectural shoulder crest (image.png)
+        (length * 0.44,             -0.46 * half_w * s),   # crisp step into upper diagonal spine
+        (length * 0.68,             -0.30 * half_w * s),   # razor-straight upper blade edge
+        (length,                    -0.14 * half_w * s),   # far-piercing needle tip
+        (length * (notch_t - 0.04), +0.02 * half_w * s),   # ultra-slim needle underside
+        (length * (notch_t + 0.03), +0.62 * half_w * s),   # iconic Joker abrupt ~90° step-notch!
+        (length * 0.22,             +0.92 * half_w * s),   # bold crimson beam belly
+        (-back_anchor,              +0.42 * half_w * s),
+    )
+    return _oriented_poly(angle, pts)
+
+
+def _joker_tail_slash_poly(
+    angle: float, length: float, half_w: float, back_anchor: float = 26.0,
+) -> tuple[tuple[float, float], ...]:
+    """Continuous razor-thin crimson tail slicing opposite the hero beam (Joker Assist Menu lower-left)."""
+    pts = (
+        (-back_anchor,  -0.44 * half_w),
+        (length * 0.16, -0.58 * half_w),
+        (length * 0.42, -0.24 * half_w),
+        (length,         0.0),
+        (length * 0.40, +0.26 * half_w),
+        (length * 0.14, +0.62 * half_w),
+        (-back_anchor,  +0.46 * half_w),
     )
     return _oriented_poly(angle, pts)
 
@@ -1893,51 +1949,55 @@ def _needle_poly(
     angle: float, length: float, half_w: float,
     back_anchor: float = 22.0, offset_v: float = 0.0,
 ) -> tuple[tuple[float, float], ...]:
-    """Long sleek Persona 5 razor needle (used for lower-left crimson tail & piercing black spears)."""
+    """Long sleek Persona 5 razor needle (piercing obsidian-black counter-spear & upper flare fin)."""
     pts = (
-        (-back_anchor,  offset_v - 0.55 * half_w),
-        (length * 0.22, offset_v - 0.85 * half_w),
+        (-back_anchor,  offset_v - 0.48 * half_w),
+        (length * 0.20, offset_v - 0.78 * half_w),
         (length,        offset_v),
-        (length * 0.20, offset_v + 0.72 * half_w),
-        (-back_anchor,  offset_v + 0.48 * half_w),
+        (length * 0.18, offset_v + 0.64 * half_w),
+        (-back_anchor,  offset_v + 0.42 * half_w),
     )
     return _oriented_poly(angle, pts)
 
 
-def _impact_wing_poly(
+def _joker_core_teeth_poly(
     side: int, phi_top: float, phi_bot: float, r_top: float, r_bot: float,
-    u_sprite: float,
+    u_sprite: float, u_btn: float,
 ) -> tuple[tuple[float, float], ...]:
-    """Bold irregular Persona 5 crimson cutout wing backing a side's button cluster (no repetitive spokes)."""
-    r_in = 14.0 * u_sprite
+    """Compact jagged Persona 5 crimson teeth flashing ONLY between inner tab stems
+    so crisp negative space breathes between the outer halves of the black ribbons."""
+    r_in = 10.0 * u_sprite
     span = phi_bot - phi_top
-    a_top = max(-1.38, phi_top - (0.14 if span < 0.25 else 0.10))
-    a_bot = min(+1.38, phi_bot + (0.14 if span < 0.25 else 0.10))
+    a_top = max(-1.32, phi_top - 0.06)
+    a_bot = min(+1.32, phi_bot + 0.06)
     a_mid = 0.5 * (a_top + a_bot)
-    r_mid = 0.5 * (r_top + r_bot)
+    # Keep core tight (~48-58% of tab reach) so tabs never drown in a bloated red blob
+    r_cap = 162.0 * u_btn
+    rt = min(r_top * 0.56, r_cap)
+    rb = min(r_bot * 0.54, r_cap)
+    rm = 0.5 * (rt + rb)
 
     def _pt(a: float, r: float) -> tuple[float, float]:
         return (side * r * math.cos(a), r * math.sin(a))
 
-    if span < 0.25:
-        # Compact 1-tab angular cutout slash
+    if span < 0.28:
         return (
             _pt(a_top, r_in),
-            _pt(a_top, r_top * 0.90),
-            _pt(a_mid - 0.04, r_mid * 0.72),
-            _pt(a_mid + 0.05, r_mid * 1.02),
-            _pt(a_bot, r_bot * 0.84),
+            _pt(a_top, rt * 1.04),
+            _pt(a_mid, rm * 0.62),
+            _pt(a_bot, rb * 0.96),
             _pt(a_bot, r_in),
         )
-    # Asymmetric 3-corner comic-cutout wing with one crisp inward notch
-    a_q1 = a_top + 0.34 * (a_bot - a_top)
-    a_q2 = a_top + 0.58 * (a_bot - a_top)
+    a_q1 = a_top + 0.25 * (a_bot - a_top)
+    a_q2 = a_top + 0.48 * (a_bot - a_top)
+    a_q3 = a_top + 0.72 * (a_bot - a_top)
     return (
         _pt(a_top, r_in),
-        _pt(a_top, r_top * 0.96),
-        _pt(a_q1,  r_mid * 0.66),          # sharp comic inward notch
-        _pt(a_q2,  r_mid * 0.98),          # bold outer angular corner
-        _pt(a_bot, r_bot * 0.88),
+        _pt(a_top, rt * 0.96),
+        _pt(a_q1,  rm * 0.54),          # crisp inward comic notch
+        _pt(a_q2,  rm * 1.06),          # sharp crimson center tooth flashing between middle tabs
+        _pt(a_q3,  rm * 0.56),          # crisp inward comic notch
+        _pt(a_bot, rb * 0.92),
         _pt(a_bot, r_in),
     )
 
@@ -1951,7 +2011,7 @@ def build_radial_burst_shards(
     y_lo: float,
     y_hi: float,
 ) -> tuple[list[tuple[tuple[float, float], ...]], list[tuple[tuple[float, float], ...]]]:
-    """Generate Persona 5 stepped diagonal crimson slash & piercing black counter-spears."""
+    """Generate authentic Persona 5 Joker Assist Menu stepped diagonal crimson slash & black spears."""
     red: list[tuple[tuple[float, float], ...]] = []
     black: list[tuple[tuple[float, float], ...]] = []
 
@@ -1974,8 +2034,8 @@ def build_radial_burst_shards(
     if not active_sides:
         return red, black
 
-    max_r = 395.0 * u_btn
-    # 1) Bold asymmetric crimson impact wing behind each active side's button cluster
+    max_r = 410.0 * u_btn
+    # 1) Tight jagged crimson backing teeth around Morgana's core & inner stems (preserves negative space!)
     side_info: dict[int, tuple[float, float, float, float, int]] = {}
     for side in active_sides:
         rays = sorted(by_side[side], key=lambda item: item[0])
@@ -1984,80 +2044,85 @@ def build_radial_burst_shards(
         r_top = min(r_top, max_r)
         r_bot = min(r_bot, max_r)
         side_info[side] = (phi_min, phi_max, r_top, r_bot, len(rays))
-        _add(red, _impact_wing_poly(side, phi_min, phi_max, r_top, r_bot, u_sprite), min_s=0.30)
+        _add(red, _joker_core_teeth_poly(side, phi_min, phi_max, r_top, r_bot, u_sprite, u_btn), min_s=0.30)
 
-    # 2) Hero Stepped Diagonal Crimson Lightning-Slash + Piercing Black Counter-Spears
+    # 2) Hero Joker Stepped Diagonal Crimson Lightning-Slash + Piercing Black Counter-Spears
     if len(active_sides) == 2:
-        # Classic Persona 5 Royal diagonal (reference image.png):
-        # lower-left razor needle + black spear -> bold stepped crimson beam shooting upper-right!
+        # Exact Persona 5 Joker Assist Menu composition:
+        # far lower-left razor red tail + layered black spear -> bold stepped crimson beam shooting upper-right!
         l_min, l_max, l_rt, l_rb, l_n = side_info[-1]
         r_min, r_max, r_rt, r_rb, r_n = side_info[+1]
         compact = (l_n + r_n) <= 2
-        hero_ang = clamp(r_min - (0.14 if compact else 0.16), -0.82, -0.26)
-        hero_len = min(max(r_rt * 1.44, 330.0 * u_btn), 460.0 * u_btn)
-        hero_w = (30.0 if compact else 44.0) * u_btn
-        tail_len = min(max(l_rb * 1.18, 255.0 * u_btn), 360.0 * u_btn)
+        hero_ang = clamp(r_min - (0.14 if compact else 0.17), -0.78, -0.44)
+        hero_len = min(max(r_rt * 1.66, 380.0 * u_btn), 540.0 * u_btn)
+        hero_w = (32.0 if compact else 48.0) * u_btn
+        tail_len = min(max(l_rb * 1.32, 295.0 * u_btn), 415.0 * u_btn)
 
-        # Upper-right hero stepped beam (straight top edge, stepped bottom edge -> needle tip)
-        _add(red, _stepped_slash_poly(hero_ang, hero_len, hero_w, step_sign=+1.0,
-                                      notch_t=0.62, back_anchor=26.0 * u_sprite), min_s=0.35)
-        # Lower-left razor crimson tail along exact opposite diagonal
-        _add(red, _needle_poly(hero_ang + math.pi, tail_len, (14.0 if compact else 18.0) * u_btn,
-                               back_anchor=24.0 * u_sprite), min_s=0.30)
-        # Sharp upper-left crimson flare wing (like behind NETWORK in reference image)
+        # Upper-right hero stepped beam (shoulder crest + straight spine + sharp lower step-notch -> needle)
+        _add(red, _joker_hero_slash_poly(hero_ang, hero_len, hero_w, step_sign=+1.0,
+                                         notch_t=0.71, back_anchor=30.0 * u_sprite), min_s=0.32)
+        # Continuous razor-thin crimson tail slicing along exact opposite diagonal (bottom-left)
+        _add(red, _joker_tail_slash_poly(hero_ang + math.pi, tail_len,
+                                         (14.0 if compact else 18.0) * u_btn,
+                                         back_anchor=26.0 * u_sprite), min_s=0.28)
+        # Crisp angular upper-left crimson fin peeking above top-left tab (like behind NETWORK)
         if not compact:
-            ul_ang = math.pi - clamp(l_min - 0.12, -0.95, -0.18)
-            _add(red, _needle_poly(ul_ang, l_rt * 1.08, 22.0 * u_btn, back_anchor=18.0 * u_sprite), min_s=0.30)
+            ul_ang = math.pi - clamp(l_min - 0.16, -0.96, -0.26)
+            _add(red, _needle_poly(ul_ang, l_rt * 1.02, 24.0 * u_btn,
+                                   back_anchor=18.0 * u_sprite), min_s=0.30)
 
-        # Piercing obsidian-black lower-left counter-spear (signature P5 contrast from image.png)
-        _add(black, _needle_poly(hero_ang + math.pi + 0.075, tail_len * 0.94,
-                                 (13.0 if compact else 18.0) * u_btn,
-                                 back_anchor=20.0 * u_sprite, offset_v=-5.0 * u_btn), min_s=0.28)
-        # Sleek secondary black accent dagger slicing under the right wing
-        br_ang = clamp(r_max + 0.08, 0.08, 0.92)
-        _add(black, _needle_poly(br_ang, r_rb * 0.90, 12.0 * u_btn,
+        # Signature layered obsidian-black lower-left counter-spear slicing right above the crimson needle!
+        _add(black, _needle_poly(hero_ang + math.pi + 0.055, tail_len * 0.88,
+                                 (14.0 if compact else 20.0) * u_btn,
+                                 back_anchor=22.0 * u_sprite, offset_v=-4.5 * u_btn), min_s=0.26)
+        # Sleek secondary black counter-dagger under the lower-right flank
+        br_ang = clamp(r_max + 0.07, 0.12, 0.88)
+        _add(black, _needle_poly(br_ang, r_rb * 0.86, 12.0 * u_btn,
                                  back_anchor=16.0 * u_sprite), min_s=0.28)
     else:
-        # Single-sided mode (edge / corner / single tab): orient hero stepped slash into open quadrant!
+        # Single-sided mode (corner / edge / single tab):
+        # Fire the Joker stepped crimson lightning-beam boldly into the widest open diagonal quadrant
+        # so its iconic step-notch + razor tip ALWAYS burst clearly past the outer tabs!
         side = active_sides[0]
         phi_min, phi_max, r_top, r_bot, n = side_info[side]
         phi_mid = 0.5 * (phi_min + phi_max)
         go_down = phi_mid > 0.14   # Top corners: fan hangs downward -> shoot slash diagonally DOWN-OUTWARD
         if go_down:
-            local_phi = clamp(phi_max + (0.14 if n == 1 else 0.02), +0.18, +1.08)
-            lead_r = r_bot
-            flank_phi = clamp(phi_min - 0.12, -1.20, +0.90)
+            local_phi = clamp(phi_max * 0.58 + (0.20 if n == 1 else 0.18), +0.38, +0.76)
+            lead_r = max(r_bot, r_top * 0.92)
+            flank_phi = clamp(phi_min - 0.10, -1.05, +0.85)
             flank_r = r_top
             step_sign = -1.0 if side > 0 else +1.0
         else:
-            local_phi = clamp(phi_min - (0.14 if n == 1 else 0.02), -1.08, -0.18)
-            lead_r = r_top
-            flank_phi = clamp(phi_max + 0.12, -0.90, +1.20)
+            local_phi = clamp(phi_min * 0.58 - (0.20 if n == 1 else 0.18), -0.76, -0.38)
+            lead_r = max(r_top, r_bot * 0.92)
+            flank_phi = clamp(phi_max + 0.10, -0.85, +1.05)
             flank_r = r_bot
             step_sign = +1.0 if side > 0 else -1.0
 
         hero_ang = math.atan2(math.sin(local_phi), side * math.cos(local_phi))
         flank_ang = math.atan2(math.sin(flank_phi), side * math.cos(flank_phi))
-        hero_len = min(max(lead_r * 1.46, 330.0 * u_btn), 520.0 * u_btn)
-        hero_w = (28.0 if n == 1 else 44.0) * u_btn
+        hero_len = min(max(lead_r * 1.68, 390.0 * u_btn), 560.0 * u_btn)
+        hero_w = (30.0 if n == 1 else 48.0) * u_btn
 
-        # Hero stepped crimson lightning-spear shooting past the leading outer tab
-        _add(red, _stepped_slash_poly(hero_ang, hero_len, hero_w, step_sign=step_sign,
-                                      notch_t=0.61, back_anchor=24.0 * u_sprite), min_s=0.35)
-        # Compact opposite tail needle behind Morgana (auto ray-clipped cleanly inside corner/edge!)
-        _add(red, _needle_poly(hero_ang + math.pi, 130.0 * u_sprite, 15.0 * u_sprite,
-                               back_anchor=14.0 * u_sprite), min_s=0.35)
-        # Secondary crimson counter-slash framing the opposite edge of the fan
+        # Hero stepped crimson lightning-spear shooting past the fan into open diagonal sky
+        _add(red, _joker_hero_slash_poly(hero_ang, hero_len, hero_w, step_sign=step_sign,
+                                         notch_t=0.68, back_anchor=26.0 * u_sprite), min_s=0.32)
+        # Opposite razor crimson tail piercing behind Morgana (auto ray-clipped inside corner/edge)
+        _add(red, _joker_tail_slash_poly(hero_ang + math.pi, 145.0 * u_sprite, 15.0 * u_sprite,
+                                         back_anchor=16.0 * u_sprite), min_s=0.30)
+        # Crisp secondary crimson counter-fin framing the opposite edge of the fan
         if n >= 2:
-            _add(red, _needle_poly(flank_ang, flank_r * 1.04, 18.0 * u_btn,
+            _add(red, _needle_poly(flank_ang, flank_r * 1.06, 20.0 * u_btn,
                                    back_anchor=16.0 * u_sprite), min_s=0.30)
 
-        # Piercing obsidian-black counter-spears (one along tail/back, one slicing across flank)
-        _add(black, _needle_poly(hero_ang + math.pi + (0.09 if side > 0 else -0.09),
-                                 118.0 * u_sprite, 14.0 * u_sprite,
-                                 back_anchor=14.0 * u_sprite), min_s=0.35)
+        # Piercing obsidian-black counter-spears (layered over tail + slicing under opposite flank)
+        _add(black, _needle_poly(hero_ang + math.pi + (0.07 if side > 0 else -0.07),
+                                 132.0 * u_sprite, 15.0 * u_sprite,
+                                 back_anchor=14.0 * u_sprite,
+                                 offset_v=(-3.5 if side > 0 else 3.5) * u_sprite), min_s=0.30)
         _add(black, _needle_poly(flank_ang + (-0.06 if go_down else +0.06),
-                                 flank_r * 0.88, 12.0 * u_btn,
+                                 flank_r * 0.90, 12.0 * u_btn,
                                  back_anchor=16.0 * u_sprite), min_s=0.28)
 
     return red, black
@@ -2084,7 +2149,7 @@ def compute_radial_layout(
             "w": 80, "h": 80, "cx": 40.0, "cy": 40.0, "btn_bounds": (0.0, 0.0, 0.0, 0.0),
         }
     margin = 10.0
-    need_x = 92.0 * u_pos + 204.0 * u_btn + margin
+    need_x = 92.0 * u_pos + 216.0 * u_btn + margin
 
     # 1) Select horizontal distribution mode: both sides, right-only, or left-only
     if len(active_defs) == 1:
@@ -2222,14 +2287,14 @@ def compute_radial_layout(
         if idx < len(r_list):
             ordered.append(r_list[idx])
 
-    # 6) Adaptive Persona 5 crimson & obsidian shards matched to placed buttons & screen edges
+    # 6) Adaptive Persona 5 Joker crimson & obsidian shards matched to placed buttons & screen edges
     shard_margin = 10.0
     sx_lo = -max(14.0, space_left - shard_margin)
     sx_hi = +max(14.0, space_right - shard_margin)
     sy_lo = -max(14.0, space_top - shard_margin)
     sy_hi = +max(14.0, space_bottom - shard_margin)
     placed_for_shards = [
-        (b["side"], b["ox"] * up, b["oy"] * uy, b["rot"], 176.0 * ub)
+        (b["side"], b["ox"] * up, b["oy"] * uy, b["rot"], 188.0 * ub)
         for b in ordered
     ]
     red_shards, black_shards = build_radial_burst_shards(
@@ -2238,7 +2303,7 @@ def compute_radial_layout(
 
     # 7) Snug widget bounds & Morgana-center pivot (cx, cy) staying cleanly inside the screen
     win_min_x, win_max_x, win_min_y, win_max_y = btn_bounds
-    core_pad = 32.0 * u_sprite
+    core_pad = 98.0 * u_sprite                  # Full room for Morgana's offset crimson silhouette
     win_min_x = min(win_min_x, -core_pad)
     win_max_x = max(win_max_x, +core_pad)
     win_min_y = min(win_min_y, -core_pad)
@@ -2286,16 +2351,19 @@ def compute_radial_layout(
 
 
 class MenuBackdrop(QWidget):
-    """Lapisan serpihan spike merah-hitam yang memancar dari BELAKANG karakter.
-    Tembus klik (WindowTransparentForInput) dan selalu berada di bawah PetWindow."""
+    """Lapisan serpihan spike merah-hitam + siluet merah bergaya Joker Assist Menu Persona 5
+    yang memancar dari BELAKANG karakter. Tembus klik dan selalu di bawah PetWindow."""
 
-    def __init__(self) -> None:
+    def __init__(self, pet: PetWindow | None = None) -> None:
         super().__init__()
         setup_overlay(self)
         self.setWindowFlag(Qt.WindowType.WindowTransparentForInput, True)
+        self._pet = pet
         self._cx = 0.0
         self._cy = 0.0
         self._spin_dir = -1.0
+        self._sil_dir = -1.0
+        self._u_sprite = 1.0
         self._burst = 0.0
         self._t = 0.0
         self._red: list[QPolygonF] = []
@@ -2306,12 +2374,16 @@ class MenuBackdrop(QWidget):
         red_shards: list[tuple[tuple[float, float], ...]],
         black_shards: list[tuple[tuple[float, float], ...]],
         spin_dir: float = -1.0,
+        sil_dir: float = -1.0,
+        u_sprite: float = 1.0,
     ) -> None:
         if self.width() != w or self.height() != h:
             self.setFixedSize(w, h)
         self._cx = cx
         self._cy = cy
         self._spin_dir = spin_dir
+        self._sil_dir = sil_dir
+        self._u_sprite = u_sprite
         self._red = [scale_polygon(pts, cx, cy, 1.0) for pts in red_shards]
         self._black = [scale_polygon(pts, cx, cy, 1.0) for pts in black_shards]
 
@@ -2326,12 +2398,16 @@ class MenuBackdrop(QWidget):
             return
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         p.setOpacity(opacity)
         cx = self._cx
         cy = self._cy
         live = clamp(self._burst)
-        pulse = 1.0 + 0.016 * math.sin(self._t * 2.4) * live
+        pulse = 1.0 + 0.015 * math.sin(self._t * 2.4) * live
         sc = (0.18 + 0.82 * max(self._burst, 0.0)) * pulse
+
+        # 1) Stepped Persona 5 crimson lightning-slash & piercing obsidian counter-spears
+        p.save()
         p.translate(cx, cy)
         p.rotate((1.0 - live) * (14.0 * self._spin_dir))
         p.scale(sc, sc)
@@ -2343,6 +2419,26 @@ class MenuBackdrop(QWidget):
         p.setBrush(BLACK)
         for poly in self._black:
             p.drawPolygon(poly)
+        p.restore()
+
+        # 2) Signature Joker Assist Menu offset crimson silhouette shadow hugging Morgana
+        if self._pet is not None:
+            sil = self._pet.red_silhouette_pixmap()
+            if sil is not None:
+                dpr = sil.devicePixelRatio()
+                sw, sh = sil.width() / dpr, sil.height() / dpr
+                dy_bob, tilt, sx, sy = self._pet.motion_pose()
+                off_x = self._sil_dir * 11.5 * self._u_sprite * live
+                off_y = -1.5 * self._u_sprite * live
+                piv_x = cx + off_x
+                piv_y = cy + off_y + 0.44 * self._pet.sprite_size
+                p.save()
+                p.translate(piv_x, piv_y + dy_bob)
+                p.rotate(tilt)
+                p.scale(sx, sy)
+                p.translate(-piv_x, -piv_y)
+                p.drawPixmap(QPointF(cx + off_x - sw / 2.0, cy + off_y - sh / 2.0), sil)
+                p.restore()
 
 
 class RadialMenu(QWidget):
@@ -2378,7 +2474,7 @@ class RadialMenu(QWidget):
         setup_overlay(self)
         self.setMouseTracking(True)
         self._pet = pet
-        self._backdrop = MenuBackdrop()
+        self._backdrop = MenuBackdrop(pet)
         self._enabled_keys: tuple[str, ...] = tuple(RADIAL_TAB_KEYS)
         self._buttons: list[MenuButton] = []
         self._u = 1.0                                    # button & font scale
@@ -2426,7 +2522,7 @@ class RadialMenu(QWidget):
         self._buttons = [
             MenuButton(
                 b["key"], b["label"], b["sub"], b["side"],
-                b["ox"], b["oy"], b["rot"], 176, 25, 48, b["hi"], float(i),
+                b["ox"], b["oy"], b["rot"], 188, 26, 48, b["hi"], float(i),
             )
             for i, b in enumerate(default_plan["buttons"])
         ]
@@ -2458,8 +2554,8 @@ class RadialMenu(QWidget):
         shape.addPolygon(poly)
         shape.closeSubpath()
 
-        # Susun huruf satu per satu: membesar mengikuti pelebaran trapesium (kecil di dekat karakter)
-        pad_out, pad_in = 14.0 * u, 14.0 * u
+        # Reserve inner stem space for Persona 5 Assist Menu white-bordered key/icon square
+        pad_out, pad_in = 13.0 * u, 31.0 * u
         x_start, x_end = (-L + pad_out, -pad_in) if b.side < 0 else (pad_in, L - pad_out)
         n = len(b.label)
         raw = []
@@ -2467,36 +2563,37 @@ class RadialMenu(QWidget):
         for i, ch in enumerate(b.label):
             t = i / max(1, n - 1)
             frac_outer = (1.0 - t) if b.side < 0 else t
-            h_here = h_in + (h_out - h_in) * frac_outer
-            f = p5_font(max(17, int(h_here * 0.84)), italic=False)
+            h_here = h_in + (h_out - h_in) * (0.20 + 0.80 * frac_outer)
+            f = p5_font(max(16, int(h_here * 0.78)), italic=False)
             fm = QFontMetrics(f)
             adv = fm.horizontalAdvance(ch)
             tb = fm.tightBoundingRect(ch)
-            extra = (5.0 * u) if i == b.hi else 0.0      # ruang ekstra agar kotak cutout tidak menyentuh tetangga
-            step = adv * 0.92 + extra
+            extra = (4.5 * u) if i == b.hi else 0.0      # ruang ekstra agar kotak cutout tidak menyentuh tetangga
+            step = adv * 0.91 + extra
             raw.append((ch, f, tb, step))
             total_w += step
 
         avail = abs(x_end - x_start)
         xscale = min(1.0, avail / max(1.0, total_w))
-        x = x_start + (avail - total_w * xscale) * (0.35 if b.side < 0 else 0.55)
+        x = x_start + (avail - total_w * xscale) * (0.42 if b.side < 0 else 0.48)
         glyphs = []
         for i, (ch, f, tb, step) in enumerate(raw):
             w_step = step * xscale
             cx_ch = x + w_step * 0.5
-            jy = (-1.6 if i % 2 == 0 else 1.4) * u - 3.0 * u
-            tilt = -4.0 if i % 2 == 0 else 3.5
-            pad = 3.0 * u
+            jy = (-1.4 if i % 2 == 0 else 1.2) * u - 5.2 * u
+            tilt = -3.8 if i % 2 == 0 else 3.2
+            pad = 2.4 * u
             box = QRectF(-tb.width() / 2 - pad, -tb.height() / 2 - pad,
                          tb.width() + 2 * pad, tb.height() + 2 * pad)
             glyphs.append((ch, f, cx_ch, jy, tilt, xscale, -tb.center().x(), -tb.center().y(), box, i == b.hi))
             x += w_step
 
-        # Subjudul di tepi bawah (path di-cache supaya 60 FPS ringan)
-        sub_f = p5_font(max(11, int(14 * u)), italic=True)
+        # Crisp Persona 5 subtitle tucked neatly along the lower band right beneath the cutout title
+        sub_f = p5_font(max(10, int(13 * u)), italic=True)
         tw = QFontMetrics(sub_f).horizontalAdvance(b.sub)
-        tx = (-L * 0.54 if b.side < 0 else L * 0.54) - tw * 0.5
-        ty = (h_in + h_out) * 0.24 + 5.0 * u
+        mid_x = 0.5 * (x_start + x_end)
+        tx = mid_x - tw * 0.5
+        ty = (h_in + h_out) * 0.24 + 4.8 * u
         sub_path = QPainterPath()
         sub_path.addText(QPointF(tx, ty), sub_f, b.sub)
         return L, h_in, h_out, poly, shape, glyphs, sub_path
@@ -2544,7 +2641,7 @@ class RadialMenu(QWidget):
             else:
                 rebuilt.append(MenuButton(
                     key, spec["label"], spec["sub"], spec["side"],
-                    spec["ox"], spec["oy"], spec["rot"], 176, 25, 48, spec["hi"], float(i),
+                    spec["ox"], spec["oy"], spec["rot"], 188, 26, 48, spec["hi"], float(i),
                 ))
 
         self._buttons = rebuilt
@@ -2565,8 +2662,10 @@ class RadialMenu(QWidget):
         if self.width() != w or self.height() != h:
             self.setFixedSize(w, h)
         spin_dir = +1.0 if plan["mode"] == "left" else -1.0
+        sil_dir = +1.0 if plan["mode"] == "left" else -1.0
         self._backdrop.configure(
-            w, h, self._cx, self._cy, plan["red_shards"], plan["black_shards"], spin_dir=spin_dir,
+            w, h, self._cx, self._cy, plan["red_shards"], plan["black_shards"],
+            spin_dir=spin_dir, sil_dir=sil_dir, u_sprite=u_sprite,
         )
 
         # Rebuild button glyph cache only when (side, scale) changes; prune inactive keys
@@ -2821,6 +2920,69 @@ class RadialMenu(QWidget):
         for b in sorted(self._buttons, key=lambda x: x.hover.value):   # yang di-hover digambar paling atas
             self._paint_button(p, b)
 
+    @staticmethod
+    def _draw_radial_glyph(p: QPainter, key: str, r: QRectF, color: QColor, u: float) -> None:
+        """Crisp minimalist Persona 5 vector glyph inside each radial tab's white-bordered square."""
+        cx, cy = r.center().x(), r.center().y()
+        s = min(r.width(), r.height()) * 0.34
+        p.save()
+        p.setPen(QPen(color, max(1.4, 1.85 * u), Qt.PenStyle.SolidLine,
+                      Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        if key == "events":
+            box = QRectF(cx - s, cy - s * 0.85, s * 2.0, s * 1.75)
+            p.drawRect(box)
+            p.drawLine(QPointF(box.left(), box.top() + s * 0.55), QPointF(box.right(), box.top() + s * 0.55))
+            p.drawLine(QPointF(cx - s * 0.45, box.top() - s * 0.25), QPointF(cx - s * 0.45, box.top() + s * 0.12))
+            p.drawLine(QPointF(cx + s * 0.45, box.top() - s * 0.25), QPointF(cx + s * 0.45, box.top() + s * 0.12))
+        elif key == "tasks":
+            p.drawPolyline(QPolygonF([
+                QPointF(cx - s * 0.85, cy + s * 0.05),
+                QPointF(cx - s * 0.20, cy + s * 0.72),
+                QPointF(cx + s * 0.90, cy - s * 0.65),
+            ]))
+        elif key == "timer":
+            p.drawEllipse(QPointF(cx, cy + s * 0.08), s * 0.88, s * 0.88)
+            p.drawLine(QPointF(cx, cy - s * 0.45), QPointF(cx, cy + s * 0.08))
+            p.drawLine(QPointF(cx, cy + s * 0.08), QPointF(cx + s * 0.48, cy + s * 0.28))
+            p.drawLine(QPointF(cx - s * 0.35, cy - s * 1.02), QPointF(cx + s * 0.35, cy - s * 1.02))
+        elif key == "notes":
+            p.drawLine(QPointF(cx - s * 0.85, cy - s * 0.60), QPointF(cx + s * 0.85, cy - s * 0.60))
+            p.drawLine(QPointF(cx - s * 0.85, cy),            QPointF(cx + s * 0.85, cy))
+            p.drawLine(QPointF(cx - s * 0.85, cy + s * 0.60), QPointF(cx + s * 0.35, cy + s * 0.60))
+        elif key == "talk":
+            p.drawPolygon(QPolygonF([
+                QPointF(cx - s * 0.95, cy - s * 0.72),
+                QPointF(cx + s * 0.95, cy - s * 0.72),
+                QPointF(cx + s * 0.95, cy + s * 0.42),
+                QPointF(cx - s * 0.05, cy + s * 0.42),
+                QPointF(cx - s * 0.62, cy + s * 0.92),
+                QPointF(cx - s * 0.50, cy + s * 0.42),
+                QPointF(cx - s * 0.95, cy + s * 0.42),
+            ]))
+        elif key == "stats":
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(color)
+            p.drawPolygon(star_polygon(cx, cy, s * 1.05, s * 0.46, 5))
+        elif key == "finance":
+            p.drawPolygon(QPolygonF([
+                QPointF(cx, cy - s * 1.0),
+                QPointF(cx + s * 0.92, cy),
+                QPointF(cx, cy + s * 1.0),
+                QPointF(cx - s * 0.92, cy),
+            ]))
+            p.drawLine(QPointF(cx - s * 0.42, cy), QPointF(cx + s * 0.42, cy))
+        else:  # system
+            p.drawEllipse(QPointF(cx, cy), s * 0.40, s * 0.40)
+            p.drawEllipse(QPointF(cx, cy), s * 0.86, s * 0.86)
+            for ang in (0.0, 90.0, 180.0, 270.0):
+                rad = math.radians(ang)
+                p.drawLine(
+                    QPointF(cx + math.cos(rad) * s * 0.86, cy + math.sin(rad) * s * 0.86),
+                    QPointF(cx + math.cos(rad) * s * 1.15, cy + math.sin(rad) * s * 1.15),
+                )
+        p.restore()
+
     def _paint_button(self, p: QPainter, b: MenuButton) -> None:
         opacity = clamp(b.pop.value * 1.7)
         if opacity <= 0.01 or b.key not in self._geom:
@@ -2834,18 +2996,32 @@ class RadialMenu(QWidget):
         p.setOpacity(opacity)
         p.setTransform(self._xf(b))
 
-        # Bilah bayangan miring: merah saat diam, putih mencolok saat hover
+        # Clean shadow: dark subtle separation at rest (never muddies red spikes), bold WHITE cutout on hover!
         p.save()
-        p.translate(b.side * (4.0 + 5.0 * hov) * u, (5.0 + 2.0 * hov) * u)
+        p.translate(b.side * (3.0 + 4.5 * hov) * u, (4.0 + 2.2 * hov) * u)
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(lerp_color(RED, WHITE, hov))
+        if hov > 0.02:
+            sh_col = lerp_color(QColor("#14141A"), WHITE, hov)
+            sh_col.setAlpha(int(150 + 105 * hov))
+        else:
+            sh_col = QColor(0, 0, 0, 145)
+        p.setBrush(sh_col)
         p.drawPolygon(poly)
         p.restore()
 
-        # Badan tombol: trapesium hitam pekat (tanpa garis tepi, sesuai menu battle P5)
+        # Badan tombol: trapesium hitam pekat tajam bergaya Joker Assist Menu Persona 5
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(BLACK)
         p.drawPath(shape)
+
+        # Subtle crisp white micro-glint along outer cut edge for razor silhouette separation
+        if hov < 0.95:
+            p.save()
+            p.setOpacity(opacity * 0.16 * (1.0 - hov))
+            p.setPen(pen(WHITE, 1.1 * u))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawPolyline(QPolygonF([poly[0], poly[1]]))
+            p.restore()
 
         if hov > 0.01:
             p.save()                                                 # sapuan merah diagonal keluar dari karakter
@@ -2869,6 +3045,20 @@ class RadialMenu(QWidget):
                 p.drawLine(QPointF(edge - 18.0 * u, -h_out), QPointF(edge + 18.0 * u, h_out))
             p.restore()
 
+        # Joker Assist Menu inner white-bordered square key/icon box ([Tab], [N], [G], [L] style)
+        p.save()
+        box_sz = 22.0 * u
+        bx = b.side * 12.5 * u
+        by = -1.0 * u
+        p.translate(bx, by)
+        p.rotate(-3.5 * b.side)
+        icon_box = QRectF(-box_sz / 2.0, -box_sz / 2.0, box_sz, box_sz)
+        p.setPen(pen(WHITE, max(1.6, 2.0 * u)))
+        p.setBrush(lerp_color(BLACK, GOLD, hov))
+        p.drawRect(icon_box)
+        self._draw_radial_glyph(p, b.key, icon_box, lerp_color(WHITE, BLACK, hov), u)
+        p.restore()
+
         # Huruf utama bergaya cutout Persona 5 (membesar ke arah ujung luar trapesium)
         for ch, f, cx_ch, jy, tilt, xscale, gx, gy, box, is_hi in glyphs:
             p.save()
@@ -2886,9 +3076,9 @@ class RadialMenu(QWidget):
             p.drawText(QPointF(gx, gy), ch)
             p.restore()
 
-        # Subjudul putih dengan garis tepi hitam tebal menempel di tepi bawah bilah
+        # Subjudul putih tajam dengan kontur hitam rapi di tepi bawah bilah
         p.save()
-        p.setPen(QPen(BLACK, 4.5 * u, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
+        p.setPen(QPen(BLACK, 4.0 * u, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
                       Qt.PenJoinStyle.RoundJoin))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawPath(sub_path)
@@ -2897,16 +3087,16 @@ class RadialMenu(QWidget):
         p.drawPath(sub_path)
         p.restore()
 
-        # Bintang penanda berputar saat hover (di ujung dalam bilah)
+        # Bintang penanda berputar saat hover (mengorbit di ujung dalam di samping kotak ikon)
         if hov > 0.01:
             p.save()
-            p.translate(b.side * 2.0 * u, -1.0 * u)
+            p.translate(-b.side * 11.0 * u, -4.0 * u)
             p.rotate(hov * 160.0)
             sc = 0.2 + 0.8 * hov
             p.scale(sc, sc)
-            p.setPen(pen(BLACK, 2.4 * u))
+            p.setPen(pen(BLACK, 2.0 * u))
             p.setBrush(WHITE)
-            p.drawPolygon(star_polygon(0, 0, 15.0 * u, 6.5 * u, 5))
+            p.drawPolygon(star_polygon(0, 0, 11.5 * u, 5.0 * u, 5))
             p.restore()
 
         p.restore()

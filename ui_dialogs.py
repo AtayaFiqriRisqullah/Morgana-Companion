@@ -30,7 +30,7 @@ from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboB
                              QDateTimeEdit, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
                              QListWidget, QListWidgetItem, QMenu, QProgressBar, QPushButton,
                              QScrollArea, QSizePolicy, QSlider, QSpinBox, QStyle,
-                             QStyledItemDelegate, QTextEdit, QTimeEdit, QVBoxLayout, QWidget)
+                             QStyleOptionSpinBox, QStyledItemDelegate, QTextEdit, QTimeEdit, QVBoxLayout, QWidget)
 
 import sprites
 from audio_manager import audio, play_ui, play_voice
@@ -333,9 +333,49 @@ class P5FluidButton(QPushButton):
         if not self.isEnabled():
             p.setOpacity(0.4)
 
-        p.setPen(QPen(bd, 1.4) if bd.alpha() > 4 else Qt.PenStyle.NoPen)
-        p.setBrush(bg)
-        p.drawRoundedRect(r, self._radius, self._radius)
+        clip = QPainterPath()
+        clip.addRoundedRect(r, self._radius, self._radius)
+
+        # Sculpted subtle vertical gradient sheen on opaque variants
+        if bg.alpha() > 20:
+            grad = QLinearGradient(r.topLeft(), r.bottomLeft())
+            grad.setColorAt(0.0, bg.lighter(114 if self._variant == "primary" else 112))
+            grad.setColorAt(1.0, bg.darker(106))
+            p.fillPath(clip, grad)
+        else:
+            p.fillPath(clip, bg)
+
+        # Persona 5 interactive accents (clipped neatly inside button bounds)
+        if bg.alpha() > 20:
+            p.save()
+            p.setClipPath(clip)
+            p.setPen(Qt.PenStyle.NoPen)
+            # Crisp 1px top specular bevel rim
+            top_a = 38 if self._variant == "primary" else 18
+            p.setBrush(QColor(255, 255, 255, top_a))
+            p.drawRect(QRectF(r.left(), r.top(), r.width(), 1.2))
+            # Diagonal Persona gloss slash on primary & gold buttons (sweeps on hover)
+            if self._variant in ("primary", "gold"):
+                sx = r.left() + r.width() * (0.14 + 0.56 * hov)
+                sw = max(14.0, r.width() * 0.14)
+                p.setBrush(QColor(255, 255, 255, int(20 + 24 * hov)))
+                p.drawPolygon(QPolygonF([
+                    QPointF(sx, r.top()),
+                    QPointF(sx + sw, r.top()),
+                    QPointF(sx + sw - 12.0, r.bottom()),
+                    QPointF(sx - 12.0, r.bottom()),
+                ]))
+            elif self._variant == "soft" and hov > 0.02:
+                # Crimson left-edge hover accent slash on soft buttons
+                bar_h = r.height() * (0.35 + 0.65 * hov)
+                p.setBrush(RED)
+                p.drawRect(QRectF(r.left(), r.center().y() - bar_h / 2.0, 3.0, bar_h))
+            p.restore()
+
+        if bd.alpha() > 4:
+            p.setPen(QPen(bd, 1.4))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRoundedRect(r, self._radius, self._radius)
 
         # Text and icon keep the exact same color on hover
         txt = self.text()
@@ -364,14 +404,22 @@ class P5CheckBox(QCheckBox):
     def __init__(self, text: str, scale: float = 1.0, parent: QWidget | None = None) -> None:
         super().__init__(text, parent)
         self._scale = max(0.75, min(1.5, float(scale)))
+        self._hovered = False
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFont(ui_font(_sc(14, self._scale, 11), bold=True))
         self.clicked.connect(lambda checked: play_ui("select" if checked else "cancel"))
 
     def enterEvent(self, e) -> None:
+        self._hovered = True
         if self.isEnabled():
             play_ui("ui_hover")
+        self.update()
         super().enterEvent(e)
+
+    def leaveEvent(self, e) -> None:
+        self._hovered = False
+        self.update()
+        super().leaveEvent(e)
 
     def sizeHint(self) -> QSize:
         fm = QFontMetrics(self.font())
@@ -385,8 +433,11 @@ class P5CheckBox(QCheckBox):
         bs = 18.0 * sc
         box = QRectF(1.0, (self.height() - bs) / 2.0, bs, bs)
         if self.isChecked():
-            p.setPen(QPen(WHITE, 1.5))
-            p.setBrush(RED)
+            grad = QLinearGradient(box.topLeft(), box.bottomLeft())
+            grad.setColorAt(0.0, RED_HOVER)
+            grad.setColorAt(1.0, RED)
+            p.setPen(QPen(WHITE, 1.6))
+            p.setBrush(grad)
             p.drawRoundedRect(box, 4.0, 4.0)
             c = box.center()
             p.setPen(QPen(WHITE, 2.2 * sc, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
@@ -394,8 +445,8 @@ class P5CheckBox(QCheckBox):
             p.drawLine(QPointF(c.x() - 4.4 * sc, c.y() + 0.4 * sc), QPointF(c.x() - 1.2 * sc, c.y() + 3.6 * sc))
             p.drawLine(QPointF(c.x() - 1.2 * sc, c.y() + 3.6 * sc), QPointF(c.x() + 4.8 * sc, c.y() - 3.8 * sc))
         else:
-            p.setPen(QPen(QColor("#8E8EA0"), 1.6))
-            p.setBrush(P5_SURFACE)
+            p.setPen(QPen(RED if self._hovered else QColor("#8E8EA4"), 1.6))
+            p.setBrush(P5_HOVER if self._hovered else P5_SURFACE)
             p.drawRoundedRect(box, 4.0, 4.0)
         tx = bs + 9.0 * sc
         p.setFont(self.font())
@@ -419,6 +470,61 @@ class P5ComboBox(QComboBox):
         p.setPen(pen)
         p.drawLine(QPointF(cx - 4.0, cy - 2.0), QPointF(cx, cy + 2.5))
         p.drawLine(QPointF(cx, cy + 2.5), QPointF(cx + 4.0, cy - 2.0))
+
+
+def _paint_step_chevrons(widget, dropdown: bool = False) -> None:
+    """Paint crisp antialiased Persona 5 chevrons inside SpinBox / TimeEdit / DateEdit controls."""
+    p = QPainter(widget)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    enabled = widget.isEnabled()
+    if dropdown:
+        col = GOLD if enabled else QColor("#5C5C6E")
+        p.setPen(QPen(col, 1.9, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        cx = widget.width() - 12.5
+        cy = widget.height() * 0.5
+        p.drawLine(QPointF(cx - 3.6, cy - 1.8), QPointF(cx, cy + 2.2))
+        p.drawLine(QPointF(cx, cy + 2.2), QPointF(cx + 3.6, cy - 1.8))
+        return
+
+    opt = QStyleOptionSpinBox()
+    widget.initStyleOption(opt)
+    st = widget.style()
+    r_up = st.subControlRect(QStyle.ComplexControl.CC_SpinBox, opt, QStyle.SubControl.SC_SpinBoxUp, widget)
+    r_dn = st.subControlRect(QStyle.ComplexControl.CC_SpinBox, opt, QStyle.SubControl.SC_SpinBoxDown, widget)
+    col = QColor("#E8E8F5") if enabled else QColor("#5C5C6E")
+    p.setPen(QPen(col, 1.7, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+    if r_up.isValid() and r_up.width() > 4:
+        cx, cy = r_up.center().x() + 0.5, r_up.center().y() + 1.0
+        p.drawLine(QPointF(cx - 3.2, cy + 1.5), QPointF(cx, cy - 1.8))
+        p.drawLine(QPointF(cx, cy - 1.8), QPointF(cx + 3.2, cy + 1.5))
+    if r_dn.isValid() and r_dn.width() > 4:
+        cx, cy = r_dn.center().x() + 0.5, r_dn.center().y()
+        p.drawLine(QPointF(cx - 3.2, cy - 1.5), QPointF(cx, cy + 1.8))
+        p.drawLine(QPointF(cx, cy + 1.8), QPointF(cx + 3.2, cy - 1.5))
+
+
+class P5SpinBox(QSpinBox):
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        _paint_step_chevrons(self, dropdown=False)
+
+
+class P5TimeEdit(QTimeEdit):
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        _paint_step_chevrons(self, dropdown=False)
+
+
+class P5DateEdit(QDateEdit):
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        _paint_step_chevrons(self, dropdown=self.calendarPopup())
+
+
+class P5DateTimeEdit(QDateTimeEdit):
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        _paint_step_chevrons(self, dropdown=self.calendarPopup())
 
 
 # ---------------------------------------------------------------------------
@@ -539,33 +645,94 @@ class P5FluidPanel(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         M, S, H = self.M, self.SHADOW, self._header_h
+        sc = self._ui_scale
         o = clamp(self._open.value)
         body = QRectF(M, M, self.width() - 2 * M - S, self.height() - 2 * M - S)
 
-        # Signature Persona 5 offset crimson shadow + obsidian frame
+        # Layered Persona 5 hard offset crimson shadow + crisp obsidian drop depth
         p.setOpacity(max(0.2, o))
         p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(0, 0, 0, 110))
+        p.drawRect(body.translated((S + 2.5) * o, (S + 2.5) * o))
         p.setBrush(RED)
         p.drawRect(body.translated(S * o, S * o))
 
-        p.setBrush(P5_BG)
+        # Deep obsidian panel canvas with subtle Persona 5 ambient crimson atmosphere
+        bg_grad = QLinearGradient(body.topLeft(), body.bottomRight())
+        bg_grad.setColorAt(0.0, QColor("#101018"))
+        bg_grad.setColorAt(0.45, P5_BG)
+        bg_grad.setColorAt(1.0, QColor("#09090E"))
+        p.setBrush(bg_grad)
         p.drawRect(body)
 
-        # Slanted crimson title slash in top-left header
-        cut = min(body.width() * 0.38, 195.0 * self._ui_scale) * o
-        if cut > 20:
-            p.setBrush(RED)
+        p.save()
+        p.setClipRect(body)
+
+        # Subtle radial crimson glow anchored behind the top-left header
+        glow = QRadialGradient(QPointF(M + 60.0 * sc, M + H * 0.6), 270.0 * sc)
+        glow.setColorAt(0.0, QColor(230, 0, 18, 24))
+        glow.setColorAt(0.55, QColor(230, 0, 18, 8))
+        glow.setColorAt(1.0, QColor(230, 0, 18, 0))
+        p.fillRect(body, glow)
+
+        # Header dark strip + subtle diagonal Persona 5 racing texture on right side
+        hdr_rect = QRectF(M, M, body.width(), H)
+        p.fillRect(hdr_rect, QColor("#08080D"))
+        stripe_w = 10.0 * sc
+        p.setBrush(QColor(255, 255, 255, 8))
+        sx = M + body.width() - 18.0 * sc
+        for _ in range(4):
+            p.drawPolygon(QPolygonF([
+                QPointF(sx, M),
+                QPointF(sx + stripe_w, M),
+                QPointF(sx + stripe_w - 16.0 * sc, M + H),
+                QPointF(sx - 16.0 * sc, M + H),
+            ]))
+            sx -= 22.0 * sc
+
+        # Dynamic title-fitted slanted crimson banner + trailing razor WHITE P5 Royal accent stripe
+        slant = 20.0 * sc
+        title_need = self._title_lbl.sizeHint().width() + _sc(76, sc, 56) + slant
+        cut = min(body.width() * 0.56, max(168.0 * sc, float(title_need))) * o
+        if cut > 24:
+            slash_grad = QLinearGradient(QPointF(M, M), QPointF(M, M + H))
+            slash_grad.setColorAt(0.0, QColor("#F50C1F"))
+            slash_grad.setColorAt(1.0, QColor("#C40010"))
+            p.setBrush(slash_grad)
             p.drawPolygon(QPolygonF([
                 QPointF(M, M),
                 QPointF(M + cut, M),
-                QPointF(M + cut - 20.0, M + H),
+                QPointF(M + cut - slant, M + H),
                 QPointF(M, M + H),
             ]))
+            # Crisp parallel WHITE trailing slash (Persona 5 Royal signature accent)
+            gap = 4.0 * sc
+            w_bar = 5.0 * sc
+            p.setBrush(WHITE)
+            p.drawPolygon(QPolygonF([
+                QPointF(M + cut + gap, M),
+                QPointF(M + cut + gap + w_bar, M),
+                QPointF(M + cut + gap + w_bar - slant, M + H),
+                QPointF(M + cut + gap - slant, M + H),
+            ]))
 
-        # Crisp crimson divider under header + white Persona 5 outer border
+        # Subtle crimson geometric corner notch at bottom-right of canvas
+        cn = 14.0 * sc
+        p.setBrush(QColor(230, 0, 18, 75))
+        p.drawPolygon(QPolygonF([
+            QPointF(body.right(), body.bottom() - cn),
+            QPointF(body.right(), body.bottom()),
+            QPointF(body.right() - cn, body.bottom()),
+        ]))
+        p.restore()
+
+        # Crisp crimson divider under header + gold highlight dash under title cut + white P5 border
         p.setPen(pen(RED, 2.0))
         p.drawLine(QPointF(M, M + H), QPointF(M + body.width(), M + H))
-        p.setPen(pen(WHITE, 2.5))
+        if cut > 24:
+            p.setPen(pen(GOLD, 2.4))
+            p.drawLine(QPointF(M + cut - slant, M + H), QPointF(M + cut - slant + 22.0 * sc, M + H))
+        p.setPen(pen(WHITE, 2.4))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawRect(body)
 
@@ -808,8 +975,11 @@ class TaskRowDelegate(QStyledItemDelegate):
         else:
             bg, border = P5_SURFACE, P5_BORDER
 
+        grad = QLinearGradient(card.topLeft(), card.bottomLeft())
+        grad.setColorAt(0.0, bg.lighter(108))
+        grad.setColorAt(1.0, bg)
         painter.setPen(QPen(border, 1.3 if (selected or overdue) else 1.2))
-        painter.setBrush(bg)
+        painter.setBrush(grad)
         painter.drawRoundedRect(card, 8.0, 8.0)
 
         # Left accent bar for overdue, high priority, or selection
@@ -964,8 +1134,11 @@ class NoteCardDelegate(QStyledItemDelegate):
         else:
             bg, border = P5_SURFACE, P5_BORDER
 
+        grad = QLinearGradient(card.topLeft(), card.bottomLeft())
+        grad.setColorAt(0.0, bg.lighter(108))
+        grad.setColorAt(1.0, bg)
         painter.setPen(QPen(border, 1.2))
-        painter.setBrush(bg)
+        painter.setBrush(grad)
         painter.drawRoundedRect(card, 8.0, 8.0)
 
         # Left stripe: Crimson when selected, Morgana Gold when pinned
@@ -1204,7 +1377,7 @@ class TasksDialog(P5FluidPanel):
         self._due_check.toggled.connect(self._on_due_check_toggled)
         dr1.addWidget(self._due_check)
 
-        self._due_edit = QDateTimeEdit()
+        self._due_edit = P5DateTimeEdit()
         self._due_edit.setCalendarPopup(True)
         self._due_edit.setDisplayFormat("dd MMM yyyy HH:mm")
         self._due_edit.setDateTime(_to_qdt(self._default_due()))
@@ -3393,13 +3566,13 @@ class SettingsDialog(P5FluidPanel):
         l1.addWidget(h1)
         self.curfew_check = P5CheckBox("Remind me to go to sleep", scale=sc)
         l1.addWidget(self.curfew_check)
-        self.bed_edit = QTimeEdit()
+        self.bed_edit = P5TimeEdit()
         self.bed_edit.setDisplayFormat("HH:mm")
         self._row(l1, "Bedtime starts", self.bed_edit)
-        self.wake_edit = QTimeEdit()
+        self.wake_edit = P5TimeEdit()
         self.wake_edit.setDisplayFormat("HH:mm")
         self._row(l1, "Reminder stops (wake up)", self.wake_edit)
-        self.curfew_interval = QSpinBox()
+        self.curfew_interval = P5SpinBox()
         self.curfew_interval.setRange(10, 3600)
         self.curfew_interval.setSingleStep(10)
         self.curfew_interval.setSuffix(" sec")
@@ -3414,11 +3587,11 @@ class SettingsDialog(P5FluidPanel):
         h2 = QLabel("EVENT, TASK & NOTE REMINDERS")
         h2.setObjectName("section")
         l2.addWidget(h2)
-        self.event_window = QSpinBox()
+        self.event_window = P5SpinBox()
         self.event_window.setRange(5, 1440)
         self.event_window.setSuffix(" min")
         self._row(l2, "Start reminding before", self.event_window)
-        self.event_interval = QSpinBox()
+        self.event_interval = P5SpinBox()
         self.event_interval.setRange(1, 120)
         self.event_interval.setSuffix(" min")
         self._row(l2, "Repeat every", self.event_interval)
@@ -3432,22 +3605,22 @@ class SettingsDialog(P5FluidPanel):
         h3 = QLabel("FOCUS, COMPANION & APP")
         h3.setObjectName("section")
         l3.addWidget(h3)
-        self.focus_spin = QSpinBox()
+        self.focus_spin = P5SpinBox()
         self.focus_spin.setRange(1, 180)
         self.focus_spin.setSuffix(" min")
         self._row(l3, "Focus session duration", self.focus_spin)
-        self.rest_spin = QSpinBox()
+        self.rest_spin = P5SpinBox()
         self.rest_spin.setRange(1, 60)
         self.rest_spin.setSuffix(" min")
         self._row(l3, "Break duration", self.rest_spin)
-        self.ui_scale_spin = QSpinBox()
+        self.ui_scale_spin = P5SpinBox()
         self.ui_scale_spin.setRange(75, 150)
         self.ui_scale_spin.setSingleStep(5)
         self.ui_scale_spin.setSuffix("%")
         self._row(l3, "UI size", self.ui_scale_spin)
         self.briefing_check = P5CheckBox("Show Daily Briefing & Confidant Summary once a day", scale=sc)
         self.evening_wrapup_check = P5CheckBox("Show Evening Wrap-up recap once per evening", scale=sc)
-        self.wrapup_edit = QTimeEdit()
+        self.wrapup_edit = P5TimeEdit()
         self.wrapup_edit.setDisplayFormat("HH:mm")
         self.auto_reward_check = P5CheckBox("Auto-reward Social Stats from tasks, habits & focus", scale=sc)
         self.auto_open_stats_check = P5CheckBox("Auto-open Social Stats star animation on rewards", scale=sc)
@@ -3472,7 +3645,7 @@ class SettingsDialog(P5FluidPanel):
         law.addWidget(haw)
         self.awareness_check = P5CheckBox("Active App / Window Awareness (100% local)", scale=sc)
         self.screen_time_check = P5CheckBox("Track daily Screen Time & suggest healthy breaks", scale=sc)
-        self.break_nudge_spin = QSpinBox()
+        self.break_nudge_spin = P5SpinBox()
         self.break_nudge_spin.setRange(15, 240)
         self.break_nudge_spin.setSingleStep(5)
         self.break_nudge_spin.setSuffix(" min")
@@ -4059,14 +4232,27 @@ class _MorganaBriefingFrame(QFrame):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         r = QRectF(self.rect()).adjusted(1.0, 1.0, -1.0, -1.0)
         sc = self._scale
-        # Obsidian base with subtle crimson glow border
-        p.setPen(QPen(self._accent, 1.6))
-        p.setBrush(P5_CARD)
-        p.drawRoundedRect(r, 10.0, 10.0)
-        # Slanted P5 left slash accent
         clip = QPainterPath()
         clip.addRoundedRect(r, 10.0, 10.0)
+
+        # Rich obsidian base + subtle accent tint emanating from the left slash
+        base = QLinearGradient(r.topLeft(), r.bottomLeft())
+        base.setColorAt(0.0, QColor("#191924"))
+        base.setColorAt(1.0, P5_CARD)
+        p.fillPath(clip, base)
+
+        p.save()
         p.setClipPath(clip)
+        wash = QLinearGradient(r.left(), r.top(), r.left() + r.width() * 0.45, r.top())
+        c0 = QColor(self._accent)
+        c0.setAlpha(34)
+        c1 = QColor(self._accent)
+        c1.setAlpha(0)
+        wash.setColorAt(0.0, c0)
+        wash.setColorAt(1.0, c1)
+        p.fillRect(r, wash)
+
+        # Slanted P5 left slash accent + trailing crisp parallel hairline
         slash = QPolygonF([
             QPointF(r.left(), r.top()),
             QPointF(r.left() + 26.0 * sc, r.top()),
@@ -4076,6 +4262,24 @@ class _MorganaBriefingFrame(QFrame):
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(self._accent)
         p.drawPolygon(slash)
+
+        gap = 3.5 * sc
+        tw = 2.6 * sc
+        trail = QPolygonF([
+            QPointF(r.left() + 26.0 * sc + gap, r.top()),
+            QPointF(r.left() + 26.0 * sc + gap + tw, r.top()),
+            QPointF(r.left() + 14.0 * sc + gap + tw, r.bottom()),
+            QPointF(r.left() + 14.0 * sc + gap, r.bottom()),
+        ])
+        c_tr = QColor(self._accent)
+        c_tr.setAlpha(155)
+        p.setBrush(c_tr)
+        p.drawPolygon(trail)
+        p.restore()
+
+        p.setPen(QPen(self._accent, 1.6))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(r, 10.0, 10.0)
         p.end()
 
 
@@ -4219,7 +4423,7 @@ class EventsDialog(P5FluidPanel):
         st_lbl = QLabel("Start")
         st_lbl.setObjectName("tip")
         ef_r2.addWidget(st_lbl)
-        self._ev_start = QDateTimeEdit()
+        self._ev_start = P5DateTimeEdit()
         self._ev_start.setCalendarPopup(True)
         self._ev_start.setDisplayFormat("dd MMM HH:mm")
         self._ev_start.setMinimumHeight(_sc(28, sc, 24))
@@ -4230,7 +4434,7 @@ class EventsDialog(P5FluidPanel):
         self._ev_end_lbl = QLabel("End")
         self._ev_end_lbl.setObjectName("tip")
         ef_r2.addWidget(self._ev_end_lbl)
-        self._ev_end = QDateTimeEdit()
+        self._ev_end = P5DateTimeEdit()
         self._ev_end.setCalendarPopup(True)
         self._ev_end.setDisplayFormat("dd MMM HH:mm")
         self._ev_end.setMinimumHeight(_sc(28, sc, 24))
@@ -5443,8 +5647,11 @@ class HabitRowDelegate(QStyledItemDelegate):
         else:
             bg, border = P5_SURFACE, P5_BORDER
 
+        grad = QLinearGradient(card.topLeft(), card.bottomLeft())
+        grad.setColorAt(0.0, bg.lighter(108))
+        grad.setColorAt(1.0, bg)
         painter.setPen(QPen(border, 1.2))
-        painter.setBrush(bg)
+        painter.setBrush(grad)
         painter.drawRoundedRect(card, 8.0, 8.0)
 
         box = self._box_rect(card)
@@ -5839,7 +6046,7 @@ class SocialStatsDialog(P5FluidPanel):
             self._quick_pts_btns[val] = b
             pts_row.addWidget(b, 1)
 
-        self._pts_spin = QSpinBox()
+        self._pts_spin = P5SpinBox()
         self._pts_spin.setRange(1, 500)
         self._pts_spin.setValue(DEFAULT_STAT_POINTS)
         self._pts_spin.setSuffix(" pts")
@@ -6674,23 +6881,56 @@ class _FocusClockDisplay(QWidget):
 
         # Signature P5 hard offset shadow
         p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(0, 0, 0, 110))
+        p.drawRect(r.translated(6.0, 6.0))
         p.setBrush(accent)
         p.drawRect(r.translated(4.0, 4.0))
 
-        # Obsidian body
-        p.setBrush(BLACK)
+        # Deep metallic obsidian body + subtle radial halo behind countdown digits
+        body_grad = QLinearGradient(r.topLeft(), r.bottomLeft())
+        body_grad.setColorAt(0.0, QColor("#12121A"))
+        body_grad.setColorAt(1.0, QColor("#07070A"))
+        p.setBrush(body_grad)
         p.drawRect(r)
 
-        # Diagonal left slash panel for phase tag
+        p.save()
+        p.setClipRect(r)
         slash_w = min(r.width() * 0.34, 156.0 * sc)
+        halo_c = QPointF(r.left() + slash_w + (r.width() - slash_w) * 0.5, r.center().y())
+        halo = QRadialGradient(halo_c, r.width() * 0.42)
+        hc = QColor(accent)
+        hc.setAlpha(46 if self._running else 22)
+        halo.setColorAt(0.0, hc)
+        halo.setColorAt(1.0, QColor(accent.red(), accent.green(), accent.blue(), 0))
+        p.fillRect(r, halo)
+
+        # Diagonal left slash panel for phase tag
         slash = QPolygonF([
             QPointF(r.left(), r.top()),
             QPointF(r.left() + slash_w, r.top()),
             QPointF(r.left() + slash_w - 22.0 * sc, r.bottom()),
             QPointF(r.left(), r.bottom()),
         ])
-        p.setBrush(accent if self._running else P5_RED_BG)
+        if self._running:
+            sgrad = QLinearGradient(r.topLeft(), r.bottomLeft())
+            sgrad.setColorAt(0.0, accent.lighter(110))
+            sgrad.setColorAt(1.0, accent.darker(115))
+            p.setBrush(sgrad)
+        else:
+            sgrad = QLinearGradient(r.topLeft(), r.bottomLeft())
+            sgrad.setColorAt(0.0, QColor("#4A0D16"))
+            sgrad.setColorAt(1.0, QColor("#28060B"))
+            p.setBrush(sgrad)
         p.drawPolygon(slash)
+
+        # Crisp Persona 5 white diagonal razor separator + thin trailing accent stripe
+        p.setPen(pen(WHITE, 2.0 * sc))
+        p.drawLine(QPointF(r.left() + slash_w + 1.0, r.top()),
+                   QPointF(r.left() + slash_w - 22.0 * sc + 1.0, r.bottom()))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 255, 255, 18))
+        p.drawRect(QRectF(r.left(), r.top(), r.width(), 1.5))
+        p.restore()
 
         # Phase label inside left slash
         tag_top = "BREAK TIME" if is_rest else ("FOCUS MODE" if self._running else "READY")
@@ -6712,10 +6952,12 @@ class _FocusClockDisplay(QWidget):
         p.drawText(QRectF(r.left() + 12 * sc, r.bottom() - 28 * sc, slash_w - 28 * sc, 18 * sc),
                    Qt.AlignmentFlag.AlignLeft.value | Qt.AlignmentFlag.AlignVCenter.value, sess_txt)
 
-        # Giant Persona 5 Anton countdown digits on right
+        # Giant Persona 5 Anton countdown digits on right (with subtle crisp crimson drop)
         digits_rect = QRectF(r.left() + slash_w - 6 * sc, r.top() + 6 * sc,
                              r.width() - slash_w - 8 * sc, r.height() - 22 * sc)
         p.setFont(p5_font(_sc(50, sc, 36), italic=False))
+        p.setPen(QColor(accent.red(), accent.green(), accent.blue(), 110))
+        p.drawText(digits_rect.translated(2.0 * sc, 2.0 * sc), Qt.AlignmentFlag.AlignCenter.value, self._clock)
         p.setPen(WHITE)
         p.drawText(digits_rect, Qt.AlignmentFlag.AlignCenter.value, self._clock)
 
@@ -6800,7 +7042,7 @@ class TimerDialog(P5FluidPanel):
         f_lbl = QLabel("Focus")
         f_lbl.setStyleSheet(f'color: #C8C8D8; font-size: {_sc(13, sc, 10)}px; font-weight: bold;')
         ctrl.addWidget(f_lbl)
-        self._focus_spin = QSpinBox()
+        self._focus_spin = P5SpinBox()
         self._focus_spin.setRange(1, 180)
         self._focus_spin.setSuffix(" m")
         self._focus_spin.setMinimumWidth(_sc(76, sc, 62))
@@ -6811,7 +7053,7 @@ class TimerDialog(P5FluidPanel):
         r_lbl = QLabel("Break")
         r_lbl.setStyleSheet(f'color: #C8C8D8; font-size: {_sc(13, sc, 10)}px; font-weight: bold;')
         ctrl.addWidget(r_lbl)
-        self._rest_spin = QSpinBox()
+        self._rest_spin = P5SpinBox()
         self._rest_spin.setRange(1, 60)
         self._rest_spin.setSuffix(" m")
         self._rest_spin.setMinimumWidth(_sc(72, sc, 58))
@@ -6924,16 +7166,16 @@ class TimerDialog(P5FluidPanel):
         dur_lbl = QLabel("Duration")
         dur_lbl.setStyleSheet(f'color: #9292A4; font-size: {_sc(12, sc, 10)}px; font-weight: bold;')
         hms_row.addWidget(dur_lbl)
-        self._h_spin = QSpinBox()
+        self._h_spin = P5SpinBox()
         self._h_spin.setRange(0, 23)
         self._h_spin.setSuffix(" h")
         self._h_spin.setFixedHeight(_sc(30, sc, 25))
-        self._m_spin = QSpinBox()
+        self._m_spin = P5SpinBox()
         self._m_spin.setRange(0, 59)
         self._m_spin.setValue(10)
         self._m_spin.setSuffix(" m")
         self._m_spin.setFixedHeight(_sc(30, sc, 25))
-        self._s_spin = QSpinBox()
+        self._s_spin = P5SpinBox()
         self._s_spin.setRange(0, 59)
         self._s_spin.setSuffix(" s")
         self._s_spin.setFixedHeight(_sc(30, sc, 25))
@@ -7836,25 +8078,33 @@ class FinanceTxDelegate(QStyledItemDelegate):
         hov = bool(option.state & QStyle.StateFlag.State_MouseOver)
         bg = P5_SELECTED if sel else (P5_HOVER if hov else P5_SURFACE)
         bd = RED if sel else (P5_BORDER_HI if hov else P5_BORDER)
-        p.setPen(QPen(bd, 1.3 if sel else 1.0))
-        p.setBrush(bg)
-        p.drawRoundedRect(r, 7.0, 7.0)
-
         tx_type = index.data(ROLE_CAT) or "expense"
         amt_txt = index.data(ROLE_BADGE) or "Rp 0"
         meta_txt = index.data(ROLE_DATE) or ""
         title = index.data(Qt.ItemDataRole.DisplayRole) or ""
 
         if tx_type == "income":
-            tag, tag_bg, tag_fg, amt_fg = "IN", P5_MINT_BG, P5_MINT_FG, P5_MINT_FG
+            tag, tag_bg, tag_fg, amt_fg, stripe_col = "IN", P5_MINT_BG, P5_MINT_FG, P5_MINT_FG, P5_MINT_FG
         elif tx_type == "transfer":
-            tag, tag_bg, tag_fg, amt_fg = "TF", P5_GOLD_BG, P5_GOLD_FG, P5_GOLD_FG
+            tag, tag_bg, tag_fg, amt_fg, stripe_col = "TF", P5_GOLD_BG, P5_GOLD_FG, P5_GOLD_FG, GOLD
         else:
-            tag, tag_bg, tag_fg, amt_fg = "OUT", P5_RED_BG, P5_RED_FG, P5_RED_FG
+            tag, tag_bg, tag_fg, amt_fg, stripe_col = "OUT", P5_RED_BG, P5_RED_FG, P5_RED_FG, RED
+
+        grad = QLinearGradient(r.topLeft(), r.bottomLeft())
+        grad.setColorAt(0.0, bg.lighter(108))
+        grad.setColorAt(1.0, bg)
+        p.setPen(QPen(bd, 1.3 if sel else 1.0))
+        p.setBrush(grad)
+        p.drawRoundedRect(r, 7.0, 7.0)
+
+        # Crisp color-coded left accent bar (Mint IN / Gold TF / Crimson OUT)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(WHITE if sel else stripe_col)
+        p.drawRoundedRect(QRectF(r.left() + 0.5, r.top() + 5.0, 3.0, r.height() - 10.0), 1.5, 1.5)
 
         pill_w = _sc(38, sc, 30)
         pill_h = _sc(22, sc, 18)
-        pill = QRectF(r.left() + _sc(8, sc, 6), r.center().y() - pill_h / 2.0, pill_w, pill_h)
+        pill = QRectF(r.left() + _sc(9, sc, 7), r.center().y() - pill_h / 2.0, pill_w, pill_h)
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(tag_bg)
         p.drawRoundedRect(pill, 4.0, 4.0)
@@ -7988,32 +8238,37 @@ class FinanceDialog(P5FluidPanel):
         kpi_row = QHBoxLayout()
         kpi_row.setSpacing(_sc(8, sc, 6))
 
-        def _kpi_card(title: str, accent: str) -> tuple[QFrame, QLabel, QLabel]:
+        def _kpi_card(title: str, accent: str, border_col: str, tint_col: str) -> tuple[QFrame, QLabel, QLabel]:
             card = _make_card("subcard")
+            card.setStyleSheet(
+                f"QFrame#subcard {{ "
+                f"background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 {tint_col}, stop:0.65 #171722, stop:1 #13131C); "
+                f"border: 1px solid #303042; border-left: 3.5px solid {border_col}; border-radius: 8px; }}"
+            )
             cl = QVBoxLayout(card)
-            cl.setContentsMargins(_sc(10, sc, 7), _sc(6, sc, 4), _sc(10, sc, 7), _sc(6, sc, 4))
+            cl.setContentsMargins(_sc(11, sc, 8), _sc(6, sc, 4), _sc(10, sc, 7), _sc(6, sc, 4))
             cl.setSpacing(_sc(2, sc, 1))
             t_lbl = QLabel(title)
             t_lbl.setStyleSheet(
-                f'color: #A0A5B5; font-family: "Barlow Condensed", sans-serif; '
-                f'font-size: {_sc(10, sc, 8)}px; font-weight: 800; letter-spacing: 0.7px;'
+                f'color: #A6ABC0; font-family: "Barlow Condensed", sans-serif; '
+                f'font-size: {_sc(10, sc, 8)}px; font-weight: 800; letter-spacing: 0.7px; background: transparent;'
             )
             val_lbl = QLabel("Rp 0")
             val_lbl.setStyleSheet(
                 f'color: {accent}; font-family: "Barlow Condensed", "Anton", sans-serif; '
-                f'font-size: {_sc(18, sc, 14)}px; font-weight: 900;'
+                f'font-size: {_sc(18, sc, 14)}px; font-weight: 900; background: transparent;'
             )
             sub_lbl = QLabel("")
-            sub_lbl.setStyleSheet(f'color: #9A9FA8; font-size: {_sc(10, sc, 8)}px;')
+            sub_lbl.setStyleSheet(f'color: #9A9FA8; font-size: {_sc(10, sc, 8)}px; background: transparent;')
             cl.addWidget(t_lbl)
             cl.addWidget(val_lbl)
             cl.addWidget(sub_lbl)
             return card, val_lbl, sub_lbl
 
-        c_bal, self._kpi_bal_val, self._kpi_bal_sub = _kpi_card("TOTAL BALANCE", "#FFE46B")
-        c_inc, self._kpi_inc_val, self._kpi_inc_sub = _kpi_card("MONTH INCOME", "#5CE09A")
-        c_exp, self._kpi_exp_val, self._kpi_exp_sub = _kpi_card("MONTH EXPENSE", "#FF5C6C")
-        c_tod, self._kpi_tod_val, self._kpi_tod_sub = _kpi_card("TODAY SPEND", "#FFFFFF")
+        c_bal, self._kpi_bal_val, self._kpi_bal_sub = _kpi_card("TOTAL BALANCE", "#FFE46B", "#FAD02C", "#241E0F")
+        c_inc, self._kpi_inc_val, self._kpi_inc_sub = _kpi_card("MONTH INCOME", "#5CE09A", "#5CE09A", "#11241C")
+        c_exp, self._kpi_exp_val, self._kpi_exp_sub = _kpi_card("MONTH EXPENSE", "#FF5C6C", "#E60012", "#281116")
+        c_tod, self._kpi_tod_val, self._kpi_tod_sub = _kpi_card("TODAY SPEND", "#FFFFFF", "#D8D8EC", "#1F1F2E")
         kpi_row.addWidget(c_bal, 3)
         kpi_row.addWidget(c_inc, 2)
         kpi_row.addWidget(c_exp, 2)
@@ -8101,7 +8356,7 @@ class FinanceDialog(P5FluidPanel):
         self._amt_input.returnPressed.connect(self._submit_transaction)
         amt_row.addWidget(self._amt_input, 3)
 
-        self._date_edit = QDateEdit()
+        self._date_edit = P5DateEdit()
         self._date_edit.setCalendarPopup(True)
         self._date_edit.setDisplayFormat("dd/MM/yyyy")
         self._date_edit.setDate(QDate.currentDate())
@@ -8429,7 +8684,7 @@ class FinanceDialog(P5FluidPanel):
         day_lbl = QLabel("Day")
         day_lbl.setObjectName("tip")
         b_add2.addWidget(day_lbl)
-        self._bill_day_spin = QSpinBox()
+        self._bill_day_spin = P5SpinBox()
         self._bill_day_spin.setRange(1, 31)
         self._bill_day_spin.setValue(1)
         self._bill_day_spin.setFixedWidth(_sc(56, sc, 48))

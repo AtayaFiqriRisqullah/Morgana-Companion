@@ -32,21 +32,21 @@ WHITE = QColor("#FFFFFF")
 GOLD = QColor("#F5C400")        # Morgana's scarf accent (pinned / pending badges)
 BLUE = QColor("#2E9BFF")        # placeholder fallback only
 
-# Dark Persona 5 window surfaces (Notes, Tasks, Settings)
-P5_BG = QColor("#0E0E12")
-P5_CARD = QColor("#15151B")
-P5_SURFACE = QColor("#1C1C24")
-P5_HOVER = QColor("#252530")
-P5_SELECTED = QColor("#2A0C11")
-P5_BORDER = QColor("#2C2C38")
-P5_BORDER_HI = QColor("#444456")
-P5_TEXT = QColor("#F4F4F8")
-P5_MUTED = QColor("#9292A4")
-P5_GOLD_BG = QColor("#2B2208")
+# Dark Persona 5 window surfaces (Notes, Tasks, Settings, Finance, Stats, Timer)
+P5_BG = QColor("#0B0B10")
+P5_CARD = QColor("#13131B")
+P5_SURFACE = QColor("#1B1B26")
+P5_HOVER = QColor("#252534")
+P5_SELECTED = QColor("#2D0A11")
+P5_BORDER = QColor("#2B2B3A")
+P5_BORDER_HI = QColor("#4A4A62")
+P5_TEXT = QColor("#F5F5FA")
+P5_MUTED = QColor("#9595AA")
+P5_GOLD_BG = QColor("#2D2308")
 P5_GOLD_FG = QColor("#FAD02C")
-P5_RED_BG = QColor("#360A10")
+P5_RED_BG = QColor("#3A0A12")
 P5_RED_FG = QColor("#FF5E6B")
-P5_MINT_BG = QColor("#10281E")
+P5_MINT_BG = QColor("#102B20")
 P5_MINT_FG = QColor("#5CE09A")
 
 
@@ -185,7 +185,7 @@ def menu_qss(scale: float = 1.0) -> str:
     ind = _sp(13, scale, 10)
     return f"""
 QMenu {{
-    background-color: #0E0E12;
+    background-color: #0A0A0F;
     color: #FFFFFF;
     border: 2px solid #FFFFFF;
     padding: 5px 0px;
@@ -216,7 +216,7 @@ QMenu::indicator {{
     height: {ind}px;
     margin-left: 6px;
     border: 1.5px solid #FFFFFF;
-    background: #0E0E12;
+    background: #0A0A0F;
 }}
 QMenu::indicator:checked {{
     background: #E60012;
@@ -226,7 +226,7 @@ QMenu::indicator:checked {{
 
 
 def dialog_qss(scale: float = 1.0) -> str:
-    """Popup windows (Notes, Tasks, Settings) scaled cleanly by `scale`."""
+    """Popup windows (Notes, Tasks, Settings, Finance, Stats, Timer) scaled cleanly by `scale`."""
     hd = _sp(18, scale, 14)
     sub = _sp(13, scale, 10)
     tip = _sp(12, scale, 10)
@@ -237,9 +237,10 @@ def dialog_qss(scale: float = 1.0) -> str:
     padv = _sp(5, scale, 3)
     padh = _sp(10, scale, 7)
     sbw = _sp(7, scale, 5)
+    spin_w = _sp(20, scale, 16)
     return f"""
 QLabel {{
-    color: #F4F4F8;
+    color: #F5F5FA;
     font-family: "Arsenal", "Optima", "Segoe UI", sans-serif;
 }}
 QLabel#heading {{
@@ -254,7 +255,7 @@ QLabel#subhead {{
     font-weight: bold;
 }}
 QLabel#tip {{
-    color: #9292A4;
+    color: #9595AA;
     font-family: "Arsenal", "Optima", "Segoe UI", sans-serif;
     font-size: {tip}px;
     font-weight: normal;
@@ -264,48 +265,51 @@ QLabel#section {{
     font-family: "Barlow Condensed", "Anton", sans-serif;
     font-size: {sec}px;
     font-weight: 800;
+    letter-spacing: 0.4px;
 }}
 QFrame#card {{
-    background-color: #15151B;
-    border: 1px solid #2C2C38;
-    border-radius: 10px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #171722, stop:1 #111118);
+    border: 1px solid #2D2D3D;
+    border-top: 1px solid #38384C;
+    border-radius: 9px;
 }}
 QFrame#subcard {{
-    background-color: #1B1B23;
-    border: 1px solid #323240;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #1F1F2D, stop:1 #161620);
+    border: 1px solid #323244;
+    border-top: 1px solid #3F3F55;
     border-radius: 8px;
 }}
 QFrame#toolbarPill {{
-    background-color: #1B1B23;
-    border: 1px solid #2E2E3B;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #20202E, stop:1 #171722);
+    border: 1px solid #323244;
     border-radius: 8px;
 }}
 QFrame#undoBar {{
-    background-color: #24090E;
-    border: 1px solid #E60012;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #2E0910, stop:1 #1E070C);
+    border: 1.5px solid #E60012;
     border-radius: 8px;
 }}
 QProgressBar {{
-    background-color: #1E1E27;
-    border: none;
+    background-color: #181824;
+    border: 1px solid #2A2A38;
     border-radius: 3px;
 }}
 QProgressBar::chunk {{
-    background-color: #E60012;
-    border-radius: 3px;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #D60010, stop:1 #FF3545);
+    border-radius: 2px;
 }}
 QToolTip {{
-    background-color: #0B0B0E;
+    background-color: #09090D;
     color: #FFFFFF;
     border: 1.5px solid #E60012;
     padding: 4px 8px;
     font-family: "Arsenal", "Segoe UI", sans-serif;
     font-size: {tip}px;
 }}
-QLineEdit, QTextEdit, QDateTimeEdit, QTimeEdit, QSpinBox, QComboBox {{
-    background-color: #1A1A22;
-    color: #F4F4F8;
-    border: 1.5px solid #323240;
+QLineEdit, QTextEdit, QDateTimeEdit, QDateEdit, QTimeEdit, QSpinBox, QComboBox {{
+    background-color: #161620;
+    color: #F5F5FA;
+    border: 1.5px solid #323244;
     border-radius: 7px;
     selection-background-color: #E60012;
     selection-color: #FFFFFF;
@@ -313,9 +317,56 @@ QLineEdit, QTextEdit, QDateTimeEdit, QTimeEdit, QSpinBox, QComboBox {{
     font-size: {inp}px;
     font-family: "Arsenal", "Optima", "Segoe UI", sans-serif;
 }}
-QLineEdit:focus, QTextEdit:focus, QDateTimeEdit:focus, QTimeEdit:focus, QSpinBox:focus, QComboBox:focus {{
-    background-color: #14141A;
+QLineEdit:hover, QTextEdit:hover, QDateTimeEdit:hover, QDateEdit:hover, QTimeEdit:hover, QSpinBox:hover, QComboBox:hover {{
+    border: 1.5px solid #484860;
+}}
+QLineEdit:focus, QTextEdit:focus, QDateTimeEdit:focus, QDateEdit:focus, QTimeEdit:focus, QSpinBox:focus, QComboBox:focus {{
+    background-color: #111119;
     border: 1.5px solid #E60012;
+}}
+QSpinBox, QTimeEdit, QDateTimeEdit {{
+    padding-right: {spin_w + 6}px;
+}}
+QSpinBox::up-button, QTimeEdit::up-button, QDateTimeEdit::up-button {{
+    subcontrol-origin: border;
+    subcontrol-position: top right;
+    width: {spin_w}px;
+    background-color: #222230;
+    border-left: 1px solid #353548;
+    border-bottom: 1px solid #2C2C3C;
+    border-top-right-radius: 6px;
+}}
+QSpinBox::down-button, QTimeEdit::down-button, QDateTimeEdit::down-button {{
+    subcontrol-origin: border;
+    subcontrol-position: bottom right;
+    width: {spin_w}px;
+    background-color: #222230;
+    border-left: 1px solid #353548;
+    border-bottom-right-radius: 6px;
+}}
+QSpinBox::up-button:hover, QTimeEdit::up-button:hover, QDateTimeEdit::up-button:hover,
+QSpinBox::down-button:hover, QTimeEdit::down-button:hover, QDateTimeEdit::down-button:hover {{
+    background-color: #E60012;
+}}
+QSpinBox::up-arrow, QTimeEdit::up-arrow, QDateTimeEdit::up-arrow,
+QSpinBox::down-arrow, QTimeEdit::down-arrow, QDateTimeEdit::down-arrow,
+QDateEdit::down-arrow {{
+    image: none;
+    border: none;
+    width: 0px;
+    height: 0px;
+}}
+QDateEdit::drop-down, QDateTimeEdit::drop-down {{
+    subcontrol-origin: border;
+    subcontrol-position: top right;
+    width: {spin_w + 4}px;
+    background-color: #222230;
+    border-left: 1px solid #353548;
+    border-top-right-radius: 6px;
+    border-bottom-right-radius: 6px;
+}}
+QDateEdit::drop-down:hover, QDateTimeEdit::drop-down:hover {{
+    background-color: #E60012;
 }}
 QComboBox::drop-down {{
     subcontrol-origin: padding;
@@ -330,8 +381,8 @@ QComboBox::down-arrow {{
     height: 0px;
 }}
 QComboBox QAbstractItemView {{
-    background-color: #14141B;
-    color: #F4F4F8;
+    background-color: #12121A;
+    color: #F5F5FA;
     border: 1.5px solid #E60012;
     selection-background-color: #E60012;
     selection-color: #FFFFFF;
@@ -348,48 +399,49 @@ QLineEdit#titleInput {{
     padding: 3px 6px;
 }}
 QLineEdit#titleInput:hover {{
-    background-color: #1D1D26;
+    background-color: #1D1D28;
 }}
 QLineEdit#titleInput:focus {{
-    background-color: #1A1A22;
+    background-color: #161620;
     border: 1.5px solid #E60012;
 }}
 QLineEdit#searchInput {{
-    background-color: #1A1A22;
-    border: 1.5px solid #2C2C38;
+    background-color: #151520;
+    border: 1.5px solid #2E2E3E;
     border-radius: 7px;
     padding: {padv}px {padh}px;
     font-size: {srch}px;
-    color: #F4F4F8;
+    color: #F5F5FA;
 }}
 QLineEdit#searchInput:focus {{
+    background-color: #111119;
     border: 1.5px solid #E60012;
 }}
 QTextEdit#noteBody {{
-    background-color: #121217;
-    border: 1px solid #262632;
+    background-color: #101017;
+    border: 1px solid #282836;
     border-radius: 8px;
     padding: 8px 10px;
     font-size: {inp}px;
-    color: #EAEAF0;
+    color: #ECECF4;
 }}
 QTextEdit#noteBody:focus {{
-    background-color: #121217;
-    border: 1px solid #4A1921;
+    background-color: #0E0E15;
+    border: 1px solid #5C1A24;
 }}
 QTextEdit#noteRaw {{
-    background-color: #101015;
-    border: 1px solid #2C2C3A;
+    background-color: #0E0E14;
+    border: 1px solid #2D2D3E;
     border-radius: 8px;
     padding: 8px 10px;
     font-size: {srch}px;
-    color: #D8D8E6;
+    color: #DCDCEB;
     font-family: "Cascadia Mono", "Consolas", "JetBrains Mono", "DejaVu Sans Mono", monospace;
     selection-background-color: #E60012;
     selection-color: #FFFFFF;
 }}
 QTextEdit#noteRaw:focus {{
-    background-color: #101015;
+    background-color: #0D0D13;
     border: 1px solid #FAD02C;
 }}
 QListWidget {{
@@ -410,7 +462,7 @@ QScrollBar:vertical {{
     margin: 4px 0px;
 }}
 QScrollBar::handle:vertical {{
-    background: #3A3A4A;
+    background: #3B3B4E;
     border-radius: 3px;
     min-height: 26px;
 }}
@@ -421,13 +473,13 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
     height: 0px;
 }}
 QCalendarWidget QWidget {{
-    background-color: #15151B;
+    background-color: #13131B;
     color: #FFFFFF;
     font-family: "Arsenal", "Segoe UI", sans-serif;
 }}
 QCalendarWidget QAbstractItemView:enabled {{
     color: #FFFFFF;
-    background-color: #15151B;
+    background-color: #13131B;
     selection-background-color: #E60012;
     selection-color: #FFFFFF;
 }}
@@ -436,18 +488,18 @@ QCalendarWidget QAbstractItemView:disabled {{
 }}
 QCalendarWidget QToolButton {{
     color: #FFFFFF;
-    background-color: #20202A;
+    background-color: #20202D;
     border-radius: 4px;
     padding: 3px 6px;
 }}
 QSlider::groove:horizontal {{
     height: 6px;
-    background: #1E1E27;
-    border: 1px solid #323240;
+    background: #1B1B26;
+    border: 1px solid #323244;
     border-radius: 3px;
 }}
 QSlider::sub-page:horizontal {{
-    background: #E60012;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #CC0010, stop:1 #FF2A3B);
     border-radius: 3px;
 }}
 QSlider::handle:horizontal {{
